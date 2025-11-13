@@ -27,7 +27,7 @@ Iceberg-inspired safe concurrent data operations for ML/AI workloads in Python.
 Stress Test Results
 ===================
 
-  EXCELLENT RESULTS:
+  FUCKING AWESOME RESULTS: 
 
   Normal Files: X CORRUPTED
    - Expected: 120,000 (12 processes × 10,000 operations each)
