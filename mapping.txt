@@ -1,0 +1,131 @@
+# Apache Iceberg Java to Python Implementation Mapping
+
+This document maps the Java classes from Apache Iceberg to their corresponding Python implementations in this simplified version.
+
+## Core Data Structures
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.TableMetadata | `data_structures.py` -> `TableMetadata` class | Core metadata structure |
+| org.apache.iceberg.Snapshot | `data_structures.py` -> `Snapshot` class | Snapshot representation |
+| org.apache.iceberg.BaseSnapshot | `data_structures.py` -> `Snapshot` class | Implementation details in Python class |
+| org.apache.iceberg.DataFile | `data_structures.py` -> `DataFile` class | Data file representation |
+| org.apache.iceberg.ManifestFile | `data_structures.py` -> `ManifestFile` class | Manifest file representation |
+| org.apache.iceberg.Schema | `data_structures.py` -> `Schema` class | Schema definition |
+| org.apache.iceberg.PartitionSpec | `data_structures.py` -> `PartitionSpec` class | Partition specification |
+| org.apache.iceberg.SortOrder | `data_structures.py` -> `SortOrder` class | Sort order specification |
+| org.apache.iceberg.DeleteFile | `data_structures.py` -> `DeleteFile` class | Delete file representation |
+| org.apache.iceberg.HistoryEntry | `data_structures.py` -> `HistoryEntry` class | History entry structure |
+
+## Table and Operations
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.Table | `transaction.py` -> `Table` class | Main table interface |
+| org.apache.iceberg.BaseTable | `transaction.py` -> `Table` class | Core table functionality |
+| org.apache.iceberg.TableOperations | `metadata_manager.py` -> `MetadataManager` class | Metadata operations |
+| org.apache.iceberg.BaseMetastoreOperations | `metadata_manager.py` -> `MetadataManager` class | Base operations implementation |
+
+## Snapshots and Time Travel
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.SnapshotManager | `snapshot_manager.py` -> `SnapshotManager` class | Snapshot management |
+| org.apache.iceberg.Snapshot | `data_structures.py` -> `Snapshot` class | Snapshot data structure |
+| org.apache.iceberg.SnapshotParser | `metadata_manager.py` -> `_dict_to_metadata`, `_metadata_to_dict` | Serialization/deserialization |
+
+## Transactions
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.Transaction | `transaction.py` -> `Transaction` class | Transaction interface |
+| org.apache.iceberg.BaseTransaction | `transaction.py` -> `Transaction` class | Base transaction implementation |
+| org.apache.iceberg.Transactions | `transaction.py` -> `TransactionManager` class | Transaction factory methods |
+| org.apache.iceberg.TableOperations.commit | `metadata_manager.py` -> `commit` method | Commit operation |
+
+## Manifests and Files
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.ManifestFile | `data_structures.py` -> `ManifestFile` class | Manifest file structure |
+| org.apache.iceberg.ManifestReader | Built into `SnapshotManager` | Reading manifest files |
+| org.apache.iceberg.ManifestWriter | Built into `Transaction` | Writing manifest files |
+| org.apache.iceberg.ManifestEntriesTable | `data_structures.py` -> `ManifestFile` | Manifest entries |
+
+## API and Utilities
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.AppendFiles | `transaction.py` -> `Transaction.append_files` | Append files operation |
+| org.apache.iceberg.OverwriteFiles | `transaction.py` -> `Transaction.overwrite_by_filter` | Overwrite operation |
+| org.apache.iceberg.ReplacePartitions | `transaction.py` -> `Transaction` class | Partition replacement |
+| org.apache.iceberg.ExpireSnapshots | `transaction.py` -> `Transaction.expire_snapshots` | Snapshot expiration |
+| org.apache.iceberg.TableScan | `snapshot_manager.py` -> `time_travel` methods | Table scanning at specific time |
+| org.apache.iceberg.ManageSnapshots | `snapshot_manager.py` -> `SnapshotManager` class | Snapshot management |
+
+## File I/O and Locations
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.io.FileIO | Built into `MetadataManager` | File I/O operations |
+| org.apache.iceberg.io.InputFile | File operations in `MetadataManager` | Input file handling |
+| org.apache.iceberg.io.OutputFile | File operations in `MetadataManager` | Output file handling |
+| org.apache.iceberg.LocationProvider | `Table` class location property | Table location management |
+
+## Core Functionality
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.Catalog | `iceberg.py` -> `create_table`, `load_table` | Table catalog operations |
+| org.apache.iceberg.BaseMetastoreCatalog | `iceberg.py` -> `Table` constructor | Metastore catalog base |
+| org.apache.iceberg.SerializableTable | `metadata_manager.py` -> JSON serialization | Serialization functionality |
+
+## Key Differences in Approach:
+
+1. **Simplified Structure**: Python implementation combines multiple Java classes into fewer, more focused Python classes
+2. **JSON Serialization**: Uses JSON instead of Avro for metadata persistence (implementation choice)
+3. **Optimistic Concurrency Control**: Implements OCC following Iceberg's atomic commit pattern instead of pessimistic locking
+4. **Package Organization**: Single directory instead of multi-package Java structure
+5. **File Format**: Uses JSON for manifest lists instead of Avro (implementation choice)
+
+## Optimistic Concurrency Control Implementation:
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.exceptions.CommitFailedException | `metadata_manager.py` -> `ConcurrentModificationException` | Exception for conflict detection |
+| org.apache.iceberg.BaseMetastoreTableOperations.commit | `metadata_manager.py` -> `commit` method with OCC | Atomic commit with version checks |
+| org.apache.iceberg.BaseTransaction | `transaction.py` -> `commit` method with retry logic | OCC retry mechanism |
+| Atomic file operations | `metadata_manager.py` -> version hint updates | Atomic operations for consistency |
+| Optimistic locking patterns | `metadata_manager.py` -> base vs current comparison | OCC validation logic |
+
+## File Management Implementation:
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.ManifestFile | `file_manager.py` -> `create_manifest_file`, `read_manifest_file` | Manifest file operations |
+| org.apache.iceberg.ManifestList | `file_manager.py` -> `create_manifest_list_file`, `read_manifest_list_file` | Manifest list operations |
+| org.apache.iceberg.io.FileIO | `file_manager.py` -> `FileManager` class | File system operations |
+| org.apache.iceberg.util.FileUtil | `file_manager.py` -> `validate_file_exists`, `validate_data_files` | File validation utilities |
+| org.apache.iceberg.ManifestReader | `file_manager.py` -> `read_manifest_file` | Manifest reading functionality |
+| org.apache.iceberg.ManifestWriter | `file_manager.py` -> `create_manifest_file` | Manifest writing functionality |
+| org.apache.iceberg.VerifyFiles | `file_manager.py` -> `verify_integrity` | File integrity verification |
+
+## Data Operations Implementation:
+
+| Java Class | Python Implementation | Notes |
+|------------|----------------------|-------|
+| org.apache.iceberg.data.FileHelpers | `data_operations.py` -> `DataFileWriter`, `DataFileReader` | Data file read/write utilities |
+| org.apache.iceberg.parquet.ParquetFileIO | `data_operations.py` -> Parquet support via PyArrow | Parquet file operations |
+| org.apache.iceberg.SchemaParser | `data_operations.py` -> `create_arrow_schema` | Schema conversion functionality |
+| org.apache.iceberg.io.InputFile | `data_operations.py` -> `DataFileReader` | Data input operations |
+| org.apache.iceberg.io.OutputFile | `data_operations.py` -> `DataFileWriter` | Data output operations |
+| org.apache.iceberg.util.SerializationUtil | `data_operations.py` -> `validate_data_compatibility` | Data serialization utilities |
+
+## Not Implemented (Advanced Features):
+
+- Encryption and security features
+- Distributed transaction coordination
+- Advanced partition transforms
+- Row-level delete files beyond file-level deletes
+- Advanced optimization operations (compaction, etc.)
+- All catalog implementations (Hadoop, Hive, etc.)

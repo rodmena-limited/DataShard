@@ -1,0 +1,13 @@
+name: python-docs
+base: /Users/farshid/develop/iceberg/datashard
+
+python:
+  version: 3.8
+  install:
+    - requirements: requirements-docs.txt
+
+build:
+  image: latest
+
+sphinx:
+  configuration: docs/conf.py
