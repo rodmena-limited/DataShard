@@ -29,7 +29,6 @@ What is datashard?
 
 datashard is a Python package that provides safe concurrent data operations for machine learning and AI workloads. It implements the core concepts of Apache Iceberg to give you:
 
-Copyright (c) RODMENA LIMITED. Licensed under Apache 2.0.
 
 - ACID transactions: Operations either fully complete or fully fail
 - Time travel: Ability to look at your data as it existed at any point in time  
@@ -83,6 +82,24 @@ Installation
 
 pip install datashard
 
+Avro Support
+============
+
+datashard supports Apache Avro files alongside Parquet and ORC formats. You can work with Avro files just like other formats:
+
+from datashard import DataFile, FileFormat
+
+# Create Avro data file reference
+avro_file = DataFile(
+    file_path="/data/sample.avro",
+    file_format=FileFormat.AVRO,  # Avro support
+    partition_values={"year": 2023},
+    record_count=1000,
+    file_size_in_bytes=512000
+)
+
+datashard automatically handles reading and writing Avro files with proper schema management.
+
 Quick Start
 ===========
 
@@ -98,6 +115,27 @@ table.append_records([
 
 # Access data from any point in time
 historical_snapshot = table.time_travel(snapshot_id=12345)
+
+# Complete example:
+from datashard import create_table
+
+# Create a new table
+my_table = create_table("./my_data_table")
+
+# Add sample data
+sample_data = [
+    {"id": 1, "name": "Alice", "age": 30},
+    {"id": 2, "name": "Bob", "age": 25},
+    {"id": 3, "name": "Charlie", "age": 35}
+]
+
+# Safely append data
+success = my_table.append_records(sample_data)
+print(f"Data successfully added: {success}")
+
+# Check current snapshot
+current = my_table.current_snapshot()
+print(f"Current snapshot: {current.snapshot_id}")
 
 Safety Guarantee
 ================
@@ -123,4 +161,4 @@ Enjoy using datashard!
 Farshid.
 
 
-
+Copyright (c) RODMENA LIMITED. Licensed under Apache 2.0.
