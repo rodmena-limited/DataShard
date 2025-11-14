@@ -153,7 +153,7 @@ class MetadataManager:
             return []
         return metadata.snapshot_log
 
-    def _write_metadata_file(self, path: str, metadata: TableMetadata):
+    def _write_metadata_file(self, path: str, metadata: TableMetadata) -> None:
         """Write metadata to a JSON file"""
         metadata_dict = self._metadata_to_dict(metadata)
 
@@ -282,7 +282,7 @@ class MetadataManager:
         # Reconstruct sort orders
         sort_orders = []
         for order_dict in metadata_dict['sort_orders']:
-            fields = [
+            sort_fields = [
                 SortField(
                     source_id=field_dict['source_id'],
                     field_id=field_dict['field_id'],
@@ -293,7 +293,7 @@ class MetadataManager:
             ]
             sort_orders.append(SortOrder(
                 order_id=order_dict['order_id'],
-                fields=fields
+                fields=sort_fields
             ))
 
         # Reconstruct snapshots
@@ -339,7 +339,7 @@ class MetadataManager:
             metadata_log=metadata_dict['metadata_log']
         )
 
-    def _write_version_hint(self, version: int):
+    def _write_version_hint(self, version: int) -> None:
         """Write the current version number to a hint file"""
         hint_path = os.path.join(self.table_path, 'metadata.version-hint.text')
         with open(hint_path, 'w', encoding='utf-8') as f:

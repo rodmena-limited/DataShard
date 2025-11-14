@@ -114,13 +114,13 @@ class SnapshotManager:
         """Rollback the table to a specific snapshot"""
         raise NotImplementedError("Rollback functionality requires more complex implementation")
 
-    def time_travel_to(self, snapshot_id: int):
+    def time_travel_to(self, snapshot_id: int) -> Any:
         """Time travel to a specific snapshot"""
         # This would typically involve setting the current snapshot to the specified one
         # For our implementation, we'll return the snapshot data for the user to work with
         return self.get_snapshot_by_id(snapshot_id)
 
-    def time_travel_to_timestamp(self, timestamp_ms: int):
+    def time_travel_to_timestamp(self, timestamp_ms: int) -> Any:
         """Time travel to a snapshot at or before a specific timestamp"""
         snapshot = self.get_snapshot_by_timestamp(timestamp_ms)
         if snapshot:

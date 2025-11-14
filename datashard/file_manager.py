@@ -4,7 +4,7 @@ File system operations and manifest management for the Python Iceberg implementa
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .data_operations import DataFileManager
 from .data_structures import DataFile, FileFormat, ManifestContent, ManifestFile
@@ -53,7 +53,7 @@ class FileManager:
 
     def create_manifest_file(self, data_files: List[DataFile],
                            manifest_content: ManifestContent = ManifestContent.DATA,
-                           snapshot_id: int = None) -> ManifestFile:
+                           snapshot_id: Optional[int] = None) -> ManifestFile:
         """Create a manifest file containing the specified data files"""
         # Generate a unique manifest file name
         timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
@@ -102,19 +102,28 @@ class FileManager:
         with open(manifest_path, 'w') as f:
             json.dump(manifest_data, f, indent=2)
 
-        # Return the manifest file structure
+        # Return the manifest file structure ensuring all integer conversions are safe
+        manifest_length = manifest_data["manifest_length"]
+        partition_spec_id = manifest_data["partition_spec_id"]
+        added_snapshot_id = manifest_data["added_snapshot_id"]
+        added_data_files_count = manifest_data["added_data_files_count"]
+        existing_data_files_count = manifest_data["existing_data_files_count"]
+        deleted_data_files_count = manifest_data["deleted_data_files_count"]
+        sequence_number = manifest_data.get("sequence_number")
+        min_sequence_number = manifest_data.get("min_sequence_number")
+        
         return ManifestFile(
             manifest_path=manifest_path,
-            manifest_length=manifest_length,
-            partition_spec_id=manifest_data["partition_spec_id"],
-            added_snapshot_id=manifest_data["added_snapshot_id"],
-            added_data_files_count=manifest_data["added_data_files_count"],
-            existing_data_files_count=manifest_data["existing_data_files_count"],
-            deleted_data_files_count=manifest_data["deleted_data_files_count"],
-            partitions=manifest_data["partitions"],
+            manifest_length=int(manifest_length) if isinstance(manifest_length, (int, str)) else 0,
+            partition_spec_id=int(partition_spec_id) if isinstance(partition_spec_id, (int, str)) else 0,
+            added_snapshot_id=int(added_snapshot_id) if added_snapshot_id is not None and isinstance(added_snapshot_id, (int, str)) else None,
+            added_data_files_count=int(added_data_files_count) if isinstance(added_data_files_count, (int, str)) else 0,
+            existing_data_files_count=int(existing_data_files_count) if isinstance(existing_data_files_count, (int, str)) else 0,
+            deleted_data_files_count=int(deleted_data_files_count) if isinstance(deleted_data_files_count, (int, str)) else 0,
+            partitions=manifest_data["partitions"] if isinstance(manifest_data["partitions"], list) else [],
             content=ManifestContent(manifest_data["content"]),
-            sequence_number=manifest_data.get("sequence_number"),
-            min_sequence_number=manifest_data.get("min_sequence_number")
+            sequence_number=int(sequence_number) if sequence_number is not None and isinstance(sequence_number, (int, str)) else None,
+            min_sequence_number=int(min_sequence_number) if min_sequence_number is not None and isinstance(min_sequence_number, (int, str)) else None
         )
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
@@ -231,7 +240,8 @@ class FileManager:
 
     def verify_integrity(self, manifest_files: List[ManifestFile]) -> Dict[str, Any]:
         """Verify the integrity of all files referenced in manifests"""
-        report = {
+        from typing import Union
+        report: Dict[str, Any] = {
             "total_files": 0,
             "existing_files": 0,
             "missing_files": [],

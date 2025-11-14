@@ -3,12 +3,13 @@ Main module for the Python Iceberg implementation
 Provides the primary API for working with Iceberg tables
 """
 import os
+from typing import Optional
 
-from .data_structures import DataFile, FileFormat
+from .data_structures import DataFile, FileFormat, Schema, PartitionSpec
 from .transaction import Table, Transaction
 
 
-def create_table(table_path: str, schema = None, partition_spec = None) -> 'Table':
+def create_table(table_path: str, schema: Optional[Schema] = None, partition_spec: Optional[PartitionSpec] = None) -> 'Table':
     """
     Create a new Iceberg table
 

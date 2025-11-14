@@ -35,7 +35,8 @@ class Transaction:
         self._is_rolled_back = False
 
         # Operations queue
-        self._operations = []
+        self._operations: List[Dict[str, Any]] = []
+        
         self._lock = threading.RLock()
 
     def begin(self) -> 'Transaction':
@@ -47,7 +48,7 @@ class Transaction:
             self._is_active = True
             self._is_committed = False
             self._is_rolled_back = False
-            self._operations = []
+            
 
             return self
 
@@ -187,11 +188,13 @@ class Transaction:
                     self.snapshot_manager.create_snapshot(
                         manifest_list_path=manifest_list_path,
                         operation="append" if any(op['type'] == 'append_files' for op in self._operations) else "update",
-                        parent_snapshot_id=base_metadata.current_snapshot_id  # Use base as parent
+                        parent_snapshot_id=base_metadata.current_snapshot_id if base_metadata.current_snapshot_id is not None else -1  # Use base as parent
                     )
 
                     # The snapshot manager already updated the metadata, so get the latest
-                    new_metadata = self.metadata_manager.refresh()
+                    refreshed_metadata = self.metadata_manager.refresh()
+                    if refreshed_metadata is not None:
+                        new_metadata = refreshed_metadata
 
                     self._is_active = False
                     self._is_committed = True
@@ -230,7 +233,7 @@ class Transaction:
         """Internal method to perform rollback"""
         self._is_active = False
         self._is_rolled_back = True
-        self._operations = []
+        
         return True
 
     def _apply_operation(self, metadata: TableMetadata, operation: Dict[str, Any]) -> TableMetadata:
@@ -276,7 +279,7 @@ class Transaction:
 
         # In a real implementation, this would create an Avro manifest list file
         # For now, we'll create a simple JSON placeholder
-        manifest_list_data = {
+        manifest_list_data: Dict[str, Any] = {
             'manifests': [],
             'snapshot_id': metadata.current_snapshot_id,
             'timestamp': metadata.last_updated_ms
@@ -287,7 +290,7 @@ class Transaction:
 
         return manifest_list_path
 
-    def _create_manifest_list_with_id(self, metadata: TableMetadata, snapshot_id: int, data_files: List[DataFile] = None) -> str:
+    def _create_manifest_list_with_id(self, metadata: TableMetadata, snapshot_id: int, data_files: Optional[List[DataFile]] = None) -> str:
         """Create a manifest list file for a specific snapshot ID"""
         if data_files is None:
             data_files = []
@@ -318,11 +321,11 @@ class Transaction:
         import copy
         return copy.deepcopy(metadata)
 
-    def __enter__(self):
+    def __enter__(self) -> "Transaction":
         """Context manager entry"""
         return self.begin()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Context manager exit"""
         if exc_type is not None:
             self.rollback()
@@ -337,7 +340,7 @@ class TransactionManager:
         self.metadata_manager = metadata_manager
         self.snapshot_manager = snapshot_manager
         self.file_manager = file_manager
-        self._active_transactions = {}
+        self._active_transactions: Dict[int, "Transaction"] = {}
         self._lock = threading.RLock()
 
     def begin_transaction(self) -> Transaction:
@@ -353,7 +356,7 @@ class TransactionManager:
         with self._lock:
             return [tx for tx in self._active_transactions.values() if tx.is_active()]
 
-    def cleanup_completed_transactions(self):
+    def cleanup_completed_transactions(self) -> None:
         """Remove completed/failed transactions from tracking"""
         with self._lock:
             completed_ids = []
@@ -379,7 +382,7 @@ class Table:
         if create_if_not_exists and not os.path.exists(os.path.join(table_path, 'metadata')):
             self._initialize_table()
 
-    def _initialize_table(self):
+    def _initialize_table(self) -> None:
         """Initialize a new table with default metadata"""
         from .data_structures import TableMetadata
 
@@ -404,7 +407,7 @@ class Table:
         """Get all snapshots"""
         return self.snapshot_manager.list_snapshots()
 
-    def time_travel(self, snapshot_id: int = None, timestamp: int = None) -> Any:
+    def time_travel(self, snapshot_id: Optional[int] = None, timestamp: Optional[int] = None) -> Any:
         """Time travel to a specific snapshot or timestamp"""
         if snapshot_id is not None:
             return self.snapshot_manager.time_travel_to(snapshot_id)
@@ -417,7 +420,8 @@ class Table:
         """Append data files to the table (convenience method)"""
         with self.new_transaction() as tx:
             tx.append_files(files)
-            return tx.commit()
+            result = tx.commit()
+            return bool(result)
 
     def append_records(self, records: List[Dict[str, Any]],
                       schema: 'Schema',
@@ -425,7 +429,8 @@ class Table:
         """Append actual data records to the table by creating new data files (convenience method)"""
         with self.new_transaction() as tx:
             tx.append_data(records=records, schema=schema, partition_values=partition_values)
-            return tx.commit()
+            result = tx.commit()
+            return bool(result)
 
     def refresh(self) -> bool:
         """Refresh the table metadata from storage"""

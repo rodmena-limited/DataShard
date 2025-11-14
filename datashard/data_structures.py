@@ -29,7 +29,7 @@ class Schema:
     fields: List[Dict[str, Any]]
     schema_string: str = ""
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.schema_string:
             self.schema_string = json.dumps(self.fields)
 
@@ -124,7 +124,7 @@ class Snapshot:
     summary: Optional[Dict[str, str]] = None
     schema_id: Optional[int] = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.summary is None:
             self.summary = {}
 
@@ -157,7 +157,7 @@ class TableMetadata:
     snapshot_log: List[HistoryEntry] = field(default_factory=list)
     metadata_log: List[Dict[str, Any]] = field(default_factory=list)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.schemas:
             # Create a default empty schema
             self.schemas = [Schema(schema_id=0, fields=[])]

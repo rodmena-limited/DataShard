@@ -17,24 +17,24 @@ class DataFileReader:
     def __init__(self, file_path: str, file_format: FileFormat, schema: Optional[pa.Schema] = None):
         self.file_path = file_path
         self.file_format = file_format
-        self.schema = schema
+        self._schema = schema  # Use private attribute to not conflict with schema method
         self._reader = None
 
-    def __enter__(self):
+    def __enter__(self) -> "DataFileReader":
         self.open()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def open(self):
+    def open(self) -> None:
         """Open the data file for reading"""
         if self.file_format == FileFormat.PARQUET:
             self._reader = pq.ParquetFile(self.file_path)
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
 
-    def close(self):
+    def close(self) -> None:
         """Close the data file"""
         if self._reader:
             # ParquetFile doesn't need explicit closing in pyarrow
@@ -77,20 +77,20 @@ class DataFileWriter:
                  schema: pa.Schema, metadata: Optional[Dict[str, Any]] = None):
         self.file_path = file_path
         self.file_format = file_format
-        self.schema = schema
+        self._schema = schema  # Use private attribute to not conflict with schema method
         self.metadata = metadata or {}
         self._writer = None
         self._temp_file = None
         self._row_count = 0
 
-    def __enter__(self):
+    def __enter__(self) -> "DataFileReader":
         self.open()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def open(self):
+    def open(self) -> None:
         """Open the data file for writing"""
         if self.file_format == FileFormat.PARQUET:
             # Create a temporary file first
@@ -100,11 +100,11 @@ class DataFileWriter:
             )
 
             # Add our metadata to the schema
-            schema_metadata = self.schema.metadata if self.schema.metadata else {}
+            schema_metadata = self._schema.metadata if self._schema.metadata else {}
             for key, value in self.metadata.items():
                 schema_metadata[key.encode('utf-8')] = str(value).encode('utf-8')
 
-            modified_schema = self.schema.with_metadata(schema_metadata)
+            modified_schema = self._schema.with_metadata(schema_metadata)
 
             self._writer = pq.ParquetWriter(
                 self._temp_file.name,
@@ -114,7 +114,7 @@ class DataFileWriter:
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
 
-    def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]):
+    def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
         """Write a batch of data to the file"""
         if not self._writer:
             self.open()
@@ -128,17 +128,17 @@ class DataFileWriter:
             self._writer.write_batch(batch)
             self._row_count += batch.num_rows
 
-    def write_records(self, records: List[Dict[str, Any]]):
+    def write_records(self, records: List[Dict[str, Any]]) -> None:
         """Write a list of records to the file"""
         if not self._writer:
             self.open()
 
         if records:
             # Convert records to Arrow Table
-            table = pa.Table.from_pylist(records, schema=self.schema)
+            table = pa.Table.from_pylist(records, schema=self._schema)
             self.write_batch(table)
 
-    def close(self):
+    def close(self) -> None:
         """Close the writer and finalize the file"""
         if self._writer:
             self._writer.close()
@@ -161,9 +161,9 @@ class DataFileWriter:
 class DataFileManager:
     """Manages data file operations, reading and writing"""
 
-    def __init__(self, file_manager):
+    def __init__(self, file_manager: "FileManager") -> None:
         self.file_manager = file_manager
-        self._arrow_schema_cache = {}
+        self._arrow_schema_cache: Dict[int, pa.Schema] = {}
 
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
         """Convert Iceberg schema to PyArrow schema"""
@@ -188,7 +188,7 @@ class DataFileManager:
         self._arrow_schema_cache[iceberg_schema.schema_id] = schema
         return schema
 
-    def _iceberg_type_to_arrow(self, iceberg_type: Union[str, Dict]) -> pa.DataType:
+    def _iceberg_type_to_arrow(self, iceberg_type: Union[str, Dict[str, Any]]) -> pa.DataType:
         """Convert Iceberg type string to PyArrow type"""
         if isinstance(iceberg_type, dict):
             iceberg_type = iceberg_type.get('type', 'string')
@@ -219,7 +219,7 @@ class DataFileManager:
             elif iceberg_type.startswith('struct<'):
                 return pa.string()  # For now, treat as string
 
-        return type_mapping.get(iceberg_type, pa.string())  # Default to string
+        return type_mapping.get(str(iceberg_type), pa.string())  # Default ...string
 
     def write_data_file(self,
                        file_path: str,
