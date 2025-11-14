@@ -6,9 +6,9 @@ import boto3
 import os
 
 # S3 configuration
-endpoint_url = "https://s3.rodmena.co.uk"
-access_key = "rodmena"
-secret_key = "pleasebeready"
+endpoint_url = "https://s3.london.cloudsci.uk"
+access_key = "rodmena-limited"
+secret_key = "pX1r4t3dS3cr3tK3y!"
 bucket_name = "datashard"
 region = "us-east-1"
 
