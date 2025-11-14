@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.1.3"
+version = "0.2.1"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts"
 readme = "README.txt"
 requires-python = ">=3.7"
