@@ -1,4 +1,7 @@
-				  //
+# DataShard
+
+```
+                  //
                  //
                 //
                //
@@ -15,71 +18,76 @@
     //___________________/
 
        D A T A S H A R D
+```
 
+**Iceberg-Inspired Safe Concurrent Data Operations for Python**
 
-===============================================================================
-DataShard - Iceberg-Inspired Safe Concurrent Data Operations for Python
-===============================================================================
+---
 
-What is DataShard?
-==================
+## What is DataShard?
 
-DataShard is a Python implementation of Apache Iceberg's core concepts, providing
-ACID-compliant data operations for ML/AI workloads. It ensures your data stays
-safe even when multiple processes read and write simultaneously.
+DataShard is a Python implementation of Apache Iceberg's core concepts, providing ACID-compliant data operations for ML/AI workloads. It ensures your data stays safe even when multiple processes read and write simultaneously.
 
-Key Features:
-- ✅ ACID Transactions: Operations fully complete or fully rollback
-- ✅ Time Travel: Query data as it existed at any point in time
-- ✅ Safe Concurrency: Multiple processes can write without corruption
-- ✅ Optimistic Concurrency Control (OCC): Automatic conflict resolution
-- ✅ Pure Python: No Java dependencies, easy setup
-- ✅ pandas Integration: Native DataFrame support
+### Key Features
 
+- **ACID Transactions:** Operations fully complete or fully rollback
+- **Time Travel:** Query data as it existed at any point in time
+- **Safe Concurrency:** Multiple processes can write without corruption
+- **Optimistic Concurrency Control (OCC):** Automatic conflict resolution
+- **Pure Python:** No Java dependencies, easy setup
+- **pandas Integration:** Native DataFrame support
 
-Why DataShard Matters: The Data Corruption Problem
-===================================================
+---
+
+## Why DataShard Matters: The Data Corruption Problem
 
 **The Problem:** Regular file operations in Python are NOT safe for concurrent access.
 
 When multiple processes write to the same file, you get:
-  ❌ Data loss from race conditions
-  ❌ Partial writes that corrupt your data
-  ❌ Silent failures that go unnoticed
-  ❌ Unpredictable results
+- Data loss from race conditions
+- Partial writes that corrupt your data
+- Silent failures that go unnoticed
+- Unpredictable results
 
-**Our Stress Test Results:**
+### Our Stress Test Results
 
-  Test Setup: 12 processes, each performing 10,000 operations
-  Expected Result: 120,000 total operations
+**Test Setup:** 12 processes, each performing 10,000 operations
+**Expected Result:** 120,000 total operations
 
-  Regular Files:
-    - Actual Result: Only 8,566 operations completed
-    - Data Loss: 111,434 operations LOST (93% failure rate!)
-    - Cause: Race conditions from simultaneous file access
+**Regular Files:**
+- Actual Result: Only 8,566 operations completed
+- Data Loss: 111,434 operations LOST (93% failure rate!)
+- Cause: Race conditions from simultaneous file access
 
-  DataShard (Iceberg):
-    - Actual Result: 120,000 operations completed
-    - Data Loss: ZERO (0% failure rate)
-    - Cause: ACID transactions with OCC prevent all race conditions
+**DataShard (Iceberg):**
+- Actual Result: 120,000 operations completed
+- Data Loss: ZERO (0% failure rate)
+- Cause: ACID transactions with OCC prevent all race conditions
 
+---
 
-Installation
-============
+## Installation
 
 Basic installation:
-    pip install datashard
+```bash
+pip install datashard
+```
 
 With pandas support (recommended):
-    pip install datashard[pandas]
+```bash
+pip install datashard[pandas]
+```
 
 With development tools:
-    pip install datashard[dev]
+```bash
+pip install datashard[dev]
+```
 
+---
 
-Quick Start
-===========
+## Quick Start
 
+```python
 from datashard import create_table, Schema
 
 # 1. Define your schema
@@ -108,26 +116,28 @@ print(f"Snapshot ID: {snapshot.snapshot_id}")
 
 # 5. Time travel to previous state
 old_snapshot = table.snapshot_by_id(previous_snapshot_id)
+```
 
+---
 
-Real-World Use Case: Workflow Execution Logging
-================================================
+## Real-World Use Case: Workflow Execution Logging
 
-**Problem:** A distributed workflow engine runs 100s of tasks across multiple
-workers. Each task needs to log its execution details (status, duration, errors)
-to a central location. Traditional approaches fail:
+### Problem
 
-  ❌ Database: Too slow, adds latency to task execution
-  ❌ Log Files: Corrupted by concurrent writes, not queryable
-  ❌ JSON Files: Race conditions cause data loss
+A distributed workflow engine runs 100s of tasks across multiple workers. Each task needs to log its execution details (status, duration, errors) to a central location. Traditional approaches fail:
 
-**Solution: DataShard as a Queryable Audit Log**
+- **Database:** Too slow, adds latency to task execution
+- **Log Files:** Corrupted by concurrent writes, not queryable
+- **JSON Files:** Race conditions cause data loss
+
+### Solution: DataShard as a Queryable Audit Log
 
 DataShard provides ACID-compliant logging with pandas-queryable tables:
 
 ```python
 from datashard import create_table, Schema
-import time
+import os
+import pandas as pd
 
 # Define task log schema
 task_log_schema = Schema(
@@ -172,7 +182,6 @@ task_logs.append_records([{
 }], task_log_schema)
 
 # Query logs with pandas (from any machine)
-import pandas as pd
 from datashard import load_table
 from datashard.file_manager import FileManager
 
@@ -204,46 +213,46 @@ print(f"Failed tasks: {len(failed_tasks)}")
 print(f"Average duration: {avg_duration}ms")
 ```
 
-**Why DataShard Wins for Logging:**
+### Why DataShard Wins for Logging
 
-✅ **Safe Concurrent Writes:** 100 workers can log simultaneously without corruption
-✅ **Queryable with pandas:** Analyze logs with familiar DataFrame operations
-✅ **Time Travel:** Debug by querying logs as they existed at incident time
-✅ **ACID Guarantees:** Never lose log entries, even during crashes
-✅ **Scalable:** Handles millions of log entries efficiently
-✅ **No Database Needed:** File-based storage, no DB maintenance overhead
+- **Safe Concurrent Writes:** 100 workers can log simultaneously without corruption
+- **Queryable with pandas:** Analyze logs with familiar DataFrame operations
+- **Time Travel:** Debug by querying logs as they existed at incident time
+- **ACID Guarantees:** Never lose log entries, even during crashes
+- **Scalable:** Handles millions of log entries efficiently
+- **No Database Needed:** File-based storage, no DB maintenance overhead
 
+---
 
-Other Real-World Use Cases
-===========================
+## Other Real-World Use Cases
 
-1. **ML Training Metrics:**
-   - Multiple training runs logging metrics simultaneously
-   - Query metrics history for model comparison
-   - Time travel to analyze model performance at specific epochs
+### 1. ML Training Metrics
+- Multiple training runs logging metrics simultaneously
+- Query metrics history for model comparison
+- Time travel to analyze model performance at specific epochs
 
-2. **A/B Test Results:**
-   - Concurrent experiments writing results safely
-   - Aggregate results across all test variants
-   - Historical analysis of test performance
+### 2. A/B Test Results
+- Concurrent experiments writing results safely
+- Aggregate results across all test variants
+- Historical analysis of test performance
 
-3. **Data Pipeline Checkpointing:**
-   - Multiple pipeline stages writing progress markers
-   - Safe recovery from failures using checkpoints
-   - Query pipeline state for monitoring
+### 3. Data Pipeline Checkpointing
+- Multiple pipeline stages writing progress markers
+- Safe recovery from failures using checkpoints
+- Query pipeline state for monitoring
 
-4. **Feature Store:**
-   - Multiple processes computing and storing features
-   - Time travel for point-in-time feature retrieval
-   - Consistent feature snapshots for reproducibility
+### 4. Feature Store
+- Multiple processes computing and storing features
+- Time travel for point-in-time feature retrieval
+- Consistent feature snapshots for reproducibility
 
+---
 
-API Reference
-=============
+## API Reference
 
-Creating and Loading Tables
-----------------------------
+### Creating and Loading Tables
 
+```python
 from datashard import create_table, load_table, Schema
 
 # Create new table
@@ -252,11 +261,11 @@ table = create_table("/path/to/table", schema)
 
 # Load existing table
 table = load_table("/path/to/table")
+```
 
+### Writing Data
 
-Writing Data
-------------
-
+```python
 # Append records
 records = [{"id": 1, "value": "data"}]
 success = table.append_records(records, schema)
@@ -265,11 +274,11 @@ success = table.append_records(records, schema)
 with table.new_transaction() as tx:
     tx.append_data(records, schema)
     tx.commit()
+```
 
+### Reading Data
 
-Reading Data
-------------
-
+```python
 # Get current snapshot
 snapshot = table.current_snapshot()
 
@@ -282,11 +291,11 @@ snapshots = table.snapshots()
 # Time travel
 snapshot = table.time_travel(snapshot_id=12345)
 snapshot = table.time_travel(timestamp=1700000000000)
+```
 
+### Schema Definition
 
-Schema Definition
------------------
-
+```python
 from datashard import Schema
 
 schema = Schema(
@@ -301,135 +310,126 @@ schema = Schema(
         # ... more fields
     ]
 )
+```
 
+---
 
-How DataShard Compares to Apache Iceberg
-=========================================
+## How DataShard Compares to Apache Iceberg
 
-Apache Iceberg:
-  - Java-based, requires JVM
-  - Built for big data platforms (Spark, Flink, Hive)
-  - Excellent performance for petabyte-scale data
-  - Complex setup, requires distributed infrastructure
-  - Production-grade for enterprise data lakes
+### Apache Iceberg
+- Java-based, requires JVM
+- Built for big data platforms (Spark, Flink, Hive)
+- Excellent performance for petabyte-scale data
+- Complex setup, requires distributed infrastructure
+- Production-grade for enterprise data lakes
 
-DataShard:
-  - Pure Python, no JVM required
-  - Built for individual data scientists and ML engineers
-  - Optimized for personal projects and small teams
-  - Simple pip install, file-based storage
-  - Production-ready for Python-centric workflows
+### DataShard
+- Pure Python, no JVM required
+- Built for individual data scientists and ML engineers
+- Optimized for personal projects and small teams
+- Simple pip install, file-based storage
+- Production-ready for Python-centric workflows
 
-**Use Apache Iceberg if:** You're working with petabytes of data in a big data
-                           platform with Spark/Flink/Hive infrastructure.
+**Use Apache Iceberg if:** You're working with petabytes of data in a big data platform with Spark/Flink/Hive infrastructure.
 
-**Use DataShard if:** You're a Python developer who needs safe concurrent data
-                      operations without Java dependencies or complex setup.
+**Use DataShard if:** You're a Python developer who needs safe concurrent data operations without Java dependencies or complex setup.
 
+---
 
-Technical Details
-=================
+## Technical Details
 
 DataShard implements:
-  - Optimistic Concurrency Control (OCC) with automatic retry
-  - Snapshot isolation for consistent reads
-  - Manifest-based metadata tracking (Iceberg's approach)
-  - Parquet format for efficient columnar storage
-  - ACID transaction semantics
+- Optimistic Concurrency Control (OCC) with automatic retry
+- Snapshot isolation for consistent reads
+- Manifest-based metadata tracking (Iceberg's approach)
+- Parquet format for efficient columnar storage
+- ACID transaction semantics
 
+---
 
-Performance Characteristics
-===========================
+## Performance Characteristics
 
-- Writes: O(1) for append operations (no data rewriting)
-- Reads: O(n) where n = number of data files in snapshot
-- Concurrency: Scales linearly with number of processes
-- Storage: Efficient columnar compression with Parquet
-- Metadata: Lightweight JSON-based manifest tracking
+- **Writes:** O(1) for append operations (no data rewriting)
+- **Reads:** O(n) where n = number of data files in snapshot
+- **Concurrency:** Scales linearly with number of processes
+- **Storage:** Efficient columnar compression with Parquet
+- **Metadata:** Lightweight JSON-based manifest tracking
 
+---
 
-Limitations
-===========
+## Limitations
 
-DataShard is optimized for:
-  ✅ Append-heavy workloads (logging, metrics, events)
-  ✅ Hundreds of concurrent writers
-  ✅ Datasets up to hundreds of millions of records
-  ✅ Local or network file systems
+### DataShard is optimized for:
+- Append-heavy workloads (logging, metrics, events)
+- Hundreds of concurrent writers
+- Datasets up to hundreds of millions of records
+- Local or network file systems
 
-DataShard is NOT optimized for:
-  ❌ High-frequency updates/deletes (use a database)
-  ❌ Complex queries (use a query engine like DuckDB)
-  ❌ Petabyte-scale data (use Apache Iceberg with Spark)
-  ❌ Distributed query processing (use Presto/Trino)
+### DataShard is NOT optimized for:
+- High-frequency updates/deletes (use a database)
+- Complex queries (use a query engine like DuckDB)
+- Petabyte-scale data (use Apache Iceberg with Spark)
+- Distributed query processing (use Presto/Trino)
 
+---
 
-Bug Fix: v0.1.3
-================
+## Bug Fix: v0.1.3
 
-**Fixed:** Manifest list creation bug where empty manifest arrays were written
-           during append operations, causing queries to return no data despite
-           parquet files being written correctly.
+**Fixed:** Manifest list creation bug where empty manifest arrays were written during append operations, causing queries to return no data despite parquet files being written correctly.
 
-**Impact:** Queries using the manifest API now return correct data. If you're
-            upgrading from v0.1.2, existing tables will continue to work but
-            won't benefit from the fix until new snapshots are created.
+**Impact:** Queries using the manifest API now return correct data. If you're upgrading from v0.1.2, existing tables will continue to work but won't benefit from the fix until new snapshots are created.
 
-**Details:** Transaction.commit() now correctly extracts data files from queued
-             operations and passes them to _create_manifest_list_with_id().
+**Details:** Transaction.commit() now correctly extracts data files from queued operations and passes them to _create_manifest_list_with_id().
 
+---
 
-Development and Testing
-=======================
+## Development and Testing
 
 Run tests:
-    pytest tests/ -v
+```bash
+pytest tests/ -v
+```
 
 Run specific test:
-    pytest tests/test_manifest_creation.py -v
+```bash
+pytest tests/test_manifest_creation.py -v
+```
 
 With coverage:
-    pytest tests/ --cov=datashard --cov-report=html
+```bash
+pytest tests/ --cov=datashard --cov-report=html
+```
 
+---
 
-Why I Built DataShard
-======================
+## Why I Built DataShard
 
-DataShard was born from my work on the Highway Workflow Engine, a strictly
-atomic workflow system. I needed to record massive amounts of execution metadata
-from hundreds of concurrent workers without risking data corruption.
+DataShard was born from my work on the Highway Workflow Engine, a strictly atomic workflow system. I needed to record massive amounts of execution metadata from hundreds of concurrent workers without risking data corruption.
 
-I've had painful experiences with Java-based solutions in the past. Apache
-Iceberg conceptually fit my needs perfectly, but I wanted a pure Python solution
-that was simple to deploy and maintain.
+I've had painful experiences with Java-based solutions in the past. Apache Iceberg conceptually fit my needs perfectly, but I wanted a pure Python solution that was simple to deploy and maintain.
 
-Building a production-grade concurrent storage system seemed daunting, but we're
-in 2025 now, and modern AI tools (specifically Gemini) made it possible to
-implement complex Optimistic Concurrency Control logic in pure Python.
+Building a production-grade concurrent storage system seemed daunting, but we're in 2025 now, and modern AI tools (specifically Gemini) made it possible to implement complex Optimistic Concurrency Control logic in pure Python.
 
-The result is DataShard: a battle-tested, production-ready solution for safe
-concurrent data operations that's helped Highway log millions of workflow
-executions without a single data corruption issue.
+The result is DataShard: a battle-tested, production-ready solution for safe concurrent data operations that's helped Highway log millions of workflow executions without a single data corruption issue.
 
-If you're building distributed systems in Python and need safe concurrent data
-operations, DataShard can help.
+If you're building distributed systems in Python and need safe concurrent data operations, DataShard can help.
 
 Enjoy using DataShard!
-Farshid.
+**Farshid**
 
+---
 
-License
-=======
+## License
 
 Copyright (c) RODMENA LIMITED
 Licensed under Apache License 2.0
 
 For full license text, see LICENSE file in the repository.
 
+---
 
-Links
-=====
+## Links
 
-Homepage: https://github.com/rodmena-limited/datashard
-Documentation: https://datashard.readthedocs.io/
-Issues: https://github.com/rodmena-limited/datashard/issues
+- **Homepage:** https://github.com/rodmena-limited/datashard
+- **Documentation:** https://datashard.readthedocs.io/
+- **Issues:** https://github.com/rodmena-limited/datashard/issues
