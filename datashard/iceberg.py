@@ -5,7 +5,7 @@ Provides the primary API for working with Iceberg tables
 import os
 from typing import Optional
 
-from .data_structures import DataFile, FileFormat, Schema, PartitionSpec
+from .data_structures import DataFile, FileFormat, PartitionSpec, Schema
 from .transaction import Table, Transaction
 
 

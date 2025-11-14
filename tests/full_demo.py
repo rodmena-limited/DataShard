@@ -9,7 +9,8 @@ import sys
 import tempfile
 import time
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add the parent directory to sys.path to import datashard modules
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 # Test 1: Data corruption with normal file operations
 def normal_file_corruption_test():
@@ -124,9 +125,8 @@ def iceberg_safety_test():
         table_dir = os.path.join(temp_dir, "iceberg_table")
 
         # Create Iceberg table
-        from iceberg import create_table
-
-        from .data_structures import Schema
+        from datashard.data_structures import Schema
+        from datashard.iceberg import create_table
 
         # Create schema for our test data
         schema = Schema(
@@ -191,7 +191,7 @@ def iceberg_worker(table_dir, worker_id, operations, schema):
     """Worker that performs Iceberg operations safely"""
     # Each process should work independently with OCC handling conflicts
     try:
-        from iceberg import load_table
+        from datashard.iceberg import load_table
 
         for i in range(operations):
             # Create some data to append

@@ -173,7 +173,7 @@ def test_metadata_management():
         table = create_table(table_path)
 
         # Test schema creation
-        schema = Schema(
+        Schema(
             schema_id=1,
             fields=[
                 {"id": 1, "name": "id", "type": "long", "required": True},
@@ -182,7 +182,7 @@ def test_metadata_management():
         )
 
         # Test partition spec
-        partition_spec = PartitionSpec(
+        PartitionSpec(
             spec_id=0,
             fields=[
                 PartitionField(source_id=1, field_id=1000, name="id_partition", transform="identity")

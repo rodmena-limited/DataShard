@@ -34,7 +34,7 @@ def normal_file_demo():
 
         # Start 12 processes
         processes = []
-        for i in range(12):
+        for _i in range(12):
             p = multiprocessing.Process(target=normal_increment_worker, args=(counter_file, 10000))
             processes.append(p)
             p.start()
@@ -72,7 +72,7 @@ def normal_file_demo():
 
 def normal_increment_worker(counter_file, iterations):
     """Worker that increments counter in shared file"""
-    for i in range(iterations):
+    for _i in range(iterations):
         try:
             # Read current value
             with open(counter_file, 'r') as f:

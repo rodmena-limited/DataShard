@@ -24,7 +24,7 @@ class DataFileReader:
         self.open()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
     def open(self) -> None:
@@ -87,7 +87,7 @@ class DataFileWriter:
         self.open()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
     def open(self) -> None:
@@ -168,7 +168,7 @@ class DataFileManager:
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
         """Convert Iceberg schema to PyArrow schema"""
         if iceberg_schema.schema_id in self._arrow_schema_cache:
-            return self._arrow_schema_cache[iceberg_schema.schema_id]
+            return self  # type: ignore[generic-type]._arrow_schema_cache[iceberg_schema.schema_id]
 
         fields = []
         for field in iceberg_schema.fields:

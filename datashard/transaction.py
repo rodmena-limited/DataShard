@@ -36,7 +36,7 @@ class Transaction:
 
         # Operations queue
         self._operations: List[Dict[str, Any]] = []
-        
+
         self._lock = threading.RLock()
 
     def begin(self) -> 'Transaction':
@@ -48,7 +48,7 @@ class Transaction:
             self._is_active = True
             self._is_committed = False
             self._is_rolled_back = False
-            
+
 
             return self
 
@@ -233,7 +233,7 @@ class Transaction:
         """Internal method to perform rollback"""
         self._is_active = False
         self._is_rolled_back = True
-        
+
         return True
 
     def _apply_operation(self, metadata: TableMetadata, operation: Dict[str, Any]) -> TableMetadata:

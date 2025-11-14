@@ -158,7 +158,7 @@ def test_schema_compatibility():
 
         # Test data file creation with this schema
         parquet_file = os.path.join(temp_dir, "compat_test.parquet")
-        data_file = data_manager.write_data_file(
+        data_manager.write_data_file(
             file_path=parquet_file,
             records=valid_records,
             iceberg_schema=schema

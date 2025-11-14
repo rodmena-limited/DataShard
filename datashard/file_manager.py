@@ -51,6 +51,21 @@ class FileManager:
                 raise FileNotFoundError(f"Data file does not exist: {data_file.file_path}")
         return True
 
+    def _safe_int(self, value, default=0) -> int:
+        """Safely convert a value to int, returning default if conversion fails"""
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return default
+        if isinstance(value, (float, bool)):
+            return int(value)
+        return default  # type: ignore[return-value]
+
     def create_manifest_file(self, data_files: List[DataFile],
                            manifest_content: ManifestContent = ManifestContent.DATA,
                            snapshot_id: Optional[int] = None) -> ManifestFile:
@@ -102,28 +117,19 @@ class FileManager:
         with open(manifest_path, 'w') as f:
             json.dump(manifest_data, f, indent=2)
 
-        # Return the manifest file structure ensuring all integer conversions are safe
-        manifest_length = manifest_data["manifest_length"]
-        partition_spec_id = manifest_data["partition_spec_id"]
-        added_snapshot_id = manifest_data["added_snapshot_id"]
-        added_data_files_count = manifest_data["added_data_files_count"]
-        existing_data_files_count = manifest_data["existing_data_files_count"]
-        deleted_data_files_count = manifest_data["deleted_data_files_count"]
-        sequence_number = manifest_data.get("sequence_number")
-        min_sequence_number = manifest_data.get("min_sequence_number")
-        
+        # Return the manifest file structure using safe integer conversions
         return ManifestFile(
             manifest_path=manifest_path,
-            manifest_length=int(manifest_length) if isinstance(manifest_length, (int, str)) else 0,
-            partition_spec_id=int(partition_spec_id) if isinstance(partition_spec_id, (int, str)) else 0,
-            added_snapshot_id=int(added_snapshot_id) if added_snapshot_id is not None and isinstance(added_snapshot_id, (int, str)) else None,
-            added_data_files_count=int(added_data_files_count) if isinstance(added_data_files_count, (int, str)) else 0,
-            existing_data_files_count=int(existing_data_files_count) if isinstance(existing_data_files_count, (int, str)) else 0,
-            deleted_data_files_count=int(deleted_data_files_count) if isinstance(deleted_data_files_count, (int, str)) else 0,
+            manifest_length=self._safe_int(manifest_data["manifest_length"]),
+            partition_spec_id=self._safe_int(manifest_data["partition_spec_id"]),
+            added_snapshot_id=self._safe_int(manifest_data["added_snapshot_id"], None),
+            added_data_files_count=self._safe_int(manifest_data["added_data_files_count"]),
+            existing_data_files_count=self._safe_int(manifest_data["existing_data_files_count"]),
+            deleted_data_files_count=self._safe_int(manifest_data["deleted_data_files_count"]),
             partitions=manifest_data["partitions"] if isinstance(manifest_data["partitions"], list) else [],
             content=ManifestContent(manifest_data["content"]),
-            sequence_number=int(sequence_number) if sequence_number is not None and isinstance(sequence_number, (int, str)) else None,
-            min_sequence_number=int(min_sequence_number) if min_sequence_number is not None and isinstance(min_sequence_number, (int, str)) else None
+            sequence_number=self._safe_int(manifest_data.get("sequence_number"), None),
+            min_sequence_number=self._safe_int(manifest_data.get("min_sequence_number"), None)
         )
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
@@ -240,7 +246,6 @@ class FileManager:
 
     def verify_integrity(self, manifest_files: List[ManifestFile]) -> Dict[str, Any]:
         """Verify the integrity of all files referenced in manifests"""
-        from typing import Union
         report: Dict[str, Any] = {
             "total_files": 0,
             "existing_files": 0,
