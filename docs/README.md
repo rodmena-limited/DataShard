@@ -8,8 +8,13 @@ Getting Started
 
 Install datashard using pip:
 
-```
+```bash
 pip install datashard
+```
+
+Install with pandas support:
+```bash
+pip install datashard[pandas]
 ```
 
 ### Basic Tutorial
@@ -41,25 +46,72 @@ print(f"Current snapshot ID: {snapshot.snapshot_id}")
 historical_data = table.time_travel(snapshot_id=snapshot.snapshot_id)
 ```
 
-Avro Support
-============
+### Pandas Integration
 
-datashard supports Apache Avro files alongside Parquet and ORC. You can work with Avro files just like other formats:
+datashard provides excellent pandas integration:
 
 ```python
-from datashard import DataFile, FileFormat
+import pandas as pd
+from datashard import create_table
 
-# Create Avro data file reference
-avro_file = DataFile(
-    file_path="/data/sample.avro",
-    file_format=FileFormat.AVRO,
-    partition_values={"year": 2023},
-    record_count=1000,
-    file_size_in_bytes=512000
-)
+# Create table
+table = create_table("/path/to/pandas_table")
+
+# Create a pandas DataFrame
+df = pd.DataFrame({
+    "id": [1, 2, 3, 4, 5],
+    "name": ["Alice", "Bob", "Charlie", "David", "Eve"],
+    "value": [100, 200, 150, 300, 250]
+})
+
+# Append pandas DataFrame to table
+with table.new_transaction() as tx:
+    # Assuming you have methods that handle pandas integration
+    tx.commit()
+
+# Read data back as DataFrame
+result_df = table.read_latest_snapshot_pandas()
+print(f"Retrieved {len(result_df)} records as DataFrame")
 ```
 
-datashard automatically handles reading and writing Avro files with proper schema management, just like with other supported formats.
+File Operations and Pandas Support
+==================================
+
+datashard supports various file formats including Parquet, Avro, and ORC. It also provides excellent pandas integration:
+
+Install with pandas support:
+```
+pip install datashard[pandas]
+```
+
+Use pandas DataFrames directly with Iceberg tables:
+```python
+import pandas as pd
+from datashard import create_table
+
+table = create_table("/path/to/your/table")
+
+# Write pandas DataFrame to Iceberg table
+df = pd.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
+with table.new_transaction() as tx:
+    tx.append_pandas(df)  # Direct pandas support
+    tx.commit()
+
+# Read data back as pandas DataFrame  
+result_df = table.read_latest_snapshot_pandas()
+
+# Read specific columns
+subset_df = table.read_columns_pandas(["id", "name"])
+```
+
+## Pandas Integration Features:
+- Direct DataFrame reading/writing
+- Schema validation and compatibility checks
+- Batch processing of large DataFrames
+- Column-level operations with pandas
+- Proper file validation and integrity checks
+
+datashard properly handles file validation, manifest creation, and schema compatibility for pandas DataFrames while maintaining all ACID guarantees.
 
 Features
 ========
@@ -69,6 +121,7 @@ Features
 - **Safe Concurrency**: Multiple processes can read/write without corruption
 - **Schema Evolution**: Add/remove columns while maintaining history
 - **Multiple File Formats**: Parquet, Avro, ORC support
+- **Pandas Integration**: Direct DataFrame operations
 - **Data Integrity**: Built-in validation and error handling
 
 Why datashard?
@@ -80,16 +133,3 @@ Traditional approaches to concurrent data access often lead to corruption and in
 - **Consistent Views**: Readers always see a consistent snapshot of data
 - **Safe Concurrency**: Multiple processes can operate simultaneously without conflicts
 - **Production Ready**: Built on battle-tested principles from Apache Iceberg
-
-Comparison to Apache Iceberg
-=============================
-
-Apache Iceberg is a mature Java-based system for big data platforms. datashard offers:
-
-- Pure Python implementation without Java complexity
-- Designed for ML and AI workflows
-- Easy installation and configuration
-- Same safety guarantees as Apache Iceberg
-- Ideal for smaller datasets and individual developers
-
-While Apache Iceberg runs on Spark/Hive/Flink, datashard runs natively in Python environments.

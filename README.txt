@@ -107,23 +107,30 @@ Installation
 
 pip install datashard
 
-Avro Support
-============
+File Operations Support
+=======================
 
-datashard supports Apache Avro files alongside Parquet and ORC formats. You can work with Avro files just like other formats:
+datashard supports various file formats including Parquet, Avro, and ORC. For pandas integration:
 
-from datashard import DataFile, FileFormat
+# Install with pandas support
+pip install datashard[pandas]
 
-# Create Avro data file reference
-avro_file = DataFile(
-    file_path="/data/sample.avro",
-    file_format=FileFormat.AVRO,  # Avro support
-    partition_values={"year": 2023},
-    record_count=1000,
-    file_size_in_bytes=512000
-)
+# Use pandas DataFrames directly with Iceberg tables
+import pandas as pd
+from datashard import create_table
 
-datashard automatically handles reading and writing Avro files with proper schema management.
+table = create_table("/path/to/your/table")
+
+# Write pandas DataFrame to Iceberg table
+df = pd.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
+with table.new_transaction() as tx:
+    tx.append_pandas(df)  # Direct pandas support
+    tx.commit()
+
+# Read data back as pandas DataFrame  
+result_df = table.read_latest_snapshot_pandas()
+
+datashard properly handles file validation, manifest creation, and schema compatibility for pandas DataFrames.
 
 Quick Start
 ===========

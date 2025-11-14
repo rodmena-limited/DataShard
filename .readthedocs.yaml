@@ -1,13 +1,30 @@
-name: python-docs
-base: /Users/farshid/develop/iceberg/datashard
+# .readthedocs.yaml
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
 
-python:
-  version: 3.8
-  install:
-    - requirements: requirements-docs.txt
+# Required
+version: 2
 
+# Set the OS, Python version and other tools
 build:
-  image: latest
+  os: ubuntu-22.04
+  tools:
+    python: "3.9"
 
+# Build documentation in the "docs/" directory with Sphinx
 sphinx:
   configuration: docs/conf.py
+
+# Optionally build your docs in additional formats such as PDF and ePub
+formats:
+  - pdf
+  - epub
+
+# Optionally set the requirements required to build your docs
+python:
+  install:
+    - requirements: docs/requirements.txt
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs

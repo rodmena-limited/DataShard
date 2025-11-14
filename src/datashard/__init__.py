@@ -4,7 +4,7 @@ datashard - Safe concurrent data operations for ML/AI workloads
 A Python implementation of Apache Iceberg providing ACID transactions,
 time travel, and safe concurrent access.
 """
-__version__ = "0.1.2"
+__version__ = "0.1.6"
 __author__ = "RODMENA LIMITED"
 
 
