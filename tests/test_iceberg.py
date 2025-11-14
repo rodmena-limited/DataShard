@@ -2,6 +2,7 @@
 Test script for the Python Iceberg implementation
 Tests ACID transactions, time travel, and metadata management
 """
+
 import os
 import tempfile
 
@@ -50,10 +51,10 @@ def test_transactions():
         file2_path = os.path.join(table_path, "data", "batch2.parquet")
 
         # Create dummy files with minimal content to satisfy file existence check
-        with open(file1_path, 'wb') as f:
-            f.write(b'dummy parquet content for batch 1')
-        with open(file2_path, 'wb') as f:
-            f.write(b'dummy parquet content for batch 2')
+        with open(file1_path, "wb") as f:
+            f.write(b"dummy parquet content for batch 1")
+        with open(file2_path, "wb") as f:
+            f.write(b"dummy parquet content for batch 2")
 
         # Create DataFile objects with Iceberg-style paths
         data_files = [
@@ -62,15 +63,15 @@ def test_transactions():
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2023},
                 record_count=1000,
-                file_size_in_bytes=os.path.getsize(file1_path)
+                file_size_in_bytes=os.path.getsize(file1_path),
             ),
             DataFile(
                 file_path="/data/batch2.parquet",
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2024},
                 record_count=2000,
-                file_size_in_bytes=os.path.getsize(file2_path)
-            )
+                file_size_in_bytes=os.path.getsize(file2_path),
+            ),
         ]
 
         # Test transaction with context manager
@@ -112,26 +113,30 @@ def test_time_travel():
         file2_path = os.path.join(table_path, "data", "time_travel_batch2.parquet")
 
         # Create dummy files with minimal content to satisfy file existence check
-        with open(file1_path, 'wb') as f:
-            f.write(b'dummy parquet content for time travel batch 1')
-        with open(file2_path, 'wb') as f:
-            f.write(b'dummy parquet content for time travel batch 2')
+        with open(file1_path, "wb") as f:
+            f.write(b"dummy parquet content for time travel batch 1")
+        with open(file2_path, "wb") as f:
+            f.write(b"dummy parquet content for time travel batch 2")
 
-        data_files1 = [DataFile(
-            file_path="/data/time_travel_batch1.parquet",
-            file_format=FileFormat.PARQUET,
-            partition_values={"year": 2023},
-            record_count=1000,
-            file_size_in_bytes=os.path.getsize(file1_path)
-        )]
+        data_files1 = [
+            DataFile(
+                file_path="/data/time_travel_batch1.parquet",
+                file_format=FileFormat.PARQUET,
+                partition_values={"year": 2023},
+                record_count=1000,
+                file_size_in_bytes=os.path.getsize(file1_path),
+            )
+        ]
 
-        data_files2 = [DataFile(
-            file_path="/data/time_travel_batch2.parquet",
-            file_format=FileFormat.PARQUET,
-            partition_values={"year": 2024},
-            record_count=2000,
-            file_size_in_bytes=os.path.getsize(file2_path)
-        )]
+        data_files2 = [
+            DataFile(
+                file_path="/data/time_travel_batch2.parquet",
+                file_format=FileFormat.PARQUET,
+                partition_values={"year": 2024},
+                record_count=2000,
+                file_size_in_bytes=os.path.getsize(file2_path),
+            )
+        ]
 
         # First snapshot
         with table.new_transaction() as tx:
@@ -142,6 +147,7 @@ def test_time_travel():
 
         # Wait a moment to ensure different timestamp
         import time
+
         time.sleep(0.01)
 
         # Second snapshot
@@ -177,16 +183,18 @@ def test_metadata_management():
             schema_id=1,
             fields=[
                 {"id": 1, "name": "id", "type": "long", "required": True},
-                {"id": 2, "name": "name", "type": "string", "required": False}
-            ]
+                {"id": 2, "name": "name", "type": "string", "required": False},
+            ],
         )
 
         # Test partition spec
         PartitionSpec(
             spec_id=0,
             fields=[
-                PartitionField(source_id=1, field_id=1000, name="id_partition", transform="identity")
-            ]
+                PartitionField(
+                    source_id=1, field_id=1000, name="id_partition", transform="identity"
+                )
+            ],
         )
 
         # Verify metadata persistence
@@ -218,16 +226,18 @@ def test_all_features():
         for i in range(3):
             file_path = os.path.join(table_path, "data", f"full_test_batch_{i}.parquet")
             # Create dummy file
-            with open(file_path, 'wb') as f:
-                f.write(f'dummy parquet content for batch {i}'.encode())
+            with open(file_path, "wb") as f:
+                f.write(f"dummy parquet content for batch {i}".encode())
 
-            sample_files.append(DataFile(
-                file_path=f"/data/full_test_batch_{i}.parquet",
-                file_format=FileFormat.PARQUET,
-                partition_values={"batch": i},
-                record_count=100 * (i + 1),
-                file_size_in_bytes=os.path.getsize(file_path)
-            ))
+            sample_files.append(
+                DataFile(
+                    file_path=f"/data/full_test_batch_{i}.parquet",
+                    file_format=FileFormat.PARQUET,
+                    partition_values={"batch": i},
+                    record_count=100 * (i + 1),
+                    file_size_in_bytes=os.path.getsize(file_path),
+                )
+            )
 
         # Perform multiple transactions
         for i, files in enumerate([sample_files[0:1], sample_files[1:2], sample_files[2:3]]):
@@ -243,7 +253,7 @@ def test_all_features():
 
         # Test time travel to each snapshot
         for snapshot in snapshots:
-            traveled = table.time_travel(snapshot_id=snapshot['snapshot_id'])
+            traveled = table.time_travel(snapshot_id=snapshot["snapshot_id"])
             assert traveled is not None
             print(f"✓ Can time travel to snapshot {snapshot['snapshot_id']}")
 

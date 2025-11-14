@@ -1,6 +1,7 @@
 """
 Core data structures for the Python Iceberg implementation
 """
+
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 class FileFormat(Enum):
     """Supported file formats"""
+
     PARQUET = "parquet"
     AVRO = "avro"
     ORC = "orc"
@@ -18,6 +20,7 @@ class FileFormat(Enum):
 
 class ManifestContent(Enum):
     """Type of content in manifest files"""
+
     DATA = "data"
     DELETES = "deletes"
 
@@ -25,6 +28,7 @@ class ManifestContent(Enum):
 @dataclass
 class Schema:
     """Table schema definition"""
+
     schema_id: int
     fields: List[Dict[str, Any]]
     schema_string: str = ""
@@ -37,6 +41,7 @@ class Schema:
 @dataclass
 class PartitionField:
     """Partition field definition"""
+
     source_id: int
     field_id: int
     name: str
@@ -46,6 +51,7 @@ class PartitionField:
 @dataclass
 class PartitionSpec:
     """Partition specification"""
+
     spec_id: int
     fields: List[PartitionField]
 
@@ -53,6 +59,7 @@ class PartitionSpec:
 @dataclass
 class SortField:
     """Sort field definition"""
+
     source_id: int
     field_id: int
     transform: str
@@ -62,6 +69,7 @@ class SortField:
 @dataclass
 class SortOrder:
     """Sort order specification"""
+
     order_id: int
     fields: List[SortField]
 
@@ -69,6 +77,7 @@ class SortOrder:
 @dataclass
 class DataFile:
     """Represents a data file in the table"""
+
     file_path: str
     file_format: FileFormat
     partition_values: Dict[str, Any]
@@ -89,6 +98,7 @@ class DataFile:
 @dataclass
 class DeleteFile:
     """Represents a delete file in the table"""
+
     file_path: str
     file_format: FileFormat
     partition_values: Dict[str, Any]
@@ -100,6 +110,7 @@ class DeleteFile:
 @dataclass
 class ManifestFile:
     """Manifest file that lists data or delete files"""
+
     manifest_path: str
     manifest_length: int
     partition_spec_id: int
@@ -116,6 +127,7 @@ class ManifestFile:
 @dataclass
 class Snapshot:
     """Represents a snapshot of the table at a point in time"""
+
     snapshot_id: int
     timestamp_ms: int  # milliseconds since epoch
     manifest_list: str  # path to manifest list file
@@ -132,6 +144,7 @@ class Snapshot:
 @dataclass
 class HistoryEntry:
     """History entry for tracking snapshot changes"""
+
     timestamp_ms: int
     snapshot_id: int
 
@@ -139,6 +152,7 @@ class HistoryEntry:
 @dataclass
 class TableMetadata:
     """Main metadata structure for an Iceberg table"""
+
     location: str
     table_uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
     format_version: int = 2

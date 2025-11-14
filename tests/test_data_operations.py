@@ -1,6 +1,7 @@
 """
 Test script for data operations functionality
 """
+
 import os
 import tempfile
 
@@ -20,7 +21,7 @@ def test_data_reader_writer():
         sample_records = [
             {"id": 1, "name": "Alice", "age": 30},
             {"id": 2, "name": "Bob", "age": 25},
-            {"id": 3, "name": "Charlie", "age": 35}
+            {"id": 3, "name": "Charlie", "age": 35},
         ]
 
         # Create an Iceberg schema
@@ -29,8 +30,8 @@ def test_data_reader_writer():
             fields=[
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "name", "type": "string", "required": True},
-                {"id": 3, "name": "age", "type": "int", "required": True}
-            ]
+                {"id": 3, "name": "age", "type": "int", "required": True},
+            ],
         )
 
         # Create data file path
@@ -41,9 +42,7 @@ def test_data_reader_writer():
         data_manager = DataFileManager(file_manager)
 
         data_file = data_manager.write_data_file(
-            file_path=parquet_file,
-            records=sample_records,
-            iceberg_schema=iceberg_schema
+            file_path=parquet_file, records=sample_records, iceberg_schema=iceberg_schema
         )
 
         print(f"✓ Data file written: {parquet_file}")
@@ -66,8 +65,8 @@ def test_data_reader_writer():
         # Test reading with specific columns
         read_records_subset = data_manager.read_data_file(parquet_file, columns=["id", "name"])
         assert "age" not in read_records_subset[0]  # age should not be present
-        assert "id" in read_records_subset[0]       # id should be present
-        assert len(read_records_subset[0]) == 2     # only id and name
+        assert "id" in read_records_subset[0]  # id should be present
+        assert len(read_records_subset[0]) == 2  # only id and name
         print(f"✓ Column selection works: {len(read_records_subset[0])} columns read")
 
         print("Data reader/writer test passed!")
@@ -86,7 +85,7 @@ def test_data_file_manager_integration():
         sample_records = [
             {"id": 1, "name": "Alice", "department": "Engineering"},
             {"id": 2, "name": "Bob", "department": "Marketing"},
-            {"id": 3, "name": "Charlie", "department": "Engineering"}
+            {"id": 3, "name": "Charlie", "department": "Engineering"},
         ]
 
         # Create schema
@@ -95,15 +94,15 @@ def test_data_file_manager_integration():
             fields=[
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "name", "type": "string", "required": True},
-                {"id": 3, "name": "department", "type": "string", "required": True}
-            ]
+                {"id": 3, "name": "department", "type": "string", "required": True},
+            ],
         )
 
         # Test append_records method
         result = table.append_records(
             records=sample_records,
             schema=schema,
-            partition_values={"department": "Engineering"}  # Example partition
+            partition_values={"department": "Engineering"},  # Example partition
         )
         assert result, "Append records should succeed"
         print("✓ append_records worked successfully")
@@ -115,7 +114,7 @@ def test_data_file_manager_integration():
 
         # Check that there are files in the data directory
         data_dir = os.path.join(table_path, "data")
-        data_files = [f for f in os.listdir(data_dir) if f.endswith('.parquet')]
+        data_files = [f for f in os.listdir(data_dir) if f.endswith(".parquet")]
         assert len(data_files) > 0, "Should have created at least one data file"
         print(f"✓ Created {len(data_files)} data files")
 
@@ -137,9 +136,7 @@ def test_schema_compatibility():
         data_manager = DataFileManager(file_manager)
 
         # Valid records
-        valid_records = [
-            {"id": 1, "name": "Alice", "score": 95.5}
-        ]
+        valid_records = [{"id": 1, "name": "Alice", "score": 95.5}]
 
         # Schema with proper types
         schema = Schema(
@@ -147,8 +144,8 @@ def test_schema_compatibility():
             fields=[
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "name", "type": "string", "required": True},
-                {"id": 3, "name": "score", "type": "double", "required": True}
-            ]
+                {"id": 3, "name": "score", "type": "double", "required": True},
+            ],
         )
 
         # Test compatibility check
@@ -159,9 +156,7 @@ def test_schema_compatibility():
         # Test data file creation with this schema
         parquet_file = os.path.join(temp_dir, "compat_test.parquet")
         data_manager.write_data_file(
-            file_path=parquet_file,
-            records=valid_records,
-            iceberg_schema=schema
+            file_path=parquet_file, records=valid_records, iceberg_schema=schema
         )
 
         assert os.path.exists(parquet_file), "File should be created"

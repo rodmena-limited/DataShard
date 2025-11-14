@@ -3,6 +3,7 @@ Clear demonstration: 12 processes incrementing a counter
 Normal files: will show corruption (value != 120000)
 Iceberg: will show safety (value == 120000)
 """
+
 import json
 import multiprocessing
 import os
@@ -10,7 +11,9 @@ import sys
 import tempfile
 import time
 
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 
 def normal_file_demo():
     """Demonstrate corruption with normal file operations"""
@@ -25,7 +28,7 @@ def normal_file_demo():
         counter_file = os.path.join(temp_dir, "counter.json")
 
         # Initialize counter to 0
-        with open(counter_file, 'w') as f:
+        with open(counter_file, "w") as f:
             json.dump({"value": 0}, f)
 
         print("Starting counter value: 0")
@@ -48,7 +51,7 @@ def normal_file_demo():
 
         # Read final value
         try:
-            with open(counter_file, 'r') as f:
+            with open(counter_file, "r") as f:
                 final_data = json.load(f)
             final_value = final_data["value"]
 
@@ -75,7 +78,7 @@ def normal_increment_worker(counter_file, iterations):
     for _i in range(iterations):
         try:
             # Read current value
-            with open(counter_file, 'r') as f:
+            with open(counter_file, "r") as f:
                 data = json.load(f)
 
             current = data["value"]
@@ -86,7 +89,7 @@ def normal_increment_worker(counter_file, iterations):
             # Increment and write back (RACE CONDITION HERE)
             new_value = current + 1
             time.sleep(0.000005)  # Tiny delay to increase collision chance
-            with open(counter_file, 'w') as f:
+            with open(counter_file, "w") as f:
                 json.dump({"value": new_value}, f)
 
         except Exception:
@@ -115,14 +118,16 @@ def iceberg_demo():
             fields=[
                 {"id": 1, "name": "counter_id", "type": "string", "required": True},
                 {"id": 2, "name": "value", "type": "long", "required": True},
-                {"id": 3, "name": "timestamp", "type": "long", "required": True}
-            ]
+                {"id": 3, "name": "timestamp", "type": "long", "required": True},
+            ],
         )
 
         table = create_table(table_dir)
 
         # Initialize with counter value 0 (as a single record)
-        initial_record = [{"counter_id": "main_counter", "value": 0, "timestamp": int(time.time() * 1000)}]
+        initial_record = [
+            {"counter_id": "main_counter", "value": 0, "timestamp": int(time.time() * 1000)}
+        ]
         table.append_records(initial_record, schema)
 
         print("Starting counter value: 0")
@@ -171,19 +176,21 @@ def iceberg_increment_worker(table_dir, iterations, worker_id):
                 {"id": 1, "name": "worker_id", "type": "int", "required": True},
                 {"id": 2, "name": "operation_id", "type": "int", "required": True},
                 {"id": 3, "name": "value", "type": "long", "required": True},
-                {"id": 4, "name": "timestamp", "type": "long", "required": True}
-            ]
+                {"id": 4, "name": "timestamp", "type": "long", "required": True},
+            ],
         )
 
         # Create all increment records at once to reduce transaction overhead
         increment_records = []
         for i in range(iterations):
-            increment_records.append({
-                "worker_id": worker_id,
-                "operation_id": i,
-                "value": 1,  # Each represents +1 to our counter
-                "timestamp": int(time.time() * 1000)
-            })
+            increment_records.append(
+                {
+                    "worker_id": worker_id,
+                    "operation_id": i,
+                    "value": 1,  # Each represents +1 to our counter
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
 
         # Load table and append all records in one transaction per worker
         table = load_table(table_dir)
@@ -261,5 +268,5 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)
+    multiprocessing.set_start_method("spawn", force=True)
     main()

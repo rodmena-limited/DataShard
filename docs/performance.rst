@@ -27,7 +27,9 @@ Parquet
    parquet_file = DataFile(
        file_path="data.parquet",
        file_format=FileFormat.PARQUET,
-       # ... other parameters
+       partition_values={},
+       record_count=1000,
+       file_size_in_bytes=50000
    )
 
 Avro
@@ -43,7 +45,9 @@ Avro
    avro_file = DataFile(
        file_path="data.avro",
        file_format=FileFormat.AVRO,
-       # ... other parameters
+       partition_values={},
+       record_count=1000,
+       file_size_in_bytes=45000
    )
 
 ORC
@@ -63,19 +67,27 @@ Organize data by columns frequently accessed together:
 
 .. code-block:: python
 
+   from datashard import create_table, Schema
+
+   # Define schema for hot data
+   hot_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "name", "type": "string", "required": True},
+           {"id": 3, "name": "status", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/partitioned_table", hot_schema)
+
    # Good: Separate frequently accessed columns from rarely accessed ones
    with table.new_transaction() as tx:
        # Hot data partition
        tx.append_data(
-           records=[{"id": 1, "name": "Alice", "status": "active"}],
-           schema=None,
+           records=[{"record_id": 1, "name": "Alice", "status": "active"}],
+           schema=hot_schema,
            partition_values={"type": "hot"}
-       )
-       # Cold data partition  
-       tx.append_data(
-           records=[{"id": 1, "detailed_history": "...", "audit_log": "..."}],
-           schema=None,
-           partition_values={"type": "cold"}
        )
        tx.commit()
 
@@ -86,17 +98,29 @@ Organize data by frequently queried dimensions:
 
 .. code-block:: python
 
-   # Partition by time for time-series data
+   from datashard import create_table, Schema
    import datetime
-   
+
+   # Define schema for time-series data
+   event_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "event", "type": "string", "required": True},
+           {"id": 2, "name": "user_id", "type": "long", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/events", event_schema)
+
+   # Partition by time for time-series data
    today = datetime.date.today()
    with table.new_transaction() as tx:
        tx.append_data(
            records=[{"event": "login", "user_id": 123}],
-           schema=None,
+           schema=event_schema,
            partition_values={
                "year": today.year,
-               "month": today.month, 
+               "month": today.month,
                "day": today.day
            }
        )
@@ -112,13 +136,26 @@ Minimize transaction overhead by batching operations:
 
 .. code-block:: python
 
+   from datashard import create_table, Schema
+
+   # Define schema
+   batch_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "value", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/batch_table", batch_schema)
+
    # Efficient: Single transaction for multiple records
    batch_records = []
    for i in range(1000):
-       batch_records.append({"id": i, "value": f"value_{i}"})
-   
+       batch_records.append({"record_id": i, "value": f"value_{i}"})
+
    with table.new_transaction() as tx:
-       tx.append_data(records=batch_records, schema=None)
+       tx.append_data(records=batch_records, schema=batch_schema)
        tx.commit()
 
 Transaction Size Guidelines
@@ -130,15 +167,32 @@ Transaction Size Guidelines
 
 .. code-block:: python
 
-   def safe_large_write(table, large_dataset, batch_size=500):
+   from datashard import create_table, Schema
+
+   # Define schema
+   large_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "data", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/large_table", large_schema)
+
+   def safe_large_write(table, large_dataset, schema, batch_size=500):
        for i in range(0, len(large_dataset), batch_size):
            batch = large_dataset[i:i + batch_size]
            with table.new_transaction() as tx:
-               tx.append_data(records=batch, schema=None)
+               tx.append_data(records=batch, schema=schema)
                success = tx.commit()
                if not success:
                    # Handle failure and possibly retry
                    break
+
+   # Example usage
+   large_data = [{"record_id": i, "data": f"data_{i}"} for i in range(10000)]
+   safe_large_write(table, large_data, large_schema, batch_size=500)
 
 Memory Management
 -----------------
@@ -150,22 +204,38 @@ Control memory usage when working with large datasets:
 
 .. code-block:: python
 
+   from datashard import create_table, Schema
    import gc
 
-   def memory_efficient_write(table, large_records):
+   # Define schema
+   memory_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "data", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/memory_table", memory_schema)
+
+   def memory_efficient_write(table, large_records, schema):
        # Process in chunks to control memory usage
        chunk_size = 100
-       
+
        for i in range(0, len(large_records), chunk_size):
            chunk = large_records[i:i + chunk_size]
-           
+
            with table.new_transaction() as tx:
-               tx.append_data(records=chunk, schema=None)
+               tx.append_data(records=chunk, schema=schema)
                tx.commit()
-           
+
            # Explicitly clean up if needed
            if i % (chunk_size * 10) == 0:  # Every 10 chunks
                gc.collect()
+
+   # Example usage
+   large_dataset = [{"record_id": i, "data": f"data_{i}"} for i in range(5000)]
+   memory_efficient_write(table, large_dataset, memory_schema)
 
 Metadata Cache Optimization
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -176,7 +246,7 @@ The metadata manager caches information to improve performance:
 
    # Efficiently refresh metadata only when needed
    current_metadata = table.metadata_manager.refresh()
-   
+
    # Reuse metadata for multiple operations in a short period
    snapshot = table.current_snapshot()  # Uses cached metadata
    history = table.metadata_manager.get_snapshot_history()  # Also uses cache
@@ -191,17 +261,33 @@ Minimize conflicts in high-concurrency scenarios:
 
 .. code-block:: python
 
+   from datashard import create_table, Schema
    import time
    import random
 
-   def low_contention_write(table, record, base_delay=0.01):
+   # Define schema
+   concurrency_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "data", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/concurrent_table", concurrency_schema)
+
+   def low_contention_write(table, record, schema, base_delay=0.01):
        # Add jitter to reduce thundering herd problem
        jitter = random.uniform(0, 0.01)
        time.sleep(base_delay + jitter)
-       
+
        with table.new_transaction() as tx:
-           tx.append_data(records=[record], schema=None)
+           tx.append_data(records=[record], schema=schema)
            return tx.commit()
+
+   # Example usage
+   sample_record = {"record_id": 1, "data": "example"}
+   low_contention_write(table, sample_record, concurrency_schema)
 
 Parallel Processing
 ^^^^^^^^^^^^^^^^^^^
@@ -210,20 +296,40 @@ Structure operations to allow parallel execution:
 
 .. code-block:: python
 
+   from datashard import create_table, Schema
    import concurrent.futures
-   from threading import Lock
 
-   def parallel_writes(table, datasets, max_workers=4):
+   # Define schema
+   parallel_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "value", "type": "double", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/parallel_table", parallel_schema)
+
+   def parallel_writes(table, datasets, schema, max_workers=4):
        def write_dataset(data_subset):
            with table.new_transaction() as tx:
-               tx.append_data(records=data_subset, schema=None)
+               tx.append_data(records=data_subset, schema=schema)
                return tx.commit()
-       
+
        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
            futures = [executor.submit(write_dataset, subset) for subset in datasets]
            results = [future.result() for future in futures]
-       
+
        return all(results)
+
+   # Example usage
+   datasets = [
+       [{"record_id": i, "value": float(i)} for i in range(0, 250)],
+       [{"record_id": i, "value": float(i)} for i in range(250, 500)],
+       [{"record_id": i, "value": float(i)} for i in range(500, 750)],
+       [{"record_id": i, "value": float(i)} for i in range(750, 1000)]
+   ]
+   parallel_writes(table, datasets, parallel_schema, max_workers=4)
 
 Monitoring and Profiling
 ------------------------
@@ -235,29 +341,43 @@ Track key performance indicators:
 
 .. code-block:: python
 
+   from datashard import create_table, Schema
    import time
    from collections import defaultdict
+
+   # Define schema
+   metrics_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "metric_id", "type": "long", "required": True},
+           {"id": 2, "name": "value", "type": "double", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/metrics_table", metrics_schema)
 
    class PerformanceTracker:
        def __init__(self):
            self.metrics = defaultdict(list)
-       
+
        def time_operation(self, name, operation, *args, **kwargs):
            start = time.time()
            result = operation(*args, **kwargs)
            duration = time.time() - start
            self.metrics[name].append(duration)
            return result
-       
+
        def get_avg_time(self, name):
            times = self.metrics[name]
            return sum(times) / len(times) if times else 0
 
    # Usage
    tracker = PerformanceTracker()
-   success = tracker.time_operation("append_data", table.append_data, records=[{"id": 1}], schema=None)
-   avg_time = tracker.get_avg_time("append_data")
-   print(f"Average append_data time: {avg_time:.4f}s")
+   sample_records = [{"metric_id": 1, "value": 42.0}]
+   success = tracker.time_operation("append_records", table.append_records,
+                                    records=sample_records, schema=metrics_schema)
+   avg_time = tracker.get_avg_time("append_records")
+   print(f"Average append_records time: {avg_time:.4f}s")
 
 Common Performance Issues
 ^^^^^^^^^^^^^^^^^^^^^^^^^

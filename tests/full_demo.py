@@ -1,6 +1,7 @@
 """
 Full demo showing concurrency safety of Iceberg vs. normal file operations
 """
+
 import json
 import multiprocessing
 import os
@@ -9,8 +10,10 @@ import sys
 import tempfile
 import time
 
+
 # Add the parent directory to sys.path to import datashard modules
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 
 # Test 1: Data corruption with normal file operations
 def normal_file_corruption_test():
@@ -24,8 +27,10 @@ def normal_file_corruption_test():
         data_file = os.path.join(temp_dir, "shared_data.json")
 
         # Initialize with some data
-        initial_data = [{"id": i, "value": f"value_{i}", "timestamp": time.time()} for i in range(100)]
-        with open(data_file, 'w') as f:
+        initial_data = [
+            {"id": i, "value": f"value_{i}", "timestamp": time.time()} for i in range(100)
+        ]
+        with open(data_file, "w") as f:
             json.dump(initial_data, f)
 
         print(f"Initial data count: {len(initial_data)}")
@@ -34,7 +39,9 @@ def normal_file_corruption_test():
 
         processes = []
         for i in range(12):
-            p = multiprocessing.Process(target=normal_file_worker, args=(data_file, i, 10))  # 10 operations per worker
+            p = multiprocessing.Process(
+                target=normal_file_worker, args=(data_file, i, 10)
+            )  # 10 operations per worker
             processes.append(p)
             p.start()
 
@@ -47,7 +54,7 @@ def normal_file_corruption_test():
 
         # Read final data and check for corruption
         try:
-            with open(data_file, 'r') as f:
+            with open(data_file, "r") as f:
                 final_data = json.load(f)
 
             expected_count = 100 + (12 * 10 * 5)  # initial + (processes * ops * records_per_op)
@@ -60,7 +67,7 @@ def normal_file_corruption_test():
             corrupted_records = 0
 
             for item in final_data:
-                if isinstance(item, dict) and 'id' in item and 'value' in item:
+                if isinstance(item, dict) and "id" in item and "value" in item:
                     valid_records += 1
                 else:
                     corrupted_records += 1
@@ -89,7 +96,7 @@ def normal_file_worker(data_file, worker_id, operations):
     for i in range(operations):
         try:
             # Read current data
-            with open(data_file, 'r') as f:
+            with open(data_file, "r") as f:
                 data = json.load(f)
 
             # Simulate some processing time
@@ -100,13 +107,13 @@ def normal_file_worker(data_file, worker_id, operations):
                 "id": len(data) + worker_id * operations + i,
                 "value": f"worker_{worker_id}_item_{i}",
                 "timestamp": time.time(),
-                "worker": worker_id
+                "worker": worker_id,
             }
             data.append(new_item)
 
             # Write back (RACE CONDITION: multiple processes doing this)
             time.sleep(0.001)  # Small delay to increase race condition probability
-            with open(data_file, 'w') as f:
+            with open(data_file, "w") as f:
                 json.dump(data, f)
 
         except Exception as e:
@@ -135,8 +142,8 @@ def iceberg_safety_test():
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "value", "type": "string", "required": True},
                 {"id": 3, "name": "worker_id", "type": "int", "required": True},
-                {"id": 4, "name": "timestamp", "type": "double", "required": True}
-            ]
+                {"id": 4, "name": "timestamp", "type": "double", "required": True},
+            ],
         )
 
         table = create_table(table_dir)
@@ -198,12 +205,14 @@ def iceberg_worker(table_dir, worker_id, operations, schema):
             records = []
             for j in range(5):  # Add 5 records per operation
                 record_id = worker_id * operations * 5 + i * 5 + j + 100  # Start from 100
-                records.append({
-                    "id": record_id,
-                    "value": f"worker_{worker_id}_batch_{i}_record_{j}",
-                    "worker_id": worker_id,
-                    "timestamp": time.time()
-                })
+                records.append(
+                    {
+                        "id": record_id,
+                        "value": f"worker_{worker_id}_batch_{i}_record_{j}",
+                        "worker_id": worker_id,
+                        "timestamp": time.time(),
+                    }
+                )
 
             # Create new table instance for each operation to get fresh metadata
             table = load_table(table_dir)
@@ -253,7 +262,9 @@ def main():
     print("DEMO RESULTS SUMMARY")
     print("=" * 60)
 
-    print(f"Normal Files - Corruption: {'✅ DETECTED' if corruption_detected else '❌ NOT DETECTED (but unsafe)'}")
+    print(
+        f"Normal Files - Corruption: {'✅ DETECTED' if corruption_detected else '❌ NOT DETECTED (but unsafe)'}"
+    )
     print(f"Iceberg - Safety: {'✅ MAINTAINED' if safety_maintained else '❌ COMPROMISED'}")
 
     print("\nCONCLUSION:")
@@ -269,5 +280,5 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn', force=True)  # Ensure proper process isolation
+    multiprocessing.set_start_method("spawn", force=True)  # Ensure proper process isolation
     main()

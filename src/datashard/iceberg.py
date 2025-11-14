@@ -2,6 +2,7 @@
 Main module for the Python Iceberg implementation
 Provides the primary API for working with Iceberg tables
 """
+
 import os
 from typing import Optional
 
@@ -9,7 +10,9 @@ from .data_structures import DataFile, FileFormat, PartitionSpec, Schema
 from .transaction import Table, Transaction
 
 
-def create_table(table_path: str, schema: Optional[Schema] = None, partition_spec: Optional[PartitionSpec] = None) -> 'Table':
+def create_table(
+    table_path: str, schema: Optional[Schema] = None, partition_spec: Optional[PartitionSpec] = None
+) -> "Table":
     """
     Create a new Iceberg table
 
@@ -31,9 +34,8 @@ def create_table(table_path: str, schema: Optional[Schema] = None, partition_spe
     current_metadata = table.metadata_manager.refresh()
     if current_metadata is None:
         from .data_structures import TableMetadata
-        initial_metadata = TableMetadata(
-            location=table_path
-        )
+
+        initial_metadata = TableMetadata(location=table_path)
         table.metadata_manager.initialize_table(initial_metadata)
 
     # If schema is provided, we'd update the table metadata
@@ -51,13 +53,10 @@ def load_table(table_path: str) -> Table:
     Returns:
         Table instance
     """
-    if not os.path.exists(os.path.join(table_path, 'metadata')):
+    if not os.path.exists(os.path.join(table_path, "metadata")):
         raise ValueError(f"No Iceberg table found at {table_path}")
 
     return Table(table_path, create_if_not_exists=False)
 
 
-__all__ = [
-    'Table', 'Transaction', 'create_table', 'load_table',
-    'DataFile', 'FileFormat'
-]
+__all__ = ["Table", "Transaction", "create_table", "load_table", "DataFile", "FileFormat"]

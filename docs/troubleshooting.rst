@@ -55,18 +55,26 @@ Transaction Issues
 
 .. code-block:: python
 
-   # Instead of large transactions
-   # with table.new_transaction() as tx:
-   #     for record in huge_dataset:  # Millions of records
-   #         tx.append_data(records=[record], schema=None)
-   #     tx.commit()
+   from datashard import create_table, Schema
 
-   # Use smaller transactions
+   # Define schema
+   batch_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "data", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/table", batch_schema)
+
+   # Instead of large transactions - process records one at a time (slow)
+   # Use smaller batch transactions instead
    batch_size = 1000
    for i in range(0, len(huge_dataset), batch_size):
        batch = huge_dataset[i:i + batch_size]
        with table.new_transaction() as tx:
-           tx.append_data(records=batch, schema=None)
+           tx.append_data(records=batch, schema=batch_schema)
            success = tx.commit()
 
 File and Path Issues
@@ -109,17 +117,34 @@ Memory Issues
 
 .. code-block:: python
 
-   def process_large_dataset_in_chunks(table, large_dataset, chunk_size=1000):
+   from datashard import create_table, Schema
+   import gc
+
+   # Define schema
+   chunk_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "record_id", "type": "long", "required": True},
+           {"id": 2, "name": "value", "type": "string", "required": True}
+       ]
+   )
+
+   table = create_table("/path/to/table", chunk_schema)
+
+   def process_large_dataset_in_chunks(table, large_dataset, schema, chunk_size=1000):
        results = []
        for i in range(0, len(large_dataset), chunk_size):
            chunk = large_dataset[i:i + chunk_size]
            with table.new_transaction() as tx:
-               tx.append_data(records=chunk, schema=None)
+               tx.append_data(records=chunk, schema=schema)
                results.append(tx.commit())
            # Allow garbage collection between chunks
-           import gc
            gc.collect()
        return results
+
+   # Example usage
+   large_data = [{"record_id": i, "value": f"value_{i}"} for i in range(100000)]
+   process_large_dataset_in_chunks(table, large_data, chunk_schema, chunk_size=1000)
 
 Debugging Techniques
 --------------------
@@ -180,16 +205,25 @@ Wrong Table Path
 .. code-block:: python
 
    import os
-   from datashard import create_table
-   
+   from datashard import create_table, Schema
+
+   # Define schema
+   basic_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "id", "type": "long", "required": True},
+           {"id": 2, "name": "data", "type": "string", "required": True}
+       ]
+   )
+
    table_path = "/valid/path/for/table"
-   
+
    # Ensure parent directory exists
    parent_dir = os.path.dirname(table_path)
    os.makedirs(parent_dir, exist_ok=True)
-   
+
    # Create table
-   table = create_table(table_path)
+   table = create_table(table_path, basic_schema)
 
 Incompatible File Formats
 ^^^^^^^^^^^^^^^^^^^^^^^^^

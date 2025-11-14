@@ -1,6 +1,7 @@
 """
 Main test suite for pytest
 """
+
 import pytest
 
 from tests.clear_demo import main as demo_main

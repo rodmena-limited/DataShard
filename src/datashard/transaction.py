@@ -1,6 +1,7 @@
 """
 ACID transaction implementation for the Python Iceberg implementation
 """
+
 import json
 import os
 import threading
@@ -23,7 +24,12 @@ from .snapshot_manager import SnapshotManager
 class Transaction:
     """Represents a database transaction with ACID properties"""
 
-    def __init__(self, metadata_manager: MetadataManager, snapshot_manager: SnapshotManager, file_manager: FileManager):
+    def __init__(
+        self,
+        metadata_manager: MetadataManager,
+        snapshot_manager: SnapshotManager,
+        file_manager: FileManager,
+    ):
         self.metadata_manager = metadata_manager
         self.snapshot_manager = snapshot_manager
         self.file_manager = file_manager
@@ -39,7 +45,7 @@ class Transaction:
 
         self._lock = threading.RLock()
 
-    def begin(self) -> 'Transaction':
+    def begin(self) -> "Transaction":
         """Start a new transaction"""
         with self._lock:
             if self._is_active:
@@ -49,14 +55,13 @@ class Transaction:
             self._is_committed = False
             self._is_rolled_back = False
 
-
             return self
 
     def is_active(self) -> bool:
         """Check if transaction is active"""
         return self._is_active and not self._is_committed and not self._is_rolled_back
 
-    def append_files(self, files: List[DataFile]) -> 'Transaction':
+    def append_files(self, files: List[DataFile]) -> "Transaction":
         """Queue files to append to the table"""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
@@ -67,16 +72,16 @@ class Transaction:
             if not self.file_manager.validate_file_exists(data_file.file_path):
                 raise FileNotFoundError(f"Data file does not exist: {data_file.file_path}")
 
-        self._operations.append({
-            'type': 'append_files',
-            'files': files
-        })
+        self._operations.append({"type": "append_files", "files": files})
 
         return self
 
-    def append_data(self, records: List[Dict[str, Any]],
-                   schema: 'Schema',
-                   partition_values: Optional[Dict[str, Any]] = None) -> 'Transaction':
+    def append_data(
+        self,
+        records: List[Dict[str, Any]],
+        schema: "Schema",
+        partition_values: Optional[Dict[str, Any]] = None,
+    ) -> "Transaction":
         """Append actual data records to the table by creating new data files"""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
@@ -92,7 +97,7 @@ class Transaction:
             records=records,
             iceberg_schema=schema,
             file_format=FileFormat.PARQUET,
-            partition_values=partition_values or {}
+            partition_values=partition_values or {},
         )
 
         # When using append_files, the file path in the DataFile object should be
@@ -110,7 +115,7 @@ class Transaction:
             value_counts=data_file.value_counts,
             null_value_counts=data_file.null_value_counts,
             lower_bounds=data_file.lower_bounds,
-            upper_bounds=data_file.upper_bounds
+            upper_bounds=data_file.upper_bounds,
         )
 
         # Queue the newly created file for appending
@@ -118,39 +123,30 @@ class Transaction:
 
         return self
 
-    def delete_files(self, file_paths: List[str]) -> 'Transaction':
+    def delete_files(self, file_paths: List[str]) -> "Transaction":
         """Queue files to delete from the table"""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
-        self._operations.append({
-            'type': 'delete_files',
-            'file_paths': file_paths
-        })
+        self._operations.append({"type": "delete_files", "file_paths": file_paths})
 
         return self
 
-    def overwrite_by_filter(self, filter_func: Callable[[Any], bool]) -> 'Transaction':
+    def overwrite_by_filter(self, filter_func: Callable[[Any], bool]) -> "Transaction":
         """Queue an overwrite operation by filter"""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
-        self._operations.append({
-            'type': 'overwrite_by_filter',
-            'filter': filter_func
-        })
+        self._operations.append({"type": "overwrite_by_filter", "filter": filter_func})
 
         return self
 
-    def expire_snapshots(self, older_than_ms: int) -> 'Transaction':
+    def expire_snapshots(self, older_than_ms: int) -> "Transaction":
         """Queue snapshot expiration operation"""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
-        self._operations.append({
-            'type': 'expire_snapshots',
-            'older_than_ms': older_than_ms
-        })
+        self._operations.append({"type": "expire_snapshots", "older_than_ms": older_than_ms})
 
         return self
 
@@ -179,23 +175,35 @@ class Transaction:
                         new_metadata = self._apply_operation(new_metadata, operation)
 
                     # Generate a snapshot ID for this transaction
-                    snapshot_id = int(datetime.now().timestamp() * 1000000)  # microseconds since epoch
+                    snapshot_id = int(
+                        datetime.now().timestamp() * 1000000
+                    )  # microseconds since epoch
 
                     # Extract data files from append_files operations
                     data_files = []
                     for operation in self._operations:
-                        if operation['type'] == 'append_files':
-                            data_files.extend(operation['files'])
+                        if operation["type"] == "append_files":
+                            data_files.extend(operation["files"])
 
                     # Create a new manifest list for this snapshot with actual data files
-                    manifest_list_path = self._create_manifest_list_with_id(new_metadata, snapshot_id, data_files)
+                    manifest_list_path = self._create_manifest_list_with_id(
+                        new_metadata, snapshot_id, data_files
+                    )
 
                     # Create a new snapshot for this transaction
                     # We need to pass the base metadata for proper OCC checking
                     self.snapshot_manager.create_snapshot(
                         manifest_list_path=manifest_list_path,
-                        operation="append" if any(op['type'] == 'append_files' for op in self._operations) else "update",
-                        parent_snapshot_id=base_metadata.current_snapshot_id if base_metadata.current_snapshot_id is not None else -1  # Use base as parent
+                        operation=(
+                            "append"
+                            if any(op["type"] == "append_files" for op in self._operations)
+                            else "update"
+                        ),
+                        parent_snapshot_id=(
+                            base_metadata.current_snapshot_id
+                            if base_metadata.current_snapshot_id is not None
+                            else -1
+                        ),  # Use base as parent
                     )
 
                     # The snapshot manager already updated the metadata, so get the latest
@@ -217,6 +225,7 @@ class Transaction:
                 else:
                     # Wait a bit before retrying (exponential backoff could be added here)
                     import time
+
                     time.sleep(0.01 * retry_count)  # Simple backoff
                     continue  # Retry the transaction
             except Exception as e:
@@ -245,28 +254,30 @@ class Transaction:
 
     def _apply_operation(self, metadata: TableMetadata, operation: Dict[str, Any]) -> TableMetadata:
         """Apply a single operation to the metadata"""
-        op_type = operation['type']
+        op_type = operation["type"]
 
-        if op_type == 'append_files':
+        if op_type == "append_files":
             # In a real implementation, this would add files to the manifest
             # For now, we'll just update the metadata
-            operation['files']
+            operation["files"]
             # Update the schema if needed (add new columns)
             # Update last_sequence_number if needed
-            metadata.last_updated_ms = int(threading.current_thread().ident or 0)  # Just for illustration
+            metadata.last_updated_ms = int(
+                threading.current_thread().ident or 0
+            )  # Just for illustration
 
-        elif op_type == 'delete_files':
-            operation['file_paths']
+        elif op_type == "delete_files":
+            operation["file_paths"]
             # In a real implementation, this would remove files from the manifest
             pass
 
-        elif op_type == 'overwrite_by_filter':
-            operation['filter']
+        elif op_type == "overwrite_by_filter":
+            operation["filter"]
             # In a real implementation, this would apply the filter
             pass
 
-        elif op_type == 'expire_snapshots':
-            older_than_ms = operation['older_than_ms']
+        elif op_type == "expire_snapshots":
+            older_than_ms = operation["older_than_ms"]
             # Remove old snapshots
             metadata.snapshots = [s for s in metadata.snapshots if s.timestamp_ms >= older_than_ms]
 
@@ -277,27 +288,31 @@ class Transaction:
         # Create a unique name for the manifest list
         timestamp = metadata.last_updated_ms
         # Use current_snapshot_id if available, otherwise use a temporary ID
-        snap_id = metadata.current_snapshot_id if metadata.current_snapshot_id is not None else "temp"
+        snap_id = (
+            metadata.current_snapshot_id if metadata.current_snapshot_id is not None else "temp"
+        )
         manifest_list_file = f"manifests/snap-{timestamp}-{snap_id}.avro"
         manifest_list_path = os.path.join(self.table_path, manifest_list_file)
 
         # Ensure the manifests directory exists
-        os.makedirs(os.path.join(self.table_path, 'manifests'), exist_ok=True)
+        os.makedirs(os.path.join(self.table_path, "manifests"), exist_ok=True)
 
         # In a real implementation, this would create an Avro manifest list file
         # For now, we'll create a simple JSON placeholder
         manifest_list_data: Dict[str, Any] = {
-            'manifests': [],
-            'snapshot_id': metadata.current_snapshot_id,
-            'timestamp': metadata.last_updated_ms
+            "manifests": [],
+            "snapshot_id": metadata.current_snapshot_id,
+            "timestamp": metadata.last_updated_ms,
         }
 
-        with open(manifest_list_path, 'w') as f:
+        with open(manifest_list_path, "w") as f:
             json.dump(manifest_list_data, f)
 
         return manifest_list_path
 
-    def _create_manifest_list_with_id(self, metadata: TableMetadata, snapshot_id: int, data_files: Optional[List[DataFile]] = None) -> str:
+    def _create_manifest_list_with_id(
+        self, metadata: TableMetadata, snapshot_id: int, data_files: Optional[List[DataFile]] = None
+    ) -> str:
         """Create a manifest list file for a specific snapshot ID"""
         if data_files is None:
             data_files = []
@@ -310,13 +325,13 @@ class Transaction:
         if data_files:
             # Create one manifest file containing all these data files
             manifest_file = self.file_manager.create_manifest_file(
-                data_files,
-                ManifestContent.DATA,
-                snapshot_id
+                data_files, ManifestContent.DATA, snapshot_id
             )
 
             # Create the manifest list containing this manifest
-            manifest_list_path = self.file_manager.create_manifest_list_file([manifest_file], snapshot_id)
+            manifest_list_path = self.file_manager.create_manifest_list_file(
+                [manifest_file], snapshot_id
+            )
         else:
             # Create empty manifest list
             manifest_list_path = self.file_manager.create_manifest_list_file([], snapshot_id)
@@ -326,6 +341,7 @@ class Transaction:
     def _deep_copy_metadata(self, metadata: TableMetadata) -> TableMetadata:
         """Create a deep copy of metadata for transaction isolation"""
         import copy
+
         return copy.deepcopy(metadata)
 
     def __enter__(self) -> "Transaction":
@@ -343,7 +359,12 @@ class Transaction:
 class TransactionManager:
     """Manages multiple transactions and ensures ACID compliance"""
 
-    def __init__(self, metadata_manager: MetadataManager, snapshot_manager: SnapshotManager, file_manager: FileManager):
+    def __init__(
+        self,
+        metadata_manager: MetadataManager,
+        snapshot_manager: SnapshotManager,
+        file_manager: FileManager,
+    ):
         self.metadata_manager = metadata_manager
         self.snapshot_manager = snapshot_manager
         self.file_manager = file_manager
@@ -353,7 +374,9 @@ class TransactionManager:
     def begin_transaction(self) -> Transaction:
         """Begin a new transaction"""
         with self._lock:
-            transaction = Transaction(self.metadata_manager, self.snapshot_manager, self.file_manager)
+            transaction = Transaction(
+                self.metadata_manager, self.snapshot_manager, self.file_manager
+            )
             transaction_id = id(transaction)
             self._active_transactions[transaction_id] = transaction
             return transaction
@@ -383,19 +406,19 @@ class Table:
         self.metadata_manager = MetadataManager(table_path)
         self.snapshot_manager = SnapshotManager(self.metadata_manager)
         self.file_manager = FileManager(table_path, self.metadata_manager)
-        self.transaction_manager = TransactionManager(self.metadata_manager, self.snapshot_manager, self.file_manager)
+        self.transaction_manager = TransactionManager(
+            self.metadata_manager, self.snapshot_manager, self.file_manager
+        )
 
         # Initialize if needed
-        if create_if_not_exists and not os.path.exists(os.path.join(table_path, 'metadata')):
+        if create_if_not_exists and not os.path.exists(os.path.join(table_path, "metadata")):
             self._initialize_table()
 
     def _initialize_table(self) -> None:
         """Initialize a new table with default metadata"""
         from .data_structures import TableMetadata
 
-        initial_metadata = TableMetadata(
-            location=self.table_path
-        )
+        initial_metadata = TableMetadata(location=self.table_path)
         self.metadata_manager.initialize_table(initial_metadata)
 
     def new_transaction(self) -> Transaction:
@@ -414,7 +437,9 @@ class Table:
         """Get all snapshots"""
         return self.snapshot_manager.list_snapshots()
 
-    def time_travel(self, snapshot_id: Optional[int] = None, timestamp: Optional[int] = None) -> Any:
+    def time_travel(
+        self, snapshot_id: Optional[int] = None, timestamp: Optional[int] = None
+    ) -> Any:
         """Time travel to a specific snapshot or timestamp"""
         if snapshot_id is not None:
             return self.snapshot_manager.time_travel_to(snapshot_id)
@@ -430,9 +455,12 @@ class Table:
             result = tx.commit()
             return bool(result)
 
-    def append_records(self, records: List[Dict[str, Any]],
-                      schema: 'Schema',
-                      partition_values: Optional[Dict[str, Any]] = None) -> bool:
+    def append_records(
+        self,
+        records: List[Dict[str, Any]],
+        schema: "Schema",
+        partition_values: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Append actual data records to the table by creating new data files (convenience method)"""
         with self.new_transaction() as tx:
             tx.append_data(records=records, schema=schema, partition_values=partition_values)

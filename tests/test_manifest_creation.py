@@ -4,6 +4,7 @@ Comprehensive tests for manifest creation bug fix.
 Tests that manifest lists are properly created with data files when appending records,
 and that queries return the written data.
 """
+
 import json
 import os
 import tempfile
@@ -29,8 +30,8 @@ def test_append_records_creates_non_empty_manifests():
             fields=[
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "value", "type": "string", "required": True},
-                {"id": 3, "name": "count", "type": "long", "required": True}
-            ]
+                {"id": 3, "name": "count", "type": "long", "required": True},
+            ],
         )
         table = create_table(table_path, schema)
 
@@ -38,7 +39,7 @@ def test_append_records_creates_non_empty_manifests():
         records = [
             {"id": 1, "value": "first", "count": 10},
             {"id": 2, "value": "second", "count": 20},
-            {"id": 3, "value": "third", "count": 30}
+            {"id": 3, "value": "third", "count": 30},
         ]
         success = table.append_records(records, schema)
         assert success, "append_records should succeed"
@@ -51,15 +52,18 @@ def test_append_records_creates_non_empty_manifests():
 
         # Read manifest list file
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
-        assert os.path.exists(manifest_list_path), f"Manifest list file should exist at {manifest_list_path}"
+        assert os.path.exists(
+            manifest_list_path
+        ), f"Manifest list file should exist at {manifest_list_path}"
 
-        with open(manifest_list_path, 'r') as f:
+        with open(manifest_list_path, "r") as f:
             manifest_list_data = json.load(f)
 
         # BUG FIX VALIDATION: manifests array should NOT be empty
         assert "manifests" in manifest_list_data, "Manifest list should have 'manifests' key"
-        assert len(manifest_list_data["manifests"]) > 0, \
-            "Manifests array should NOT be empty after appending records (BUG FIX)"
+        assert (
+            len(manifest_list_data["manifests"]) > 0
+        ), "Manifests array should NOT be empty after appending records (BUG FIX)"
 
         # Validate manifest structure
         first_manifest = manifest_list_data["manifests"][0]
@@ -81,15 +85,12 @@ def test_manifest_reading_returns_data_files():
             schema_id=1,
             fields=[
                 {"id": 1, "name": "user_id", "type": "long", "required": True},
-                {"id": 2, "name": "action", "type": "string", "required": True}
-            ]
+                {"id": 2, "name": "action", "type": "string", "required": True},
+            ],
         )
         table = create_table(table_path, schema)
 
-        records = [
-            {"user_id": 100, "action": "login"},
-            {"user_id": 101, "action": "logout"}
-        ]
+        records = [{"user_id": 100, "action": "login"}, {"user_id": 101, "action": "logout"}]
         table.append_records(records, schema)
 
         # Read manifests via FileManager
@@ -114,7 +115,7 @@ def test_manifest_reading_returns_data_files():
         # Validate data file exists
         data_file = data_files[0]
         # Data file path is relative, construct absolute path
-        data_file_path = os.path.join(table_path, data_file.file_path.lstrip('/'))
+        data_file_path = os.path.join(table_path, data_file.file_path.lstrip("/"))
         assert os.path.exists(data_file_path), f"Data file should exist at {data_file_path}"
 
 
@@ -127,8 +128,8 @@ def test_multiple_appends_create_multiple_manifests():
             schema_id=1,
             fields=[
                 {"id": 1, "name": "timestamp", "type": "long", "required": True},
-                {"id": 2, "name": "event", "type": "string", "required": True}
-            ]
+                {"id": 2, "name": "event", "type": "string", "required": True},
+            ],
         )
         table = create_table(table_path, schema)
 
@@ -144,12 +145,13 @@ def test_multiple_appends_create_multiple_manifests():
 
         # Read manifest list
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
-        with open(manifest_list_path, 'r') as f:
+        with open(manifest_list_path, "r") as f:
             manifest_list_data = json.load(f)
 
         # Should have manifests from the append
-        assert len(manifest_list_data["manifests"]) > 0, \
-            "Should have at least one manifest after multiple appends"
+        assert (
+            len(manifest_list_data["manifests"]) > 0
+        ), "Should have at least one manifest after multiple appends"
 
 
 def test_concurrent_appends_create_valid_manifests():
@@ -165,8 +167,8 @@ def test_concurrent_appends_create_valid_manifests():
             schema_id=1,
             fields=[
                 {"id": 1, "name": "worker_id", "type": "long", "required": True},
-                {"id": 2, "name": "task_id", "type": "string", "required": True}
-            ]
+                {"id": 2, "name": "task_id", "type": "string", "required": True},
+            ],
         )
         table = create_table(table_path, schema)
 
@@ -181,12 +183,13 @@ def test_concurrent_appends_create_valid_manifests():
         assert snapshot is not None
 
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
-        with open(manifest_list_path, 'r') as f:
+        with open(manifest_list_path, "r") as f:
             manifest_list_data = json.load(f)
 
         # Final snapshot should have manifests
-        assert len(manifest_list_data["manifests"]) > 0, \
-            "Final snapshot should have non-empty manifests"
+        assert (
+            len(manifest_list_data["manifests"]) > 0
+        ), "Final snapshot should have non-empty manifests"
 
 
 def test_empty_append_creates_empty_manifest():
@@ -195,8 +198,7 @@ def test_empty_append_creates_empty_manifest():
         table_path = os.path.join(temp_dir, "test_table")
 
         schema = Schema(
-            schema_id=1,
-            fields=[{"id": 1, "name": "id", "type": "long", "required": True}]
+            schema_id=1, fields=[{"id": 1, "name": "id", "type": "long", "required": True}]
         )
         table = create_table(table_path, schema)
 
@@ -209,7 +211,7 @@ def test_empty_append_creates_empty_manifest():
         if snapshot is not None and snapshot.manifest_list:
             manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
             if os.path.exists(manifest_list_path):
-                with open(manifest_list_path, 'r') as f:
+                with open(manifest_list_path, "r") as f:
                     manifest_list_data = json.load(f)
 
                 # Empty append should have empty manifests (this is correct behavior)
@@ -234,8 +236,8 @@ def test_pandas_query_returns_data():
             fields=[
                 {"id": 1, "name": "workflow_id", "type": "string", "required": True},
                 {"id": 2, "name": "status", "type": "string", "required": True},
-                {"id": 3, "name": "duration_ms", "type": "long", "required": True}
-            ]
+                {"id": 3, "name": "duration_ms", "type": "long", "required": True},
+            ],
         )
         table = create_table(table_path, schema)
 
@@ -243,7 +245,7 @@ def test_pandas_query_returns_data():
         records = [
             {"workflow_id": "wf-001", "status": "success", "duration_ms": 1500},
             {"workflow_id": "wf-002", "status": "failed", "duration_ms": 3000},
-            {"workflow_id": "wf-003", "status": "success", "duration_ms": 2200}
+            {"workflow_id": "wf-003", "status": "success", "duration_ms": 2200},
         ]
         table.append_records(records, schema)
 
@@ -266,7 +268,7 @@ def test_pandas_query_returns_data():
             data_files = file_manager.read_manifest_file(manifest_path)
 
             for data_file in data_files:
-                parquet_path = os.path.join(table_path, data_file.file_path.lstrip('/'))
+                parquet_path = os.path.join(table_path, data_file.file_path.lstrip("/"))
                 df = pd.read_parquet(parquet_path)
                 all_data.append(df)
 
@@ -276,7 +278,9 @@ def test_pandas_query_returns_data():
         # Validate results
         assert len(result_df) == 3, "Should have 3 records"
         assert "workflow_id" in result_df.columns
-        assert result_df[result_df["status"] == "success"].shape[0] == 2, "Should have 2 success records"
+        assert (
+            result_df[result_df["status"] == "success"].shape[0] == 2
+        ), "Should have 2 success records"
         assert result_df["duration_ms"].sum() == 6700, "Total duration should be 6700ms"
 
 

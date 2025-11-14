@@ -1,6 +1,7 @@
 """
 Snapshotting and time travel functionality for the Python Iceberg implementation
 """
+
 import os
 from copy import deepcopy
 from datetime import datetime
@@ -15,14 +16,18 @@ class SnapshotManager:
 
     def __init__(self, metadata_manager: MetadataManager):
         self.metadata_manager = metadata_manager
-        self.snapshots_path = os.path.join(self.metadata_manager.table_path, 'snapshots')
+        self.snapshots_path = os.path.join(self.metadata_manager.table_path, "snapshots")
 
         # Ensure snapshots directory exists
         os.makedirs(self.snapshots_path, exist_ok=True)
 
-    def create_snapshot(self, manifest_list_path: str, operation: str = "append",
-                       parent_snapshot_id: Optional[int] = None,
-                       summary: Optional[Dict[str, str]] = None) -> Snapshot:
+    def create_snapshot(
+        self,
+        manifest_list_path: str,
+        operation: str = "append",
+        parent_snapshot_id: Optional[int] = None,
+        summary: Optional[Dict[str, str]] = None,
+    ) -> Snapshot:
         """Create a new snapshot with proper OCC handling"""
         # Get the base metadata that will be used for comparison in commit
         base_metadata = self.metadata_manager.refresh()
@@ -39,7 +44,7 @@ class SnapshotManager:
             manifest_list=manifest_list_path,
             parent_snapshot_id=parent_snapshot_id,
             operation=operation,
-            summary=summary or {}
+            summary=summary or {},
         )
 
         # Create new metadata based on base, but with modifications
@@ -49,8 +54,7 @@ class SnapshotManager:
 
         # Add to snapshot log
         history_entry = HistoryEntry(
-            timestamp_ms=snapshot.timestamp_ms,
-            snapshot_id=snapshot.snapshot_id
+            timestamp_ms=snapshot.timestamp_ms, snapshot_id=snapshot.snapshot_id
         )
         new_metadata.snapshot_log.append(history_entry)
 
@@ -100,12 +104,12 @@ class SnapshotManager:
         snapshots = self.get_all_snapshots()
         return [
             {
-                'snapshot_id': snapshot.snapshot_id,
-                'timestamp_ms': snapshot.timestamp_ms,
-                'timestamp': datetime.fromtimestamp(snapshot.timestamp_ms / 1000.0),
-                'operation': snapshot.operation,
-                'summary': snapshot.summary,
-                'parent_id': snapshot.parent_snapshot_id
+                "snapshot_id": snapshot.snapshot_id,
+                "timestamp_ms": snapshot.timestamp_ms,
+                "timestamp": datetime.fromtimestamp(snapshot.timestamp_ms / 1000.0),
+                "operation": snapshot.operation,
+                "summary": snapshot.summary,
+                "parent_id": snapshot.parent_snapshot_id,
             }
             for snapshot in snapshots
         ]
@@ -146,8 +150,9 @@ class SnapshotManager:
             # Update current snapshot if needed
             if current_metadata.current_snapshot_id == snapshot_id:
                 # Set to the most recent snapshot
-                valid_snapshots = [s for s in current_metadata.snapshots
-                                 if s.snapshot_id != snapshot_id]
+                valid_snapshots = [
+                    s for s in current_metadata.snapshots if s.snapshot_id != snapshot_id
+                ]
                 if valid_snapshots:
                     current_metadata.current_snapshot_id = max(
                         s.snapshot_id for s in valid_snapshots

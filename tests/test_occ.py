@@ -2,11 +2,13 @@
 Test for Optimistic Concurrency Control (OCC) functionality
 Tests concurrent operations to ensure proper conflict detection and retry logic
 """
+
 import os
 import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from datashard import DataFile, FileFormat, create_table
@@ -25,8 +27,8 @@ def test_concurrent_operations():
             # Create an actual file in the table's data directory
             file_path = os.path.join(table.table_path, "data", f"thread_{thread_id}_file.parquet")
             os.makedirs(os.path.join(table.table_path, "data"), exist_ok=True)
-            with open(file_path, 'wb') as f:
-                f.write(f'dummy content for thread {thread_id}'.encode())
+            with open(file_path, "wb") as f:
+                f.write(f"dummy content for thread {thread_id}".encode())
 
             data_files = [
                 DataFile(
@@ -34,7 +36,7 @@ def test_concurrent_operations():
                     file_format=FileFormat.PARQUET,
                     partition_values={"thread": thread_id},
                     record_count=100,
-                    file_size_in_bytes=os.path.getsize(file_path)
+                    file_size_in_bytes=os.path.getsize(file_path),
                 )
             ]
 
@@ -63,7 +65,9 @@ def test_concurrent_operations():
         print(f"  Total snapshots created: {len(snapshots)}")
 
         # We should have 5 snapshots (one for each successful transaction)
-        assert len(snapshots) == num_threads, f"Expected {num_threads} snapshots, got {len(snapshots)}"
+        assert (
+            len(snapshots) == num_threads
+        ), f"Expected {num_threads} snapshots, got {len(snapshots)}"
         print("  ✓ All concurrent operations completed successfully with OCC")
 
         # Pytest expects None return for test functions
@@ -87,8 +91,8 @@ def test_occ_conflict_resolution():
         # Create actual file
         file_path = os.path.join(table.table_path, "data", "occ_test_file.parquet")
         os.makedirs(os.path.join(table.table_path, "data"), exist_ok=True)
-        with open(file_path, 'wb') as f:
-            f.write(b'dummy content for OCC test')
+        with open(file_path, "wb") as f:
+            f.write(b"dummy content for OCC test")
 
         data_files = [
             DataFile(
@@ -96,7 +100,7 @@ def test_occ_conflict_resolution():
                 file_format=FileFormat.PARQUET,
                 partition_values={"test": 1},
                 record_count=100,
-                file_size_in_bytes=os.path.getsize(file_path)
+                file_size_in_bytes=os.path.getsize(file_path),
             )
         ]
 

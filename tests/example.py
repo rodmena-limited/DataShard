@@ -1,9 +1,11 @@
 """
 Example usage of the Python Iceberg implementation
 """
+
 import os
 import sys
 import tempfile
+
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import time
@@ -39,10 +41,10 @@ def main():
         file2_path = os.path.join(table_path, "data", "users_2024.parquet")
 
         # Create dummy files with minimal content to satisfy file existence check
-        with open(file1_path, 'wb') as f:
-            f.write(b'dummy parquet content for users 2023')
-        with open(file2_path, 'wb') as f:
-            f.write(b'dummy parquet content for users 2024')
+        with open(file1_path, "wb") as f:
+            f.write(b"dummy parquet content for users 2023")
+        with open(file2_path, "wb") as f:
+            f.write(b"dummy parquet content for users 2024")
 
         # Create DataFile objects with Iceberg-style paths
         data_files = [
@@ -51,15 +53,15 @@ def main():
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2023},
                 record_count=5000,
-                file_size_in_bytes=os.path.getsize(file1_path)
+                file_size_in_bytes=os.path.getsize(file1_path),
             ),
             DataFile(
                 file_path="/data/users_2024.parquet",
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2024},
                 record_count=7500,
-                file_size_in_bytes=os.path.getsize(file2_path)
-            )
+                file_size_in_bytes=os.path.getsize(file2_path),
+            ),
         ]
 
         print("   Adding 2 data files to the table...")
@@ -81,8 +83,8 @@ def main():
         # Add more data to create another snapshot
         print("\n5. Adding more data to create a second snapshot")
         file3_path = os.path.join(table_path, "data", "users_2025.parquet")
-        with open(file3_path, 'wb') as f:
-            f.write(b'dummy parquet content for users 2025')
+        with open(file3_path, "wb") as f:
+            f.write(b"dummy parquet content for users 2025")
 
         more_files = [
             DataFile(
@@ -90,7 +92,7 @@ def main():
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2025},
                 record_count=10000,
-                file_size_in_bytes=os.path.getsize(file3_path)
+                file_size_in_bytes=os.path.getsize(file3_path),
             )
         ]
 
@@ -106,7 +108,7 @@ def main():
         print("\n7. Time travel demonstration:")
         first_snapshot = snapshots[0]
         print(f"   Traveling to first snapshot: {first_snapshot['snapshot_id']}")
-        traveled = table.time_travel(snapshot_id=first_snapshot['snapshot_id'])
+        traveled = table.time_travel(snapshot_id=first_snapshot["snapshot_id"])
         print(f"   ✓ Traveled to snapshot: {traveled.snapshot_id}")
 
         # Show current state

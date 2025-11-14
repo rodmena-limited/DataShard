@@ -1,9 +1,11 @@
 """
 Test script for file management functionality
 """
+
 import os
 import sys
 import tempfile
+
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from datashard import DataFile, FileFormat, create_table
@@ -24,7 +26,7 @@ def test_file_validation():
         data_file_path = os.path.join(data_subdir, "test.parquet")
 
         # Write some sample data
-        with open(data_file_path, 'wb') as f:
+        with open(data_file_path, "wb") as f:
             f.write(b"sample parquet data")
 
         # Test file validation using Iceberg-style path (relative to table)
@@ -54,11 +56,11 @@ def test_manifest_creation():
         os.makedirs(data_subdir, exist_ok=True)
 
         file1_path = os.path.join(data_subdir, "file1.parquet")
-        with open(file1_path, 'wb') as f:
+        with open(file1_path, "wb") as f:
             f.write(b"data for file 1")
 
         file2_path = os.path.join(data_subdir, "file2.parquet")
-        with open(file2_path, 'wb') as f:
+        with open(file2_path, "wb") as f:
             f.write(b"data for file 2")
 
         # Create data file objects using Iceberg-style paths (relative to table)
@@ -68,15 +70,15 @@ def test_manifest_creation():
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2023, "month": 1},
                 record_count=100,
-                file_size_in_bytes=1024
+                file_size_in_bytes=1024,
             ),
             DataFile(
                 file_path="/data/file2.parquet",
                 file_format=FileFormat.PARQUET,
                 partition_values={"year": 2023, "month": 2},
                 record_count=200,
-                file_size_in_bytes=2048
-            )
+                file_size_in_bytes=2048,
+            ),
         ]
 
         # Validate data files exist (this should pass)
@@ -107,11 +109,11 @@ def test_full_transaction_with_files():
 
         # Create data files
         file1_path = os.path.join(table_path, "data", "batch1.parquet")
-        with open(file1_path, 'wb') as f:
+        with open(file1_path, "wb") as f:
             f.write(b"test data batch 1")
 
         file2_path = os.path.join(table_path, "data", "batch2.parquet")
-        with open(file2_path, 'wb') as f:
+        with open(file2_path, "wb") as f:
             f.write(b"test data batch 2")
 
         # Create table
@@ -124,15 +126,15 @@ def test_full_transaction_with_files():
                 file_format=FileFormat.PARQUET,
                 partition_values={"batch": 1},
                 record_count=1000,
-                file_size_in_bytes=10240
+                file_size_in_bytes=10240,
             ),
             DataFile(
                 file_path="/data/batch2.parquet",
                 file_format=FileFormat.PARQUET,
                 partition_values={"batch": 2},
                 record_count=2000,
-                file_size_in_bytes=20480
-            )
+                file_size_in_bytes=20480,
+            ),
         ]
 
         # Perform transaction
@@ -167,7 +169,7 @@ def test_integrity_verification():
 
         # Create some data files
         file1_path = os.path.join(table_path, "data", "data1.parquet")
-        with open(file1_path, 'wb') as f:
+        with open(file1_path, "wb") as f:
             f.write(b"data file 1")
 
         data_files = [
@@ -176,7 +178,7 @@ def test_integrity_verification():
                 file_format=FileFormat.PARQUET,
                 partition_values={"id": 1},
                 record_count=100,
-                file_size_in_bytes=1024
+                file_size_in_bytes=1024,
             )
         ]
 
@@ -185,7 +187,9 @@ def test_integrity_verification():
 
         # Verify integrity
         integrity_report = table.file_manager.verify_integrity([manifest])
-        print(f"✓ Integrity check: {integrity_report['existing_files']}/{integrity_report['total_files']} files exist")
+        print(
+            f"✓ Integrity check: {integrity_report['existing_files']}/{integrity_report['total_files']} files exist"
+        )
         assert integrity_report["existing_files"] == integrity_report["total_files"] == 1
         assert len(integrity_report["missing_files"]) == 0
 
@@ -195,10 +199,12 @@ def test_integrity_verification():
             file_format=FileFormat.PARQUET,
             partition_values={"id": 2},
             record_count=200,
-            file_size_in_bytes=2048
+            file_size_in_bytes=2048,
         )
 
-        missing_manifest = table.file_manager.create_manifest_file([missing_file], snapshot_id=99998)
+        missing_manifest = table.file_manager.create_manifest_file(
+            [missing_file], snapshot_id=99998
+        )
         integrity_report2 = table.file_manager.verify_integrity([missing_manifest])
         assert len(integrity_report2["missing_files"]) == 1
         assert integrity_report2["missing_files"][0] == "/data/missing.parquet"

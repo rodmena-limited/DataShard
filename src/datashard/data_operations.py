@@ -1,6 +1,7 @@
 """
 Data file operations and readers/writers for the Python Iceberg implementation
 """
+
 import os
 import tempfile
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
@@ -8,15 +9,18 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+
 # Try to import pandas as optional dependency
 try:
     import pandas as pd
+
     PANDAS_AVAILABLE = True
 except ImportError:
     PANDAS_AVAILABLE = False
     pd = None  # Define as None to avoid reference errors
 
 from .data_structures import DataFile, FileFormat, Schema
+
 
 if TYPE_CHECKING:
     from .file_manager import FileManager
@@ -73,10 +77,12 @@ class DataFileReader:
 
         return self._reader.read(columns=column_names)
 
-    def read_pandas(self) -> Optional['pd.DataFrame']:
+    def read_pandas(self) -> Optional["pd.DataFrame"]:
         """Read data as pandas DataFrame (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         if not self._reader:
             self.open()
@@ -86,10 +92,12 @@ class DataFileReader:
             return table.to_pandas()
         return None
 
-    def read_batches_pandas(self, batch_size: int = 1000) -> Iterator['pd.DataFrame']:
+    def read_batches_pandas(self, batch_size: int = 1000) -> Iterator["pd.DataFrame"]:
         """Read data in pandas DataFrame batches (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         if not self._reader:
             self.open()
@@ -98,10 +106,12 @@ class DataFileReader:
             for batch in self._reader.iter_batches(batch_size=batch_size):
                 yield batch.to_pandas()
 
-    def read_columns_pandas(self, column_names: List[str]) -> Optional['pd.DataFrame']:
+    def read_columns_pandas(self, column_names: List[str]) -> Optional["pd.DataFrame"]:
         """Read specific columns from the file as pandas DataFrame (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         if not self._reader:
             self.open()
@@ -127,8 +137,13 @@ class DataFileReader:
 class DataFileWriter:
     """Writer for Iceberg data files"""
 
-    def __init__(self, file_path: str, file_format: FileFormat,
-                 schema: pa.Schema, metadata: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        file_path: str,
+        file_format: FileFormat,
+        schema: pa.Schema,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         self.file_path = file_path
         self.file_format = file_format
         self._schema = schema  # Use private attribute to not conflict with any method
@@ -150,20 +165,18 @@ class DataFileWriter:
             # Create a temporary file first
             temp_dir = os.path.dirname(self.file_path)
             self._temp_file = tempfile.NamedTemporaryFile(
-                delete=False, dir=temp_dir, suffix='.parquet'
+                delete=False, dir=temp_dir, suffix=".parquet"
             )
 
             # Add our metadata to the schema
             schema_metadata = self._schema.metadata if self._schema.metadata else {}
             for key, value in self.metadata.items():
-                schema_metadata[key.encode('utf-8')] = str(value).encode('utf-8')
+                schema_metadata[key.encode("utf-8")] = str(value).encode("utf-8")
 
             modified_schema = self._schema.with_metadata(schema_metadata)
 
             self._writer = pq.ParquetWriter(
-                self._temp_file.name,
-                modified_schema,
-                compression='snappy'
+                self._temp_file.name, modified_schema, compression="snappy"
             )
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
@@ -192,10 +205,12 @@ class DataFileWriter:
             table = pa.Table.from_pylist(records, schema=self._schema)
             self.write_batch(table)
 
-    def write_pandas(self, df: 'pd.DataFrame') -> None:
+    def write_pandas(self, df: "pd.DataFrame") -> None:
         """Write a pandas DataFrame to the file (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         if not self._writer:
             self.open()
@@ -236,15 +251,15 @@ class DataFileManager:
 
         fields = []
         for field_dict in iceberg_schema.fields:
-            field_id = field_dict.get('id', 0)
-            field_name = field_dict.get('name', f'field_{field_id}')
-            field_type_str = field_dict.get('type', 'string')
+            field_id = field_dict.get("id", 0)
+            field_name = field_dict.get("name", f"field_{field_id}")
+            field_type_str = field_dict.get("type", "string")
 
             # Map Iceberg types to PyArrow types
             arrow_type = self._iceberg_type_to_arrow(field_type_str)
 
             # Check if field is required
-            is_nullable = not field_dict.get('required', False)
+            is_nullable = not field_dict.get("required", False)
 
             fields.append(pa.field(field_name, arrow_type, nullable=is_nullable))
 
@@ -257,43 +272,45 @@ class DataFileManager:
         import pyarrow as pa
 
         if isinstance(iceberg_type, dict):
-            iceberg_type = iceberg_type.get('type', 'string')
+            iceberg_type = iceberg_type.get("type", "string")
 
         type_mapping = {
-            'boolean': pa.bool_(),
-            'int': pa.int32(),
-            'long': pa.int64(),
-            'float': pa.float32(),
-            'double': pa.float64(),
-            'date': pa.date32(),
-            'time': pa.time64('us'),
-            'timestamp': pa.timestamp('us'),
-            'string': pa.string(),
-            'uuid': pa.string(),  # For UUID handling
-            'binary': pa.binary(),
-            'fixed': pa.binary(),
+            "boolean": pa.bool_(),
+            "int": pa.int32(),
+            "long": pa.int64(),
+            "float": pa.float32(),
+            "double": pa.float64(),
+            "date": pa.date32(),
+            "time": pa.time64("us"),
+            "timestamp": pa.timestamp("us"),
+            "string": pa.string(),
+            "uuid": pa.string(),  # For UUID handling
+            "binary": pa.binary(),
+            "fixed": pa.binary(),
         }
 
         # Handle complex types
         if isinstance(iceberg_type, str):
-            if iceberg_type.startswith('list<'):
+            if iceberg_type.startswith("list<"):
                 # Extract element type and map it
                 element_type = iceberg_type[5:-1]  # Remove 'list<>' wrapper
                 return pa.list_(self._iceberg_type_to_arrow(element_type))
-            elif iceberg_type.startswith('map<'):
+            elif iceberg_type.startswith("map<"):
                 # For now, treat as string - in real implementation would need key/value types
                 return pa.string()
-            elif iceberg_type.startswith('struct<'):
+            elif iceberg_type.startswith("struct<"):
                 return pa.string()  # For now, treat as string
 
         return type_mapping.get(str(iceberg_type), pa.string())  # Default to string
 
-    def write_data_file(self,
-                       file_path: str,
-                       records: List[Dict[str, Any]],
-                       iceberg_schema: Schema,
-                       file_format: FileFormat = FileFormat.PARQUET,
-                       partition_values: Optional[Dict[str, Any]] = None) -> DataFile:
+    def write_data_file(
+        self,
+        file_path: str,
+        records: List[Dict[str, Any]],
+        iceberg_schema: Schema,
+        file_format: FileFormat = FileFormat.PARQUET,
+        partition_values: Optional[Dict[str, Any]] = None,
+    ) -> DataFile:
         """Write data records to a file and return DataFile metadata"""
 
         arrow_schema = self.create_arrow_schema(iceberg_schema)
@@ -303,7 +320,7 @@ class DataFileManager:
                 # Write in batches to handle large datasets efficiently
                 batch_size = 1000
                 for i in range(0, len(records), batch_size):
-                    batch_records = records[i:i + batch_size]
+                    batch_records = records[i : i + batch_size]
                     writer.write_records(batch_records)
 
         # Create and return the DataFile object with statistics
@@ -312,18 +329,22 @@ class DataFileManager:
             file_format=file_format,
             partition_values=partition_values or {},
             record_count=writer.row_count,
-            file_size_in_bytes=os.path.getsize(file_path)
+            file_size_in_bytes=os.path.getsize(file_path),
         )
 
-    def write_pandas_file(self,
-                         file_path: str,
-                         df: 'pd.DataFrame',
-                         iceberg_schema: Schema,
-                         file_format: FileFormat = FileFormat.PARQUET,
-                         partition_values: Optional[Dict[str, Any]] = None) -> DataFile:
+    def write_pandas_file(
+        self,
+        file_path: str,
+        df: "pd.DataFrame",
+        iceberg_schema: Schema,
+        file_format: FileFormat = FileFormat.PARQUET,
+        partition_values: Optional[Dict[str, Any]] = None,
+    ) -> DataFile:
         """Write a pandas DataFrame to a file and return DataFile metadata (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         # Validate that the DataFrame is compatible with the schema
         if not self.validate_pandas_compatibility(df, iceberg_schema):
@@ -340,13 +361,15 @@ class DataFileManager:
             file_format=file_format,
             partition_values=partition_values or {},
             record_count=writer.row_count,
-            file_size_in_bytes=os.path.getsize(file_path)
+            file_size_in_bytes=os.path.getsize(file_path),
         )
 
-    def read_data_file(self,
-                      file_path: str,
-                      file_format: FileFormat = FileFormat.PARQUET,
-                      columns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    def read_data_file(
+        self,
+        file_path: str,
+        file_format: FileFormat = FileFormat.PARQUET,
+        columns: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Read data from a file and return as list of records"""
 
         with DataFileReader(file_path, file_format) as reader:
@@ -358,13 +381,17 @@ class DataFileManager:
             # Convert to list of dictionaries
             return table.to_pylist()
 
-    def read_pandas_file(self,
-                        file_path: str,
-                        file_format: FileFormat = FileFormat.PARQUET,
-                        columns: Optional[List[str]] = None) -> 'pd.DataFrame':
+    def read_pandas_file(
+        self,
+        file_path: str,
+        file_format: FileFormat = FileFormat.PARQUET,
+        columns: Optional[List[str]] = None,
+    ) -> "pd.DataFrame":
         """Read data from a file as pandas DataFrame (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         with DataFileReader(file_path, file_format) as reader:
             if columns:
@@ -372,10 +399,12 @@ class DataFileManager:
             else:
                 return reader.read_pandas()
 
-    def validate_pandas_compatibility(self, df: 'pd.DataFrame', iceberg_schema: Schema) -> bool:
+    def validate_pandas_compatibility(self, df: "pd.DataFrame", iceberg_schema: Schema) -> bool:
         """Validate that pandas DataFrame is compatible with the schema (requires pandas)"""
         if not PANDAS_AVAILABLE:
-            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+            raise ImportError(
+                "pandas is not available. Install with: pip install datashard[pandas]"
+            )
 
         try:
             # Convert the DataFrame to Arrow Table using the schema
@@ -385,9 +414,9 @@ class DataFileManager:
         except Exception:
             return False
 
-    def validate_data_compatibility(self,
-                                   records: List[Dict[str, Any]],
-                                   iceberg_schema: Schema) -> bool:
+    def validate_data_compatibility(
+        self, records: List[Dict[str, Any]], iceberg_schema: Schema
+    ) -> bool:
         """Validate that records are compatible with the schema"""
         try:
             arrow_schema = self.create_arrow_schema(iceberg_schema)
