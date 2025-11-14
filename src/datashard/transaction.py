@@ -180,8 +180,15 @@ class Transaction:
 
                     # Generate a snapshot ID for this transaction
                     snapshot_id = int(datetime.now().timestamp() * 1000000)  # microseconds since epoch
-                    # Create a new manifest list for this snapshot
-                    manifest_list_path = self._create_manifest_list_with_id(new_metadata, snapshot_id)
+
+                    # Extract data files from append_files operations
+                    data_files = []
+                    for operation in self._operations:
+                        if operation['type'] == 'append_files':
+                            data_files.extend(operation['files'])
+
+                    # Create a new manifest list for this snapshot with actual data files
+                    manifest_list_path = self._create_manifest_list_with_id(new_metadata, snapshot_id, data_files)
 
                     # Create a new snapshot for this transaction
                     # We need to pass the base metadata for proper OCC checking
