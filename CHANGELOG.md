@@ -5,6 +5,28 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2025-11-14
+
+### Fixed
+
+#### Critical S3 Table Path Bug 🔧
+- **Fixed `create_storage_backend()` ignoring table_path for S3 storage**
+  - Previously, all S3 tables were created at the bucket root regardless of the `table_path` parameter
+  - Now correctly combines `DATASHARD_S3_PREFIX` environment variable with `table_path`
+  - Example: `create_table("logs/workflows", schema)` now creates `s3://bucket/logs/workflows/` instead of `s3://bucket/`
+  - This fix is critical for multi-table applications using S3 storage
+
+- **Impact**: Without this fix, multiple tables would overwrite each other's data in S3
+  - ❌ Before: `create_table("table1", schema)` and `create_table("table2", schema)` both wrote to `s3://bucket/`
+  - ✅ After: Tables correctly write to `s3://bucket/table1/` and `s3://bucket/table2/`
+
+### Changed
+
+- **S3 prefix handling** in `storage_backend.py`
+  - `create_storage_backend()` now constructs full S3 prefix from both environment variable and table path
+  - Logic: `full_prefix = f"{env_prefix}/{table_path}"` (with proper path normalization)
+  - Maintains backward compatibility: empty prefixes handled correctly
+
 ## [0.2.2] - 2025-01-14
 
 ### Added
@@ -121,6 +143,7 @@ DATASHARD_S3_PREFIX=<prefix>       # Optional prefix
 
 ---
 
+[0.2.3]: https://github.com/rodmena-limited/datashard/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/rodmena-limited/datashard/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/rodmena-limited/datashard/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/rodmena-limited/datashard/releases/tag/v0.2.0

@@ -322,7 +322,19 @@ def create_storage_backend(table_path: str) -> StorageBackend:
         access_key = os.getenv("DATASHARD_S3_ACCESS_KEY")
         secret_key = os.getenv("DATASHARD_S3_SECRET_KEY")
         region = os.getenv("DATASHARD_S3_REGION", "us-east-1")
-        prefix = os.getenv("DATASHARD_S3_PREFIX", "")
+        env_prefix = os.getenv("DATASHARD_S3_PREFIX", "")
+
+        # Combine environment prefix with table path for full S3 prefix
+        # table_path is the logical location of the table (e.g., "logs/workflow_logs")
+        table_prefix = table_path.strip("/")
+        if env_prefix and table_prefix:
+            full_prefix = f"{env_prefix.rstrip('/')}/{table_prefix}"
+        elif env_prefix:
+            full_prefix = env_prefix.rstrip("/")
+        elif table_prefix:
+            full_prefix = table_prefix
+        else:
+            full_prefix = ""
 
         # Validate credentials
         if not (access_key and secret_key):
@@ -336,7 +348,7 @@ def create_storage_backend(table_path: str) -> StorageBackend:
             access_key=access_key,
             secret_key=secret_key,
             region=region,
-            prefix=prefix,
+            prefix=full_prefix,
         )
     else:
         # Local filesystem (default)

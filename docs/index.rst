@@ -19,6 +19,7 @@ Welcome to the official documentation for **datashard**, a Python implementation
    schemas
    time_travel
    concurrency
+   s3_storage
 
 .. toctree::
    :maxdepth: 2
@@ -55,6 +56,8 @@ Key Features:
 - **ACID Transactions**: Atomic, Consistent, Isolated, Durable operations
 - **Time Travel**: Query data as it existed at any point in time
 - **Safe Concurrency**: Multiple processes can read/write without corruption
+- **S3-Compatible Storage**: AWS S3, MinIO, DigitalOcean Spaces support (v0.2.2+)
+- **Distributed Workflows**: Run workers across different machines with shared S3 storage
 - **Schema Evolution**: Add/remove columns while maintaining history
 - **Multiple File Formats**: Parquet, Avro, ORC support
 - **Data Integrity**: Built-in validation and error handling

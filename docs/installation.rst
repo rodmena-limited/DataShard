@@ -18,6 +18,14 @@ The easiest way to install datashard is using pip:
 
    pip install datashard
 
+For S3 storage support, install with the ``s3`` extra:
+
+.. code-block:: bash
+
+   pip install datashard[s3]
+
+This includes the ``boto3`` library required for S3-compatible storage backends.
+
 Installing from Source
 ----------------------
 
