@@ -3,12 +3,15 @@ Data file operations and readers/writers for the Python Iceberg implementation
 """
 import os
 import tempfile
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .data_structures import DataFile, FileFormat, Schema
+
+if TYPE_CHECKING:
+    from .file_manager import FileManager
 
 
 class DataFileReader:

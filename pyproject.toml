@@ -8,15 +8,14 @@ version = "0.1.4"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts"
 readme = "README.txt"
 requires-python = ">=3.7"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [
     {name = "Farshid Ashouri", email = "farsheed.ashouri@gmail.com"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research", 
-    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.7",
@@ -116,6 +115,9 @@ ensure_newline_before_comments = true
 line_length = 99
 
 [tool.ruff]
+line-length = 99
+
+[tool.ruff.lint]
 select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -127,12 +129,11 @@ select = [
 ignore = [
     "E501",  # Line too long (handled by black)
 ]
-line-length = 99
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 combine-as-imports = true
 
 [tool.mypy]
