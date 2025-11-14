@@ -10,12 +10,23 @@ Let's create a simple table to store user data:
 
 .. code-block:: python
 
-   from datashard import create_table, Schema, FileFormat
+   from datashard import create_table, Schema
    import os
+
+   # Define schema for user data
+   user_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "user_id", "type": "long", "required": True},
+           {"id": 2, "name": "name", "type": "string", "required": True},
+           {"id": 3, "name": "age", "type": "long", "required": True},
+           {"id": 4, "name": "email", "type": "string", "required": True}
+       ]
+   )
 
    # Create a new table
    table_path = "/tmp/my_first_table"
-   table = create_table(table_path)
+   table = create_table(table_path, user_schema)
 
    print(f"Table created at: {table_path}")
 
@@ -26,9 +37,6 @@ Now let's add some data using ACID transactions:
 
 .. code-block:: python
 
-   from datashard import DataFile
-   import json
-
    # Sample data to add
    sample_data = [
        {"user_id": 1, "name": "Alice", "age": 30, "email": "alice@example.com"},
@@ -36,16 +44,10 @@ Now let's add some data using ACID transactions:
        {"user_id": 3, "name": "Charlie", "age": 35, "email": "charlie@example.com"}
    ]
 
-   # Add data using a transaction
-   with table.new_transaction() as tx:
-       # Append the records to the table
-       success = table.append_records(
-           records=sample_data,
-           schema=None  # Using default schema for this example
-       )
-       result = tx.commit()
-       
-   print(f"Data added successfully: {result}")
+   # Add data - append_records handles transactions automatically
+   success = table.append_records(records=sample_data, schema=user_schema)
+
+   print(f"Data added successfully: {success}")
 
 Reading Data and Snapshots
 --------------------------
@@ -86,27 +88,33 @@ Here's a more comprehensive example that demonstrates multiple features:
 
 .. code-block:: python
 
-   from datashard import DataFile, FileFormat
+   from datashard import create_table, Schema
    import os
+
+   # Define schema for complex data
+   complex_schema = Schema(
+       schema_id=1,
+       fields=[
+           {"id": 1, "name": "id", "type": "long", "required": True},
+           {"id": 2, "name": "category", "type": "string", "required": True},
+           {"id": 3, "name": "value", "type": "double", "required": True},
+           {"id": 4, "name": "timestamp", "type": "string", "required": True}
+       ]
+   )
 
    # Create a new table with more complex data
    complex_table_path = "/tmp/complex_table"
-   complex_table = create_table(complex_table_path)
+   complex_table = create_table(complex_table_path, complex_schema)
 
-   # Add more complex data using multiple transactions
+   # Add more complex data
    complex_data = [
        {"id": 1, "category": "A", "value": 100.0, "timestamp": "2023-01-01"},
        {"id": 2, "category": "B", "value": 200.5, "timestamp": "2023-01-02"},
        {"id": 3, "category": "A", "value": 150.0, "timestamp": "2023-01-03"}
    ]
 
-   # Add data in a transaction
-   with complex_table.new_transaction() as tx:
-       success = complex_table.append_records(
-           records=complex_data,
-           schema=None
-       )
-       tx.commit()
+   # Add data
+   success = complex_table.append_records(records=complex_data, schema=complex_schema)
 
    # Verify the data was added
    print(f"Table has {len(complex_table.snapshots())} snapshots after adding complex data")
