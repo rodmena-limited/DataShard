@@ -77,10 +77,10 @@ class DataFileReader:
         """Read data as pandas DataFrame (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         if not self._reader:
             self.open()
-        
+
         if self._reader:
             table = self._reader.read()
             return table.to_pandas()
@@ -90,10 +90,10 @@ class DataFileReader:
         """Read data in pandas DataFrame batches (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         if not self._reader:
             self.open()
-        
+
         if self._reader:
             for batch in self._reader.iter_batches(batch_size=batch_size):
                 yield batch.to_pandas()
@@ -102,10 +102,10 @@ class DataFileReader:
         """Read specific columns from the file as pandas DataFrame (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         if not self._reader:
             self.open()
-            
+
         if self._reader:
             table = self._reader.read(columns=column_names)
             return table.to_pandas()
@@ -117,7 +117,7 @@ class DataFileReader:
         # If no reader opened yet, return the stored schema
         if not self._reader:
             self.open()
-            
+
         if self._reader:
             return self._reader.schema
         else:
@@ -196,10 +196,10 @@ class DataFileWriter:
         """Write a pandas DataFrame to the file (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         if not self._writer:
             self.open()
-        
+
         # Convert pandas DataFrame to Arrow Table
         table = pa.Table.from_pandas(df, schema=self._schema)
         self.write_batch(table)
@@ -222,7 +222,7 @@ class DataFileWriter:
 
 class DataFileManager:
     """Manages data file operations including reading/writing with proper schema management"""
-    
+
     def __init__(self, file_manager: "FileManager"):
         self.file_manager = file_manager
         self._arrow_schema_cache: Dict[int, pa.Schema] = {}
@@ -233,21 +233,21 @@ class DataFileManager:
             return self._arrow_schema_cache[iceberg_schema.schema_id]
 
         import pyarrow as pa
-        
+
         fields = []
         for field_dict in iceberg_schema.fields:
             field_id = field_dict.get('id', 0)
             field_name = field_dict.get('name', f'field_{field_id}')
             field_type_str = field_dict.get('type', 'string')
-            
+
             # Map Iceberg types to PyArrow types
             arrow_type = self._iceberg_type_to_arrow(field_type_str)
-            
+
             # Check if field is required
             is_nullable = not field_dict.get('required', False)
-            
+
             fields.append(pa.field(field_name, arrow_type, nullable=is_nullable))
-        
+
         schema = pa.schema(fields)
         self._arrow_schema_cache[iceberg_schema.schema_id] = schema
         return schema
@@ -255,7 +255,7 @@ class DataFileManager:
     def _iceberg_type_to_arrow(self, iceberg_type: Union[str, Dict[str, Any]]) -> pa.DataType:
         """Convert Iceberg type string to PyArrow type"""
         import pyarrow as pa
-        
+
         if isinstance(iceberg_type, dict):
             iceberg_type = iceberg_type.get('type', 'string')
 
@@ -295,9 +295,9 @@ class DataFileManager:
                        file_format: FileFormat = FileFormat.PARQUET,
                        partition_values: Optional[Dict[str, Any]] = None) -> DataFile:
         """Write data records to a file and return DataFile metadata"""
-        
+
         arrow_schema = self.create_arrow_schema(iceberg_schema)
-        
+
         with DataFileWriter(file_path, file_format, arrow_schema, {}) as writer:
             if records:
                 # Write in batches to handle large datasets efficiently
@@ -305,7 +305,7 @@ class DataFileManager:
                 for i in range(0, len(records), batch_size):
                     batch_records = records[i:i + batch_size]
                     writer.write_records(batch_records)
-        
+
         # Create and return the DataFile object with statistics
         return DataFile(
             file_path=file_path,
@@ -324,16 +324,16 @@ class DataFileManager:
         """Write a pandas DataFrame to a file and return DataFile metadata (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         # Validate that the DataFrame is compatible with the schema
         if not self.validate_pandas_compatibility(df, iceberg_schema):
             raise ValueError("DataFrame is not compatible with the provided schema")
-        
+
         arrow_schema = self.create_arrow_schema(iceberg_schema)
-        
+
         with DataFileWriter(file_path, file_format, arrow_schema, {}) as writer:
             writer.write_pandas(df)
-        
+
         # Create and return the DataFile object with statistics
         return DataFile(
             file_path=file_path,
@@ -343,18 +343,18 @@ class DataFileManager:
             file_size_in_bytes=os.path.getsize(file_path)
         )
 
-    def read_data_file(self, 
-                      file_path: str, 
+    def read_data_file(self,
+                      file_path: str,
                       file_format: FileFormat = FileFormat.PARQUET,
                       columns: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Read data from a file and return as list of records"""
-        
+
         with DataFileReader(file_path, file_format) as reader:
             if columns:
                 table = reader.read_columns(columns)
             else:
                 table = reader.read_all()
-            
+
             # Convert to list of dictionaries
             return table.to_pylist()
 
@@ -365,7 +365,7 @@ class DataFileManager:
         """Read data from a file as pandas DataFrame (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         with DataFileReader(file_path, file_format) as reader:
             if columns:
                 return reader.read_columns_pandas(columns)
@@ -376,7 +376,7 @@ class DataFileManager:
         """Validate that pandas DataFrame is compatible with the schema (requires pandas)"""
         if not PANDAS_AVAILABLE:
             raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
-        
+
         try:
             # Convert the DataFrame to Arrow Table using the schema
             arrow_schema = self.create_arrow_schema(iceberg_schema)

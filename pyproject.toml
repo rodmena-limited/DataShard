@@ -4,18 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.1.6"
+version = "0.1.2"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts"
 readme = "README.txt"
 requires-python = ">=3.7"
-license = "Apache-2.0"
+license = {text = "Apache-2.0"}
 authors = [
-    {name = "Farshid Ashouri", email = "farsheed.ashouri@gmail.com"}
+    {name = "RODMENA LIMITED", email = "contact@rodmena.com"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research",
+    "Intended Audience :: Science/Research", 
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.7",
@@ -55,24 +56,6 @@ docs = [
     "sphinx-autodoc-typehints>=1.0"
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "pytest-xdist>=3.0",
-    "black>=22.0",
-    "ruff>=0.0.247",
-    "isort>=5.0",
-    "mypy>=1.0",
-    "types-setuptools>=65.0"
-]
-docs = [
-    "sphinx>=4.0",
-    "sphinx-rtd-theme>=1.0",
-    "sphinx-autodoc-typehints>=1.0",
-    "pyarrow>=10.0.0"
-]
-
 [project.urls]
 Homepage = "https://github.com/rodmena-limited/datashard"
 Repository = "https://github.com/rodmena-limited/datashard"
@@ -89,7 +72,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--strict-markers",
-    "--strict-config",
+    "--strict-config", 
     "-ra",
     "--tb=short",
     "-v"
@@ -104,7 +87,7 @@ source = ["datashard"]
 omit = [
     "*/tests/*",
     "*/test_*",
-    "*/__pycache__/*",
+    "*/__pycache__/*", 
     "*/venv/*",
     "*/env/*"
 ]
@@ -116,7 +99,7 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "if TYPE_CHECKING:",
     "raise AssertionError",
-    "raise NotImplementedError",
+    "raise NotImplementedError", 
     "if 0:",
     "if __debug__:"
 ]
@@ -135,13 +118,10 @@ use_parentheses = true
 ensure_newline_before_comments = true
 line_length = 99
 
-[tool.ruff]
-line-length = 99
-
 [tool.ruff.lint]
 select = [
     "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
+    "W",  # pycodestyle warnings  
     "F",  # pyflakes
     "I",  # isort
     "C",  # flake8-comprehensions

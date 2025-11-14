@@ -34,13 +34,13 @@ The implementation consists of several key components:
 ### Creating a Table
 
 ```python
-from rewrite.iceberg import create_table, DataFile, FileFormat
+from datashard.iceberg import create_table, DataFile, FileFormat
 
 # Create a new table
 table = create_table("/path/to/your/table")
 
 # Add data files to the table using a transaction
-from rewrite.data_structures import DataFile, FileFormat
+from datashard.data_structures import DataFile, FileFormat
 
 data_files = [
     DataFile(
@@ -144,6 +144,6 @@ This implementation properly follows Apache Iceberg's atomic commit pattern:
 Run the comprehensive test suite:
 
 ```bash
-cd rewrite
+cd datashard
 python test_iceberg.py
 ```
