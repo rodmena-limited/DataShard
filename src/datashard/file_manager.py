@@ -1,49 +1,56 @@
 """
 File system operations and manifest management for the Python Iceberg implementation
+
+Supports both local filesystem and S3-compatible storage via StorageBackend abstraction
 """
 
 import json
-import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .data_operations import DataFileManager
 from .data_structures import DataFile, FileFormat, ManifestContent, ManifestFile
 from .metadata_manager import MetadataManager
+from .storage_backend import StorageBackend
 
 
 class FileManager:
     """Handles file system operations and manifest management"""
 
-    def __init__(self, table_path: str, metadata_manager: MetadataManager):
+    def __init__(
+        self,
+        table_path: str,
+        metadata_manager: MetadataManager,
+        storage: StorageBackend,
+    ):
         self.table_path = table_path
         self.metadata_manager = metadata_manager
-        self.data_path = os.path.join(table_path, "data")
-        self.metadata_path = os.path.join(table_path, "metadata")
-        self.manifests_path = os.path.join(table_path, "metadata", "manifests")
+        self.storage = storage
+
+        # Path components
+        self.data_path = "data"
+        self.metadata_path = "metadata"
+        self.manifests_path = "metadata/manifests"
 
         # Ensure directories exist
-        os.makedirs(self.data_path, exist_ok=True)
-        os.makedirs(self.manifests_path, exist_ok=True)
+        self.storage.makedirs(self.data_path, exist_ok=True)
+        self.storage.makedirs(self.manifests_path, exist_ok=True)
 
         # Initialize data file manager
-        self.data_file_manager = DataFileManager(self)
+        self.data_file_manager = DataFileManager(self, storage)
 
     def validate_file_exists(self, file_path: str) -> bool:
         """Validate that a file exists in the proper location"""
-        # In Iceberg, paths that start with / are relative to the table location, not system absolute
+        # In Iceberg, paths that start with / are relative to the table location
         # So "/data/file.parquet" means "{table_location}/data/file.parquet"
         if file_path.startswith("/"):
             # Iceberg-style path relative to table location
-            full_path = os.path.join(self.table_path, file_path.lstrip("/"))
-            return os.path.exists(full_path)
-        elif os.path.isabs(file_path):
-            # True system absolute path
-            return os.path.exists(file_path)
+            path = file_path.lstrip("/")
         else:
-            # Relative path, join with table path
-            full_path = os.path.join(self.table_path, file_path)
-            return os.path.exists(full_path)
+            # Relative path
+            path = file_path
+
+        return self.storage.exists(path)
 
     def validate_data_files(self, data_files: List[DataFile]) -> bool:
         """Validate that all data files exist and are accessible"""
@@ -77,7 +84,7 @@ class FileManager:
         # Generate a unique manifest file name
         timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
         manifest_filename = f"manifest_{timestamp}.avro"
-        manifest_path = os.path.join(self.manifests_path, manifest_filename)
+        manifest_path = f"{self.manifests_path}/{manifest_filename}"
 
         # Create manifest content
         manifest_data = {
@@ -109,17 +116,15 @@ class FileManager:
             ],
         }
 
-        # Write the manifest file (in JSON format for simplicity, would be Avro in real implementation)
-        with open(manifest_path, "w") as f:
-            json.dump(manifest_data, f, indent=2)
+        # Write the manifest file using storage backend
+        self.storage.write_json(manifest_path, manifest_data)
 
         # Calculate actual file size
-        manifest_length = os.path.getsize(manifest_path)
+        manifest_length = self.storage.get_size(manifest_path)
         manifest_data["manifest_length"] = manifest_length
 
         # Update the file with correct length
-        with open(manifest_path, "w") as f:
-            json.dump(manifest_data, f, indent=2)
+        self.storage.write_json(manifest_path, manifest_data)
 
         # Return the manifest file structure using safe integer conversions
         return ManifestFile(
@@ -140,11 +145,10 @@ class FileManager:
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
         """Read and parse a manifest file to get data files"""
-        if not os.path.exists(manifest_path):
+        if not self.storage.exists(manifest_path):
             raise FileNotFoundError(f"Manifest file does not exist: {manifest_path}")
 
-        with open(manifest_path, "r") as f:
-            manifest_data = json.load(f)
+        manifest_data = self.storage.read_json(manifest_path)
 
         data_files = []
         for file_entry in manifest_data.get("files", []):
@@ -170,7 +174,7 @@ class FileManager:
         """Create a manifest list file for a snapshot"""
         timestamp = int(datetime.now().timestamp() * 1000)
         list_filename = f"manifest_list_{snapshot_id}_{timestamp}.avro"
-        list_path = os.path.join(self.manifests_path, list_filename)
+        list_path = f"{self.manifests_path}/{list_filename}"
 
         # Create manifest list content
         list_data = {
@@ -191,19 +195,17 @@ class FileManager:
             ],
         }
 
-        # Write the manifest list file
-        with open(list_path, "w") as f:
-            json.dump(list_data, f, indent=2)
+        # Write the manifest list file using storage backend
+        self.storage.write_json(list_path, list_data)
 
         return list_path
 
     def read_manifest_list_file(self, list_path: str) -> List[ManifestFile]:
         """Read a manifest list file and return manifest files"""
-        if not os.path.exists(list_path):
+        if not self.storage.exists(list_path):
             raise FileNotFoundError(f"Manifest list file does not exist: {list_path}")
 
-        with open(list_path, "r") as f:
-            list_data = json.load(f)
+        list_data = self.storage.read_json(list_path)
 
         manifest_files = []
         for manifest_entry in list_data.get("manifests", []):
@@ -225,14 +227,16 @@ class FileManager:
     def cleanup_orphaned_files(self, valid_file_paths: List[str]) -> int:
         """Clean up data files that are no longer referenced by any manifest"""
         # Get all data files currently in the data directory
+        all_data_files_raw = self.storage.list_files(self.data_path)
+
+        # Filter to only data files
         all_data_files = []
-        for root, _dirs, files in os.walk(self.data_path):
-            for file in files:
-                if file.endswith((".parquet", ".avro", ".orc")):
-                    full_path = os.path.join(root, file)
-                    # Convert to relative path for comparison
-                    rel_path = os.path.relpath(full_path, self.data_path)
-                    all_data_files.append(os.path.join("/data", rel_path))
+        for file_path in all_data_files_raw:
+            if file_path.endswith((".parquet", ".avro", ".orc")):
+                # Ensure path starts with /
+                if not file_path.startswith("/"):
+                    file_path = "/" + file_path
+                all_data_files.append(file_path)
 
         # Find files that are not in valid_file_paths
         orphaned_files = [f for f in all_data_files if f not in valid_file_paths]
@@ -241,10 +245,10 @@ class FileManager:
         deleted_count = 0
         for file_path in orphaned_files:
             try:
-                # Convert back to full path
-                full_path = os.path.join(self.table_path, file_path.lstrip("/"))
-                if os.path.exists(full_path):
-                    os.remove(full_path)
+                # Remove leading slash for storage backend
+                path = file_path.lstrip("/")
+                if self.storage.exists(path):
+                    self.storage.delete_file(path)
                     deleted_count += 1
             except Exception as e:
                 print(f"Warning: Could not delete orphaned file {file_path}: {e}")

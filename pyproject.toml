@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.2.1"
-description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts"
+version = "0.2.2"
+description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts with S3 support"
 readme = "README.md"
 requires-python = ">=3.7"
 license = {text = "Apache-2.0"}
@@ -37,22 +37,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+s3 = [
+    "boto3>=1.26.0",
+]
 pandas = [
     "pandas>=1.3.0",
 ]
 dev = [
     "pytest>=7.0",
-    "pytest-cov>=4.0", 
+    "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
     "black>=22.0",
     "ruff>=0.0.247",
-    "isort>=5.0", 
+    "isort>=5.0",
     "mypy>=1.0",
-    "types-setuptools>=65.0"
+    "types-setuptools>=65.0",
+    "boto3>=1.26.0",
 ]
 docs = [
     "sphinx>=4.0",
-    "sphinx-rtd-theme>=1.0", 
+    "sphinx-rtd-theme>=1.0",
     "sphinx-autodoc-typehints>=1.0"
 ]
 

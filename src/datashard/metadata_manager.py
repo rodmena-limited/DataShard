@@ -6,9 +6,12 @@ import json
 import os
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
+
+if TYPE_CHECKING:
+    from .storage_backend import StorageBackend
 
 
 class ConcurrentModificationException(Exception):
@@ -20,14 +23,15 @@ class ConcurrentModificationException(Exception):
 class MetadataManager:
     """Manages table metadata persistence and updates"""
 
-    def __init__(self, table_path: str):
+    def __init__(self, table_path: str, storage: "StorageBackend"):
         self.table_path = table_path
-        self.metadata_path = os.path.join(table_path, "metadata")
+        self.storage = storage
+        self.metadata_path = "metadata"  # Relative to table_path
         self.current_version = 0
         self._lock = threading.RLock()  # For thread safety
 
         # Ensure metadata directory exists
-        os.makedirs(self.metadata_path, exist_ok=True)
+        self.storage.makedirs(self.metadata_path, exist_ok=True)
 
     def initialize_table(self, metadata: TableMetadata) -> TableMetadata:
         """Initialize a new table with the given metadata"""
@@ -39,7 +43,7 @@ class MetadataManager:
 
             # Write the metadata file
             metadata_file = f"v{self.current_version}.metadata.json"
-            metadata_path = os.path.join(self.metadata_path, metadata_file)
+            metadata_path = f"{self.metadata_path}/{metadata_file}"
 
             self._write_metadata_file(metadata_path, metadata)
 
@@ -56,9 +60,9 @@ class MetadataManager:
                 return None
 
             metadata_file = f"v{version}.metadata.json"
-            metadata_path = os.path.join(self.metadata_path, metadata_file)
+            metadata_path = f"{self.metadata_path}/{metadata_file}"
 
-            if not os.path.exists(metadata_path):
+            if not self.storage.exists(metadata_path):
                 return None
 
             return self._read_metadata_file(metadata_path)
@@ -111,7 +115,7 @@ class MetadataManager:
 
             # Write new metadata file
             metadata_file = f"v{self.current_version}.metadata.json"
-            metadata_path = os.path.join(self.metadata_path, metadata_file)
+            metadata_path = f"{self.metadata_path}/{metadata_file}"
 
             self._write_metadata_file(metadata_path, new_metadata)
 
@@ -159,15 +163,11 @@ class MetadataManager:
     def _write_metadata_file(self, path: str, metadata: TableMetadata) -> None:
         """Write metadata to a JSON file"""
         metadata_dict = self._metadata_to_dict(metadata)
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(metadata_dict, f, indent=2)
+        self.storage.write_json(path, metadata_dict)
 
     def _read_metadata_file(self, path: str) -> TableMetadata:
         """Read metadata from a JSON file"""
-        with open(path, "r", encoding="utf-8") as f:
-            metadata_dict = json.load(f)
-
+        metadata_dict = self.storage.read_json(path)
         return self._dict_to_metadata(metadata_dict)
 
     def _metadata_to_dict(self, metadata: TableMetadata) -> Dict[str, Any]:
@@ -336,16 +336,15 @@ class MetadataManager:
 
     def _write_version_hint(self, version: int) -> None:
         """Write the current version number to a hint file"""
-        hint_path = os.path.join(self.table_path, "metadata.version-hint.text")
-        with open(hint_path, "w", encoding="utf-8") as f:
-            f.write(str(version))
+        hint_path = "metadata.version-hint.text"
+        content = str(version).encode("utf-8")
+        self.storage.write_file(hint_path, content)
 
     def _read_version_hint(self) -> Optional[int]:
         """Read the current version number from the hint file"""
-        hint_path = os.path.join(self.table_path, "metadata.version-hint.text")
-        if not os.path.exists(hint_path):
+        hint_path = "metadata.version-hint.text"
+        if not self.storage.exists(hint_path):
             return None
 
-        with open(hint_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            return int(content) if content.isdigit() else None
+        content = self.storage.read_file(hint_path).decode("utf-8").strip()
+        return int(content) if content.isdigit() else None

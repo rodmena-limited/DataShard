@@ -1,0 +1,343 @@
+"""
+Storage backend abstraction for DataShard.
+
+Supports both local filesystem and S3-compatible storage (AWS S3, MinIO, etc.)
+Configuration via environment variables:
+
+Local filesystem (default):
+    No configuration needed
+
+S3-compatible storage:
+    DATASHARD_STORAGE_TYPE=s3
+    DATASHARD_S3_ENDPOINT=https://s3.amazonaws.com (or MinIO endpoint)
+    DATASHARD_S3_ACCESS_KEY=your-access-key
+    DATASHARD_S3_SECRET_KEY=your-secret-key
+    DATASHARD_S3_BUCKET=your-bucket-name
+    DATASHARD_S3_REGION=us-east-1
+    DATASHARD_S3_PREFIX=optional/prefix/ (optional, default: "")
+"""
+
+import io
+import json
+import os
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+
+class StorageBackend(ABC):
+    """Abstract base class for storage backends"""
+
+    @abstractmethod
+    def read_file(self, path: str) -> bytes:
+        """Read file contents as bytes"""
+        pass
+
+    @abstractmethod
+    def write_file(self, path: str, content: bytes) -> None:
+        """Write bytes to file"""
+        pass
+
+    @abstractmethod
+    def read_json(self, path: str) -> Dict[str, Any]:
+        """Read JSON file"""
+        pass
+
+    @abstractmethod
+    def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        """Write JSON to file"""
+        pass
+
+    @abstractmethod
+    def exists(self, path: str) -> bool:
+        """Check if file exists"""
+        pass
+
+    @abstractmethod
+    def list_files(self, prefix: str) -> List[str]:
+        """List files with given prefix"""
+        pass
+
+    @abstractmethod
+    def delete_file(self, path: str) -> None:
+        """Delete file"""
+        pass
+
+    @abstractmethod
+    def makedirs(self, path: str, exist_ok: bool = True) -> None:
+        """Create directory (no-op for S3)"""
+        pass
+
+    @abstractmethod
+    def get_size(self, path: str) -> int:
+        """Get file size in bytes"""
+        pass
+
+
+class LocalStorageBackend(StorageBackend):
+    """Local filesystem storage backend"""
+
+    def __init__(self, base_path: str):
+        self.base_path = base_path
+
+    def _resolve_path(self, path: str) -> str:
+        """Resolve path relative to base_path"""
+        if path.startswith("/"):
+            # Iceberg-style absolute path relative to table
+            return os.path.join(self.base_path, path.lstrip("/"))
+        elif os.path.isabs(path):
+            # True system absolute path
+            return path
+        else:
+            # Relative path
+            return os.path.join(self.base_path, path)
+
+    def read_file(self, path: str) -> bytes:
+        full_path = self._resolve_path(path)
+        with open(full_path, "rb") as f:
+            return f.read()
+
+    def write_file(self, path: str, content: bytes) -> None:
+        full_path = self._resolve_path(path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "wb") as f:
+            f.write(content)
+
+    def read_json(self, path: str) -> Dict[str, Any]:
+        content = self.read_file(path)
+        return json.loads(content.decode('utf-8'))
+
+    def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        content = json.dumps(data, indent=2).encode('utf-8')
+        self.write_file(path, content)
+
+    def exists(self, path: str) -> bool:
+        full_path = self._resolve_path(path)
+        return os.path.exists(full_path)
+
+    def list_files(self, prefix: str) -> List[str]:
+        full_prefix = self._resolve_path(prefix)
+        if not os.path.exists(full_prefix):
+            return []
+
+        result = []
+        for root, dirs, files in os.walk(full_prefix):
+            for file in files:
+                full_path = os.path.join(root, file)
+                # Return path relative to base_path
+                rel_path = os.path.relpath(full_path, self.base_path)
+                result.append(rel_path)
+        return result
+
+    def delete_file(self, path: str) -> None:
+        full_path = self._resolve_path(path)
+        if os.path.exists(full_path):
+            os.remove(full_path)
+
+    def makedirs(self, path: str, exist_ok: bool = True) -> None:
+        full_path = self._resolve_path(path)
+        os.makedirs(full_path, exist_ok=exist_ok)
+
+    def get_size(self, path: str) -> int:
+        full_path = self._resolve_path(path)
+        return os.path.getsize(full_path)
+
+
+class S3StorageBackend(StorageBackend):
+    """S3-compatible storage backend (AWS S3, MinIO, etc.)"""
+
+    def __init__(
+        self,
+        bucket: str,
+        endpoint_url: Optional[str] = None,
+        access_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        region: str = "us-east-1",
+        prefix: str = "",
+    ):
+        if not BOTO3_AVAILABLE:
+            raise ImportError(
+                "boto3 is required for S3 storage backend. "
+                "Install with: pip install datashard[s3]"
+            )
+
+        self.bucket = bucket
+        self.prefix = prefix.rstrip("/")
+        self.endpoint_url = endpoint_url
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.region = region
+
+        # Create S3 client
+        session = boto3.session.Session()
+
+        s3_config = {
+            "region_name": region,
+        }
+
+        if endpoint_url:
+            s3_config["endpoint_url"] = endpoint_url
+
+        if access_key and secret_key:
+            s3_config["aws_access_key_id"] = access_key
+            s3_config["aws_secret_access_key"] = secret_key
+
+        self.s3 = session.client("s3", **s3_config)
+
+    def _get_s3_key(self, path: str) -> str:
+        """Convert path to S3 key"""
+        # Remove leading slash if present
+        path = path.lstrip("/")
+
+        # Add prefix if configured
+        if self.prefix:
+            return f"{self.prefix}/{path}"
+        return path
+
+    def read_file(self, path: str) -> bytes:
+        key = self._get_s3_key(path)
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=key)
+            return response["Body"].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}")
+            raise
+
+    def write_file(self, path: str, content: bytes) -> None:
+        key = self._get_s3_key(path)
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=content)
+
+    def read_json(self, path: str) -> Dict[str, Any]:
+        content = self.read_file(path)
+        return json.loads(content.decode('utf-8'))
+
+    def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        content = json.dumps(data, indent=2).encode('utf-8')
+        self.write_file(path, content)
+
+    def exists(self, path: str) -> bool:
+        key = self._get_s3_key(path)
+
+        # First try exact object match
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "404":
+                raise
+
+        # If exact match fails, check if it's a prefix (directory-like)
+        # by checking if any objects exist with this prefix
+        prefix = key if key.endswith("/") else key + "/"
+        try:
+            response = self.s3.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=prefix,
+                MaxKeys=1
+            )
+            return "Contents" in response and len(response["Contents"]) > 0
+        except ClientError:
+            return False
+
+    def list_files(self, prefix: str) -> List[str]:
+        s3_prefix = self._get_s3_key(prefix)
+
+        result = []
+        paginator = self.s3.get_paginator("list_objects_v2")
+
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=s3_prefix):
+            if "Contents" not in page:
+                continue
+
+            for obj in page["Contents"]:
+                key = obj["Key"]
+                # Remove prefix to get relative path
+                if self.prefix and key.startswith(self.prefix + "/"):
+                    rel_path = key[len(self.prefix) + 1:]
+                else:
+                    rel_path = key
+                result.append(rel_path)
+
+        return result
+
+    def delete_file(self, path: str) -> None:
+        key = self._get_s3_key(path)
+        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+    def makedirs(self, path: str, exist_ok: bool = True) -> None:
+        """No-op for S3 - directories don't need to be created"""
+        pass
+
+    def get_size(self, path: str) -> int:
+        key = self._get_s3_key(path)
+        try:
+            response = self.s3.head_object(Bucket=self.bucket, Key=key)
+            return response["ContentLength"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}")
+            raise
+
+
+def create_storage_backend(table_path: str) -> StorageBackend:
+    """
+    Create storage backend based on environment configuration.
+
+    Environment variables:
+        DATASHARD_STORAGE_TYPE: "local" (default) or "s3"
+
+        For S3:
+            DATASHARD_S3_ENDPOINT: S3 endpoint URL (optional, for MinIO/custom endpoints)
+            DATASHARD_S3_ACCESS_KEY: AWS access key
+            DATASHARD_S3_SECRET_KEY: AWS secret key
+            DATASHARD_S3_BUCKET: S3 bucket name
+            DATASHARD_S3_REGION: AWS region (default: us-east-1)
+            DATASHARD_S3_PREFIX: Optional prefix for all objects (default: "")
+
+    Args:
+        table_path: Table location (local path or S3-style identifier)
+
+    Returns:
+        StorageBackend instance
+    """
+    storage_type = os.getenv("DATASHARD_STORAGE_TYPE", "local").lower()
+
+    if storage_type == "s3":
+        # S3 configuration
+        bucket = os.getenv("DATASHARD_S3_BUCKET")
+        if not bucket:
+            raise ValueError(
+                "DATASHARD_S3_BUCKET environment variable is required for S3 storage"
+            )
+
+        endpoint_url = os.getenv("DATASHARD_S3_ENDPOINT")
+        access_key = os.getenv("DATASHARD_S3_ACCESS_KEY")
+        secret_key = os.getenv("DATASHARD_S3_SECRET_KEY")
+        region = os.getenv("DATASHARD_S3_REGION", "us-east-1")
+        prefix = os.getenv("DATASHARD_S3_PREFIX", "")
+
+        # Validate credentials
+        if not (access_key and secret_key):
+            raise ValueError(
+                "DATASHARD_S3_ACCESS_KEY and DATASHARD_S3_SECRET_KEY are required for S3 storage"
+            )
+
+        return S3StorageBackend(
+            bucket=bucket,
+            endpoint_url=endpoint_url,
+            access_key=access_key,
+            secret_key=secret_key,
+            region=region,
+            prefix=prefix,
+        )
+    else:
+        # Local filesystem (default)
+        return LocalStorageBackend(table_path)

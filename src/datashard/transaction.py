@@ -89,7 +89,8 @@ class Transaction:
         # Create a data file with the records
         timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
         file_name = f"auto_{timestamp}.parquet"
-        file_path = os.path.join(self.table_path, "data", file_name)
+        # Use relative path for storage backend (works for both local and S3)
+        file_path = f"data/{file_name}"
 
         # Use the data file manager to write the data
         data_file = self.file_manager.data_file_manager.write_data_file(
@@ -402,16 +403,23 @@ class Table:
     """Main table interface with transaction support"""
 
     def __init__(self, table_path: str, create_if_not_exists: bool = True):
+        from .storage_backend import create_storage_backend
+
         self.table_path = table_path
-        self.metadata_manager = MetadataManager(table_path)
+
+        # Create storage backend
+        self.storage = create_storage_backend(table_path)
+
+        # Create managers with storage backend
+        self.metadata_manager = MetadataManager(table_path, self.storage)
         self.snapshot_manager = SnapshotManager(self.metadata_manager)
-        self.file_manager = FileManager(table_path, self.metadata_manager)
+        self.file_manager = FileManager(table_path, self.metadata_manager, self.storage)
         self.transaction_manager = TransactionManager(
             self.metadata_manager, self.snapshot_manager, self.file_manager
         )
 
         # Initialize if needed
-        if create_if_not_exists and not os.path.exists(os.path.join(table_path, "metadata")):
+        if create_if_not_exists and not self.storage.exists("metadata"):
             self._initialize_table()
 
     def _initialize_table(self) -> None:

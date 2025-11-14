@@ -24,10 +24,13 @@ def create_table(
     Returns:
         Table instance
     """
-    # Ensure the table directory exists
-    os.makedirs(table_path, exist_ok=True)
+    from .storage_backend import create_storage_backend
 
-    # Create the table instance
+    # Create storage backend and ensure table directory exists
+    storage = create_storage_backend(table_path)
+    storage.makedirs(".", exist_ok=True)
+
+    # Create the table instance (will create storage internally)
     table = Table(table_path, create_if_not_exists=True)
 
     # Initialize the table with default metadata if it doesn't exist
@@ -53,7 +56,11 @@ def load_table(table_path: str) -> Table:
     Returns:
         Table instance
     """
-    if not os.path.exists(os.path.join(table_path, "metadata")):
+    from .storage_backend import create_storage_backend
+
+    # Check if table exists using storage backend
+    storage = create_storage_backend(table_path)
+    if not storage.exists("metadata"):
         raise ValueError(f"No Iceberg table found at {table_path}")
 
     return Table(table_path, create_if_not_exists=False)

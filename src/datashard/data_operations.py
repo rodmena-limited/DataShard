@@ -20,6 +20,7 @@ except ImportError:
     pd = None  # Define as None to avoid reference errors
 
 from .data_structures import DataFile, FileFormat, Schema
+from .storage_backend import StorageBackend, S3StorageBackend
 
 
 if TYPE_CHECKING:
@@ -29,10 +30,17 @@ if TYPE_CHECKING:
 class DataFileReader:
     """Reader for Iceberg data files"""
 
-    def __init__(self, file_path: str, file_format: FileFormat, schema: Optional[pa.Schema] = None):
+    def __init__(
+        self,
+        file_path: str,
+        file_format: FileFormat,
+        schema: Optional[pa.Schema] = None,
+        filesystem: Optional[Any] = None,
+    ):
         self.file_path = file_path
         self.file_format = file_format
         self._schema = schema  # Use private attribute to not conflict with schema method
+        self._filesystem = filesystem
         self._reader = None
 
     def __enter__(self) -> "DataFileReader":
@@ -45,7 +53,12 @@ class DataFileReader:
     def open(self) -> None:
         """Open the data file for reading"""
         if self.file_format == FileFormat.PARQUET:
-            self._reader = pq.ParquetFile(self.file_path)
+            if self._filesystem:
+                # Use PyArrow filesystem (S3)
+                self._reader = pq.ParquetFile(self.file_path, filesystem=self._filesystem)
+            else:
+                # Use local filesystem
+                self._reader = pq.ParquetFile(self.file_path)
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
 
@@ -143,11 +156,13 @@ class DataFileWriter:
         file_format: FileFormat,
         schema: pa.Schema,
         metadata: Optional[Dict[str, Any]] = None,
+        filesystem: Optional[Any] = None,
     ):
         self.file_path = file_path
         self.file_format = file_format
         self._schema = schema  # Use private attribute to not conflict with any method
         self.metadata = metadata or {}
+        self._filesystem = filesystem
         self._writer = None
         self._temp_file = None
         self._row_count = 0
@@ -162,12 +177,6 @@ class DataFileWriter:
     def open(self) -> None:
         """Open the file for writing"""
         if self.file_format == FileFormat.PARQUET:
-            # Create a temporary file first
-            temp_dir = os.path.dirname(self.file_path)
-            self._temp_file = tempfile.NamedTemporaryFile(
-                delete=False, dir=temp_dir, suffix=".parquet"
-            )
-
             # Add our metadata to the schema
             schema_metadata = self._schema.metadata if self._schema.metadata else {}
             for key, value in self.metadata.items():
@@ -175,9 +184,20 @@ class DataFileWriter:
 
             modified_schema = self._schema.with_metadata(schema_metadata)
 
-            self._writer = pq.ParquetWriter(
-                self._temp_file.name, modified_schema, compression="snappy"
-            )
+            if self._filesystem:
+                # For S3, write directly using PyArrow filesystem
+                self._writer = pq.ParquetWriter(
+                    self.file_path, modified_schema, compression="snappy", filesystem=self._filesystem
+                )
+            else:
+                # For local filesystem, use temp file pattern for safety
+                temp_dir = os.path.dirname(self.file_path)
+                self._temp_file = tempfile.NamedTemporaryFile(
+                    delete=False, dir=temp_dir, suffix=".parquet"
+                )
+                self._writer = pq.ParquetWriter(
+                    self._temp_file.name, modified_schema, compression="snappy"
+                )
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
 
@@ -223,7 +243,7 @@ class DataFileWriter:
         """Close the writer and finalize the file"""
         if self._writer:
             self._writer.close()
-            # Move temp file to final location
+            # Move temp file to final location (only for local filesystem)
             if self._temp_file:
                 os.rename(self._temp_file.name, self.file_path)
                 self._temp_file = None
@@ -238,9 +258,38 @@ class DataFileWriter:
 class DataFileManager:
     """Manages data file operations including reading/writing with proper schema management"""
 
-    def __init__(self, file_manager: "FileManager"):
+    def __init__(self, file_manager: "FileManager", storage: "StorageBackend"):
         self.file_manager = file_manager
+        self.storage = storage
         self._arrow_schema_cache: Dict[int, pa.Schema] = {}
+        self._pyarrow_fs = self._get_arrow_filesystem()
+
+    def _get_arrow_filesystem(self) -> Optional[Any]:
+        """Get PyArrow filesystem for S3 or None for local filesystem"""
+        if isinstance(self.storage, S3StorageBackend):
+            try:
+                import pyarrow.fs as pafs
+
+                return pafs.S3FileSystem(
+                    access_key=self.storage.access_key,
+                    secret_key=self.storage.secret_key,
+                    endpoint_override=self.storage.endpoint_url,
+                    region=self.storage.region,
+                )
+            except ImportError:
+                raise ImportError(
+                    "pyarrow with S3 support is required for S3 storage backend. "
+                    "Install with: pip install pyarrow"
+                )
+        return None  # Local filesystem
+
+    def _get_arrow_path(self, path: str) -> str:
+        """Convert path to PyArrow format (bucket/key for S3)"""
+        if isinstance(self.storage, S3StorageBackend):
+            # For PyArrow S3FileSystem, path should be bucket/key
+            key = self.storage._get_s3_key(path)
+            return f"{self.storage.bucket}/{key}"
+        return path  # Local filesystem
 
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
         """Convert Iceberg schema to PyArrow schema"""
@@ -315,7 +364,10 @@ class DataFileManager:
 
         arrow_schema = self.create_arrow_schema(iceberg_schema)
 
-        with DataFileWriter(file_path, file_format, arrow_schema, {}) as writer:
+        # Convert path for PyArrow (adds bucket prefix for S3)
+        arrow_path = self._get_arrow_path(file_path)
+
+        with DataFileWriter(arrow_path, file_format, arrow_schema, {}, self._pyarrow_fs) as writer:
             if records:
                 # Write in batches to handle large datasets efficiently
                 batch_size = 1000
@@ -324,12 +376,15 @@ class DataFileManager:
                     writer.write_records(batch_records)
 
         # Create and return the DataFile object with statistics
+        # For S3, use storage backend to get size
+        file_size = self.storage.get_size(file_path.lstrip("/")) if isinstance(self.storage, S3StorageBackend) else os.path.getsize(file_path)
+
         return DataFile(
             file_path=file_path,
             file_format=file_format,
             partition_values=partition_values or {},
             record_count=writer.row_count,
-            file_size_in_bytes=os.path.getsize(file_path),
+            file_size_in_bytes=file_size,
         )
 
     def write_pandas_file(
@@ -352,16 +407,22 @@ class DataFileManager:
 
         arrow_schema = self.create_arrow_schema(iceberg_schema)
 
-        with DataFileWriter(file_path, file_format, arrow_schema, {}) as writer:
+        # Convert path for PyArrow (adds bucket prefix for S3)
+        arrow_path = self._get_arrow_path(file_path)
+
+        with DataFileWriter(arrow_path, file_format, arrow_schema, {}, self._pyarrow_fs) as writer:
             writer.write_pandas(df)
 
         # Create and return the DataFile object with statistics
+        # For S3, use storage backend to get size
+        file_size = self.storage.get_size(file_path.lstrip("/")) if isinstance(self.storage, S3StorageBackend) else os.path.getsize(file_path)
+
         return DataFile(
             file_path=file_path,
             file_format=file_format,
             partition_values=partition_values or {},
             record_count=writer.row_count,
-            file_size_in_bytes=os.path.getsize(file_path),
+            file_size_in_bytes=file_size,
         )
 
     def read_data_file(
@@ -372,7 +433,10 @@ class DataFileManager:
     ) -> List[Dict[str, Any]]:
         """Read data from a file and return as list of records"""
 
-        with DataFileReader(file_path, file_format) as reader:
+        # Convert path for PyArrow (adds bucket prefix for S3)
+        arrow_path = self._get_arrow_path(file_path)
+
+        with DataFileReader(arrow_path, file_format, filesystem=self._pyarrow_fs) as reader:
             if columns:
                 table = reader.read_columns(columns)
             else:
@@ -393,7 +457,10 @@ class DataFileManager:
                 "pandas is not available. Install with: pip install datashard[pandas]"
             )
 
-        with DataFileReader(file_path, file_format) as reader:
+        # Convert path for PyArrow (adds bucket prefix for S3)
+        arrow_path = self._get_arrow_path(file_path)
+
+        with DataFileReader(arrow_path, file_format, filesystem=self._pyarrow_fs) as reader:
             if columns:
                 return reader.read_columns_pandas(columns)
             else:

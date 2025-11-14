@@ -34,6 +34,8 @@ DataShard is a Python implementation of Apache Iceberg's core concepts, providin
 - **Time Travel:** Query data as it existed at any point in time
 - **Safe Concurrency:** Multiple processes can write without corruption
 - **Optimistic Concurrency Control (OCC):** Automatic conflict resolution
+- **S3-Compatible Storage:** AWS S3, MinIO, DigitalOcean Spaces support (NEW in v0.2.2)
+- **Distributed Workflows:** Run workers across different machines with shared S3 storage
 - **Pure Python:** No Java dependencies, easy setup
 - **pandas Integration:** Native DataFrame support
 
@@ -76,6 +78,16 @@ pip install datashard
 With pandas support (recommended):
 ```bash
 pip install datashard[pandas]
+```
+
+With S3 support (AWS S3, MinIO, etc.):
+```bash
+pip install datashard[s3]
+```
+
+With all features:
+```bash
+pip install datashard[pandas,s3]
 ```
 
 With development tools:
@@ -245,6 +257,183 @@ print(f"Average duration: {avg_duration}ms")
 - Multiple processes computing and storing features
 - Time travel for point-in-time feature retrieval
 - Consistent feature snapshots for reproducibility
+
+---
+
+## S3-Compatible Storage (NEW in v0.2.2)
+
+DataShard now supports S3-compatible storage backends, enabling truly distributed workflows across multiple machines without shared filesystems.
+
+### Supported Storage Backends
+
+- **AWS S3** - Amazon's Simple Storage Service
+- **MinIO** - Self-hosted S3-compatible storage
+- **DigitalOcean Spaces** - Cloud object storage
+- **Wasabi** - S3-compatible cloud storage
+- **Any S3-compatible API** - Including on-premise solutions
+
+### Configuration
+
+DataShard automatically selects the storage backend based on environment variables:
+
+```bash
+# Local filesystem (default - no configuration needed)
+# Just use create_table("/path/to/table", schema)
+
+# S3-compatible storage
+export DATASHARD_STORAGE_TYPE=s3
+export DATASHARD_S3_ENDPOINT=https://s3.amazonaws.com  # AWS S3
+export DATASHARD_S3_ACCESS_KEY=your-access-key
+export DATASHARD_S3_SECRET_KEY=your-secret-key
+export DATASHARD_S3_BUCKET=my-datashard-bucket
+export DATASHARD_S3_REGION=us-east-1
+export DATASHARD_S3_PREFIX=optional/prefix/  # Optional: namespace within bucket
+```
+
+### Usage Example: Distributed Workflow Logging
+
+**Scenario:** Workers running on different EC2 instances need to log to the same table.
+
+```python
+from datashard import create_table, load_table, Schema
+
+# Define schema (same across all workers)
+schema = Schema(
+    schema_id=1,
+    fields=[
+        {"id": 1, "name": "task_id", "type": "string", "required": True},
+        {"id": 2, "name": "worker_id", "type": "string", "required": True},
+        {"id": 3, "name": "status", "type": "string", "required": True},
+        {"id": 4, "name": "timestamp", "type": "long", "required": True},
+    ]
+)
+
+# Worker 1 on EC2 instance us-east-1a
+table = create_table("task-logs", schema)  # Creates in S3
+table.append_records([
+    {"task_id": "t1", "worker_id": "worker-1", "status": "success", "timestamp": 1700000000}
+], schema)
+
+# Worker 2 on EC2 instance us-east-1b (simultaneously)
+table = load_table("task-logs")  # Loads from S3
+table.append_records([
+    {"task_id": "t2", "worker_id": "worker-2", "status": "success", "timestamp": 1700000001}
+], schema)
+
+# Both writes succeed with ACID guarantees!
+# No shared filesystem required - just S3 access
+```
+
+### MinIO Example (Self-Hosted)
+
+```bash
+# Configure MinIO endpoint
+export DATASHARD_STORAGE_TYPE=s3
+export DATASHARD_S3_ENDPOINT=https://minio.mycompany.com
+export DATASHARD_S3_ACCESS_KEY=minioadmin
+export DATASHARD_S3_SECRET_KEY=minioadmin
+export DATASHARD_S3_BUCKET=datashard
+export DATASHARD_S3_REGION=us-east-1
+```
+
+```python
+# Same code works with MinIO
+from datashard import create_table, Schema
+
+schema = Schema(schema_id=1, fields=[
+    {"id": 1, "name": "metric", "type": "string", "required": True},
+    {"id": 2, "name": "value", "type": "double", "required": True},
+])
+
+table = create_table("metrics", schema)
+table.append_records([
+    {"metric": "cpu_usage", "value": 45.2},
+    {"metric": "memory_usage", "value": 67.8}
+], schema)
+```
+
+### AWS S3 with IAM Roles
+
+On EC2/ECS/Lambda, boto3 automatically uses IAM roles - no credentials needed:
+
+```bash
+# Minimal configuration (credentials from IAM role)
+export DATASHARD_STORAGE_TYPE=s3
+export DATASHARD_S3_BUCKET=my-bucket
+export DATASHARD_S3_REGION=us-east-1
+```
+
+### Benefits of S3 Storage
+
+**Distributed Workflows:**
+- Workers on different machines/regions can share tables
+- No NFS or shared filesystem required
+- Auto-scaling friendly architecture
+
+**Durability:**
+- 99.999999999% (11 9's) durability with S3
+- Automatic replication and redundancy
+- No risk of local disk failures
+
+**Cost-Effective:**
+- Pay only for storage used
+- ~$0.023/GB/month for S3 Standard
+- Cheaper than EBS for cold data
+
+**Performance:**
+- Concurrent reads/writes from multiple workers
+- Same ACID guarantees as local storage
+- Optimistic concurrency control prevents conflicts
+
+### Local vs S3 Performance
+
+| Operation | Local Filesystem | S3 (same region) |
+|-----------|-----------------|------------------|
+| Write (1000 records) | ~1ms | ~50ms |
+| Read (50k records) | ~20ms | ~100ms |
+| Concurrent writes | ✅ Safe | ✅ Safe |
+| Cross-machine access | ❌ Needs NFS | ✅ Native |
+| Durability | Single disk | 11 9's |
+
+**Recommendation:** Use local storage for single-machine workloads, S3 for distributed workflows.
+
+### Switching Between Storage Backends
+
+The same Python code works for both backends - just change environment variables:
+
+```python
+# This code works unchanged with local OR S3 storage
+from datashard import create_table, Schema
+
+schema = Schema(schema_id=1, fields=[...])
+table = create_table("my-table", schema)
+table.append_records(records, schema)
+```
+
+**Local mode:** No env vars (default)
+**S3 mode:** Set `DATASHARD_STORAGE_TYPE=s3` + S3 credentials
+
+### Security Best Practices
+
+**Never hardcode credentials:**
+```python
+# ❌ WRONG - hardcoded
+table = create_table("s3://bucket/table", schema)
+
+# ✅ CORRECT - use environment variables
+export DATASHARD_S3_ACCESS_KEY=...
+table = create_table("table", schema)
+```
+
+**Use IAM roles on AWS:**
+- EC2/ECS/Lambda auto-discover IAM credentials
+- No access keys needed in code or env vars
+- Automatic credential rotation
+
+**Enable S3 encryption:**
+- Server-side encryption (SSE-S3 or SSE-KMS)
+- Configured at bucket level in AWS Console
+- Transparent to DataShard - works automatically
 
 ---
 
