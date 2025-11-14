@@ -4,9 +4,11 @@ Tests concurrent operations to ensure proper conflict detection and retry logic
 """
 import os
 import tempfile
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from datashard import create_table, DataFile, FileFormat
 from datashard.data_structures import Schema, PartitionField, PartitionSpec
 
@@ -65,7 +67,7 @@ def test_concurrent_operations():
         assert len(snapshots) == num_threads, f"Expected {num_threads} snapshots, got {len(snapshots)}"
         print("  ✓ All concurrent operations completed successfully with OCC")
         
-        return True
+        # Pytest expects None return for test functions
 
 
 def test_occ_conflict_resolution():
@@ -77,7 +79,7 @@ def test_occ_conflict_resolution():
         table = create_table(table_path)
         
         # Manually test the OCC mechanism by trying to update with stale metadata
-        from metadata_manager import ConcurrentModificationException
+        from datashard.metadata_manager import ConcurrentModificationException
         
         # Get initial metadata
         initial_metadata = table.metadata_manager.refresh()
@@ -116,7 +118,7 @@ def test_occ_conflict_resolution():
         except Exception as e:
             print(f"  ? OCC raised different exception: {e}")
         
-        return True
+        # Pytest expects None return for test functions
 
 
 def main():

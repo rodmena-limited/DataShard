@@ -4,7 +4,9 @@ Tests ACID transactions, time travel, and metadata management
 """
 import os
 import tempfile
+import sys
 from datetime import datetime
+
 from datashard import create_table, DataFile, FileFormat
 from datashard.data_structures import Schema, PartitionField, PartitionSpec
 

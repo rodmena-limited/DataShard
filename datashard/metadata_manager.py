@@ -3,11 +3,11 @@ Metadata management for the Python Iceberg implementation
 """
 import json
 import os
-import uuid
-from datetime import datetime
-from typing import Dict, List, Optional, Any
-from data_structures import TableMetadata, Snapshot, HistoryEntry, Schema
 import threading
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
 
 
 class ConcurrentModificationException(Exception):
@@ -17,16 +17,16 @@ class ConcurrentModificationException(Exception):
 
 class MetadataManager:
     """Manages table metadata persistence and updates"""
-    
+
     def __init__(self, table_path: str):
         self.table_path = table_path
         self.metadata_path = os.path.join(table_path, 'metadata')
         self.current_version = 0
         self._lock = threading.RLock()  # For thread safety
-        
+
         # Ensure metadata directory exists
         os.makedirs(self.metadata_path, exist_ok=True)
-        
+
     def initialize_table(self, metadata: TableMetadata) -> TableMetadata:
         """Initialize a new table with the given metadata"""
         with self._lock:
@@ -34,45 +34,45 @@ class MetadataManager:
             if metadata.current_snapshot_id is None:
                 metadata.current_snapshot_id = -1  # No snapshot initially
             metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
-            
+
             # Write the metadata file
             metadata_file = f"v{self.current_version}.metadata.json"
             metadata_path = os.path.join(self.metadata_path, metadata_file)
-            
+
             self._write_metadata_file(metadata_path, metadata)
-            
+
             # Create version hint file
             self._write_version_hint(self.current_version)
-            
+
             return metadata
-    
+
     def refresh(self) -> Optional[TableMetadata]:
         """Refresh metadata from the latest version"""
         with self._lock:
             version = self._read_version_hint()
             if version is None:
                 return None
-                
+
             metadata_file = f"v{version}.metadata.json"
             metadata_path = os.path.join(self.metadata_path, metadata_file)
-            
+
             if not os.path.exists(metadata_path):
                 return None
-                
+
             return self._read_metadata_file(metadata_path)
-    
+
     def commit(self, base_metadata: TableMetadata, new_metadata: TableMetadata) -> TableMetadata:
         """Commit new metadata with Optimistic Concurrency Control following Iceberg pattern"""
         # In true Iceberg style, we need to check that the underlying metadata hasn't changed
         # since we read it. This is done by comparing with current state during commit.
-        
+
         # Read the current metadata to compare with the base that the caller had
         current = self.refresh()
-        
+
         # Check UUID consistency
         if current and current.table_uuid != base_metadata.table_uuid:
             raise ValueError("Table UUID mismatch - concurrent modification detected")
-        
+
         # The key OCC check: verify that the metadata hasn't changed since the caller read it
         # This implements the Iceberg atomic commit pattern
         if current and current.current_snapshot_id != base_metadata.current_snapshot_id:
@@ -82,7 +82,7 @@ class MetadataManager:
                 f"Expected current_snapshot_id: {base_metadata.current_snapshot_id}, "
                 f"but found: {current.current_snapshot_id}"
             )
-        
+
         if current and current.last_updated_ms != base_metadata.last_updated_ms:
             # The metadata was updated while this operation was in progress
             raise ConcurrentModificationException(
@@ -90,83 +90,83 @@ class MetadataManager:
                 f"Expected last_updated_ms: {base_metadata.last_updated_ms}, "
                 f"but found: {current.last_updated_ms}"
             )
-        
+
         # After validation passes, perform the atomic update
         with self._lock:
             # Double-check the state right before committing (double-checked locking pattern)
             fresh_current = self.refresh()
-            if (fresh_current and 
+            if (fresh_current and
                 (fresh_current.current_snapshot_id != base_metadata.current_snapshot_id or
                  fresh_current.last_updated_ms != base_metadata.last_updated_ms)):
                 raise ConcurrentModificationException(
                     "Concurrent modification detected during commit - retry operation"
                 )
-            
+
             # Update sequence number and timestamp
             new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
             self.current_version += 1  # This creates the next version
-            
+
             # Write new metadata file
             metadata_file = f"v{self.current_version}.metadata.json"
             metadata_path = os.path.join(self.metadata_path, metadata_file)
-            
+
             self._write_metadata_file(metadata_path, new_metadata)
-            
+
             # Atomically update the version hint to point to the new version
             self._write_version_hint(self.current_version)
-            
+
             return new_metadata
-    
+
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """Get a specific snapshot by ID"""
         metadata = self.refresh()
         if not metadata:
             return None
-            
+
         for snapshot in metadata.snapshots:
             if snapshot.snapshot_id == snapshot_id:
                 return snapshot
         return None
-    
+
     def get_current_snapshot(self) -> Optional[Snapshot]:
         """Get the current snapshot"""
         metadata = self.refresh()
         if not metadata or metadata.current_snapshot_id is None:
             return None
-        
+
         for snapshot in metadata.snapshots:
             if snapshot.snapshot_id == metadata.current_snapshot_id:
                 return snapshot
         return None
-    
+
     def get_all_snapshots(self) -> List[Snapshot]:
         """Get all snapshots"""
         metadata = self.refresh()
         if not metadata:
             return []
         return metadata.snapshots
-    
+
     def get_snapshot_history(self) -> List[HistoryEntry]:
         """Get snapshot history"""
         metadata = self.refresh()
         if not metadata:
             return []
         return metadata.snapshot_log
-    
+
     def _write_metadata_file(self, path: str, metadata: TableMetadata):
         """Write metadata to a JSON file"""
         metadata_dict = self._metadata_to_dict(metadata)
-        
+
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(metadata_dict, f, indent=2)
-    
+
     def _read_metadata_file(self, path: str) -> TableMetadata:
         """Read metadata from a JSON file"""
         with open(path, 'r', encoding='utf-8') as f:
             metadata_dict = json.load(f)
-        
+
         return self._dict_to_metadata(metadata_dict)
-    
+
     def _metadata_to_dict(self, metadata: TableMetadata) -> Dict[str, Any]:
         """Convert TableMetadata to dictionary for JSON serialization"""
         return {
@@ -240,12 +240,18 @@ class MetadataManager:
             ],
             'metadata_log': metadata.metadata_log
         }
-    
+
     def _dict_to_metadata(self, metadata_dict: Dict[str, Any]) -> TableMetadata:
         """Convert dictionary back to TableMetadata"""
-        from data_structures import Schema, PartitionField, PartitionSpec, SortField, SortOrder
-        from data_structures import Snapshot as SnapshotStruct, HistoryEntry as HistoryEntryStruct
-        
+        from .data_structures import (
+            HistoryEntry as HistoryEntryStruct,
+            PartitionField,
+            PartitionSpec,
+            Snapshot as SnapshotStruct,
+            SortField,
+            SortOrder,
+        )
+
         # Reconstruct schemas
         schemas = [
             Schema(
@@ -255,7 +261,7 @@ class MetadataManager:
             )
             for schema_dict in metadata_dict['schemas']
         ]
-        
+
         # Reconstruct partition specs
         partition_specs = []
         for spec_dict in metadata_dict['partition_specs']:
@@ -272,7 +278,7 @@ class MetadataManager:
                 spec_id=spec_dict['spec_id'],
                 fields=fields
             ))
-        
+
         # Reconstruct sort orders
         sort_orders = []
         for order_dict in metadata_dict['sort_orders']:
@@ -289,7 +295,7 @@ class MetadataManager:
                 order_id=order_dict['order_id'],
                 fields=fields
             ))
-        
+
         # Reconstruct snapshots
         snapshots = [
             SnapshotStruct(
@@ -303,7 +309,7 @@ class MetadataManager:
             )
             for snapshot_dict in metadata_dict['snapshots']
         ]
-        
+
         # Reconstruct history
         snapshot_log = [
             HistoryEntryStruct(
@@ -312,7 +318,7 @@ class MetadataManager:
             )
             for entry_dict in metadata_dict['snapshot_log']
         ]
-        
+
         return TableMetadata(
             location=metadata_dict['location'],
             table_uuid=metadata_dict['table_uuid'],
@@ -332,19 +338,19 @@ class MetadataManager:
             snapshot_log=snapshot_log,
             metadata_log=metadata_dict['metadata_log']
         )
-    
+
     def _write_version_hint(self, version: int):
         """Write the current version number to a hint file"""
         hint_path = os.path.join(self.table_path, 'metadata.version-hint.text')
         with open(hint_path, 'w', encoding='utf-8') as f:
             f.write(str(version))
-    
+
     def _read_version_hint(self) -> Optional[int]:
         """Read the current version number from the hint file"""
         hint_path = os.path.join(self.table_path, 'metadata.version-hint.text')
         if not os.path.exists(hint_path):
             return None
-            
+
         with open(hint_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
             return int(content) if content.isdigit() else None

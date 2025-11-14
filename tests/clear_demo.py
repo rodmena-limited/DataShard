@@ -8,8 +8,8 @@ import time
 import tempfile
 import multiprocessing
 import json
-from datashard import create_table, load_table
-from datashard.data_structures import Schema
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 def normal_file_demo():
     """Demonstrate corruption with normal file operations"""
@@ -196,8 +196,8 @@ def get_current_counter(table_dir):
     """Get the current counter value by reading all increment records"""
     try:
         from datashard import load_table
-        from datashard.file_manager import FileManager
-        from datashard.metadata_manager import MetadataManager
+        from .file_manager import FileManager
+        from .metadata_manager import MetadataManager
         import glob
         
         # The proper way would be to read all data files in the table

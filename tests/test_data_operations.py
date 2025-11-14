@@ -3,6 +3,7 @@ Test script for data operations functionality
 """
 import os
 import tempfile
+import sys
 from datashard import create_table
 from datashard.data_structures import Schema
 from datashard.data_operations import DataFileManager, DataFileReader, DataFileWriter

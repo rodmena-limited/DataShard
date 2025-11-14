@@ -125,7 +125,7 @@ def iceberg_safety_test():
         
         # Create Iceberg table
         from iceberg import create_table, DataFile, FileFormat
-        from data_structures import Schema
+        from .data_structures import Schema
         
         # Create schema for our test data
         schema = Schema(

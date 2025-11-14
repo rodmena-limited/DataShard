@@ -3,10 +3,10 @@ Core data structures for the Python Iceberg implementation
 """
 import json
 import uuid
-from datetime import datetime
-from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
+from typing import Any, Dict, List, Optional
 
 
 class FileFormat(Enum):
@@ -28,7 +28,7 @@ class Schema:
     schema_id: int
     fields: List[Dict[str, Any]]
     schema_string: str = ""
-    
+
     def __post_init__(self):
         if not self.schema_string:
             self.schema_string = json.dumps(self.fields)
@@ -97,7 +97,7 @@ class DeleteFile:
     content: ManifestContent = ManifestContent.DELETES
 
 
-@dataclass 
+@dataclass
 class ManifestFile:
     """Manifest file that lists data or delete files"""
     manifest_path: str
@@ -123,7 +123,7 @@ class Snapshot:
     operation: Optional[str] = None  # "append", "replace", "delete", etc.
     summary: Optional[Dict[str, str]] = None
     schema_id: Optional[int] = None
-    
+
     def __post_init__(self):
         if self.summary is None:
             self.summary = {}
@@ -156,7 +156,7 @@ class TableMetadata:
     snapshots: List[Snapshot] = field(default_factory=list)
     snapshot_log: List[HistoryEntry] = field(default_factory=list)
     metadata_log: List[Dict[str, Any]] = field(default_factory=list)
-    
+
     def __post_init__(self):
         if not self.schemas:
             # Create a default empty schema

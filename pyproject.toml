@@ -116,7 +116,6 @@ ensure_newline_before_comments = true
 line_length = 99
 
 [tool.ruff]
-line-length = 99
 select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -128,14 +127,13 @@ select = [
 ignore = [
     "E501",  # Line too long (handled by black)
 ]
-extend-ignore = [
-]
-extend-safe-fixes = [
-]
-line-too-long-threshold = 99
+line-length = 99
 
 [tool.ruff.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[tool.ruff.isort]
+combine-as-imports = true
 
 [tool.mypy]
 python_version = "3.8"

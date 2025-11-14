@@ -2,11 +2,11 @@
 Main test suite for pytest
 """
 import pytest
-from .test_iceberg import main as test_iceberg_main
-from .test_occ import main as test_occ_main
-from .test_file_management import main as test_file_management_main
-from .test_data_operations import main as test_data_operations_main
-from .clear_demo import main as demo_main
+from tests.test_iceberg import main as test_iceberg_main
+from tests.test_occ import main as test_occ_main
+from tests.test_file_management import main as test_file_management_main
+from tests.test_data_operations import main as test_data_operations_main
+from tests.clear_demo import main as demo_main
 
 
 def test_iceberg_functionality():

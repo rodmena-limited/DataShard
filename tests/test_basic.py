@@ -4,12 +4,12 @@ Basic tests for the datashard package
 import pytest
 import tempfile
 import os
-from src.datashard.iceberg import create_table
+from datashard.iceberg import create_table
 
 
 def test_package_imports():
     """Test that the package can be imported"""
-    from src.datashard import create_table, DataFile, FileFormat
+    from datashard import create_table, DataFile, FileFormat
     assert create_table is not None
     assert DataFile is not None
     assert FileFormat is not None

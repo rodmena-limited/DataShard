@@ -3,7 +3,9 @@ Test script for file management functionality
 """
 import os
 import tempfile
+import sys
 from datetime import datetime
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from datashard import create_table, DataFile, FileFormat
 from datashard.data_structures import Schema, PartitionField, PartitionSpec
 from datashard.file_manager import FileManager

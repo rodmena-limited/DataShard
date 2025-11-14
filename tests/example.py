@@ -6,7 +6,7 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from iceberg import create_table, DataFile, FileFormat
-from data_structures import Schema, PartitionField, PartitionSpec
+from .data_structures import Schema, PartitionField, PartitionSpec
 import time
 
 

@@ -7,18 +7,34 @@ time travel, and safe concurrent access.
 __version__ = "0.1.2"
 __author__ = "RODMENA LIMITED"
 
-# Import the main classes to make them available at package level
-from .iceberg import create_table, load_table, DataFile
-from .data_structures import FileFormat
-from .transaction import Table
 
+# Import the main classes to make them available at package level
+from .data_structures import (
+    DeleteFile,
+    ManifestFile,
+    PartitionSpec,
+    Schema,
+    Snapshot,
+    SortOrder,
+    TableMetadata,
+)
+from .iceberg import DataFile, FileFormat, create_table, load_table
+from .transaction import Table, Transaction
 
 __all__ = [
     'create_table',
     'load_table',
-    'DataFile', 
+    'DataFile',
     'FileFormat',
+    'Schema',
+    'PartitionSpec',
+    'SortOrder',
+    'DeleteFile',
+    'ManifestFile',
+    'Snapshot',
+    'TableMetadata',
     'Table',
+    'Transaction',
     '__version__',
     '__author__'
 ]
