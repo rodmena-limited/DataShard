@@ -5,6 +5,32 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2025-11-17
+
+### Fixed
+
+#### Critical Local Filesystem Data Write Bugs 🔧
+- **Fixed missing directory creation in DataFileWriter** (`data_operations.py:196`)
+  - Previously, temporary parquet file creation would fail with `FileNotFoundError` if the target directory didn't exist
+  - Now ensures parent directory exists with `os.makedirs(temp_dir, exist_ok=True)` before creating temporary files
+  - This fix prevents file write failures when writing data to newly created tables
+
+- **Fixed relative path handling for local filesystem** (`data_operations.py:294-298`)
+  - Previously, file paths were not converted to absolute paths, causing files to be written relative to current working directory
+  - Now correctly converts relative paths to absolute paths by joining with `storage.base_path`
+  - Also fixed file size check to use the absolute `arrow_path` instead of relative `file_path`
+  - This ensures parquet files are written to the correct table directory
+
+- **Impact**: Without these fixes, `table.append_records()` would fail for local filesystem tables
+  - ❌ Before: `table.append_records(data, schema)` raised `FileNotFoundError`
+  - ✅ After: Data is correctly written to `{table_path}/data/*.parquet`
+
+### Changed
+
+- **Path handling** in `data_operations.py`
+  - `_get_arrow_path()` now handles relative paths for local filesystem by joining with base path
+  - File size retrieval now uses correct absolute path for local files
+
 ## [0.2.3] - 2025-11-14
 
 ### Fixed
@@ -143,6 +169,7 @@ DATASHARD_S3_PREFIX=<prefix>       # Optional prefix
 
 ---
 
+[0.2.4]: https://github.com/rodmena-limited/datashard/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/rodmena-limited/datashard/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/rodmena-limited/datashard/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/rodmena-limited/datashard/compare/v0.2.0...v0.2.1

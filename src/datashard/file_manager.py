@@ -136,7 +136,9 @@ class FileManager:
             existing_data_files_count=self._safe_int(manifest_data["existing_data_files_count"]),
             deleted_data_files_count=self._safe_int(manifest_data["deleted_data_files_count"]),
             partitions=(
-                manifest_data["partitions"] if isinstance(manifest_data["partitions"], list) else []
+                manifest_data["partitions"]
+                if isinstance(manifest_data["partitions"], list)
+                else []
             ),
             content=ManifestContent(manifest_data["content"]),
             sequence_number=self._safe_int(manifest_data.get("sequence_number"), None),

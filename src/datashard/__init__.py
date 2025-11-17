@@ -7,7 +7,7 @@ time travel, and safe concurrent access.
 Supports both local filesystem and S3-compatible storage (AWS S3, MinIO, etc.)
 """
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 __author__ = "RODMENA LIMITED"
 
 

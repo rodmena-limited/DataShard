@@ -88,7 +88,10 @@ def test_manifest_creation():
         # Create manifest file
         manifest = table.file_manager.create_manifest_file(data_files, snapshot_id=12345)
         print(f"✓ Manifest created: {manifest.manifest_path}")
-        assert os.path.exists(manifest.manifest_path)
+        manifest_abs_path = os.path.join(table_path, manifest.manifest_path)
+        assert os.path.exists(
+            manifest_abs_path
+        ), f"Manifest file should exist at {manifest_abs_path}"
 
         # Read manifest back
         read_files = table.file_manager.read_manifest_file(manifest.manifest_path)

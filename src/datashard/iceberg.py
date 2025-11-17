@@ -11,7 +11,9 @@ from .transaction import Table, Transaction
 
 
 def create_table(
-    table_path: str, schema: Optional[Schema] = None, partition_spec: Optional[PartitionSpec] = None
+    table_path: str,
+    schema: Optional[Schema] = None,
+    partition_spec: Optional[PartitionSpec] = None,
 ) -> "Table":
     """
     Create a new Iceberg table

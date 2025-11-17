@@ -187,11 +187,16 @@ class DataFileWriter:
             if self._filesystem:
                 # For S3, write directly using PyArrow filesystem
                 self._writer = pq.ParquetWriter(
-                    self.file_path, modified_schema, compression="snappy", filesystem=self._filesystem
+                    self.file_path,
+                    modified_schema,
+                    compression="snappy",
+                    filesystem=self._filesystem,
                 )
             else:
                 # For local filesystem, use temp file pattern for safety
                 temp_dir = os.path.dirname(self.file_path)
+                # Ensure the directory exists before creating temp file
+                os.makedirs(temp_dir, exist_ok=True)
                 self._temp_file = tempfile.NamedTemporaryFile(
                     delete=False, dir=temp_dir, suffix=".parquet"
                 )
@@ -289,7 +294,11 @@ class DataFileManager:
             # For PyArrow S3FileSystem, path should be bucket/key
             key = self.storage._get_s3_key(path)
             return f"{self.storage.bucket}/{key}"
-        return path  # Local filesystem
+        # For local filesystem, convert relative path to absolute path
+        # by joining with the storage base path
+        if not os.path.isabs(path):
+            path = os.path.join(self.storage.base_path, path)
+        return path
 
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
         """Convert Iceberg schema to PyArrow schema"""
@@ -377,7 +386,11 @@ class DataFileManager:
 
         # Create and return the DataFile object with statistics
         # For S3, use storage backend to get size
-        file_size = self.storage.get_size(file_path.lstrip("/")) if isinstance(self.storage, S3StorageBackend) else os.path.getsize(file_path)
+        if isinstance(self.storage, S3StorageBackend):
+            file_size = self.storage.get_size(file_path.lstrip("/"))
+        else:
+            # For local filesystem, use the absolute arrow_path
+            file_size = os.path.getsize(arrow_path)
 
         return DataFile(
             file_path=file_path,
@@ -415,7 +428,11 @@ class DataFileManager:
 
         # Create and return the DataFile object with statistics
         # For S3, use storage backend to get size
-        file_size = self.storage.get_size(file_path.lstrip("/")) if isinstance(self.storage, S3StorageBackend) else os.path.getsize(file_path)
+        file_size = (
+            self.storage.get_size(file_path.lstrip("/"))
+            if isinstance(self.storage, S3StorageBackend)
+            else os.path.getsize(file_path)
+        )
 
         return DataFile(
             file_path=file_path,

@@ -3,6 +3,30 @@ Changelog
 
 All notable changes to the datashard project will be documented in this file.
 
+Version 0.2.4 (2025-11-17)
+----------------------------
+
+Critical Bug Fixes:
+
+- **Fixed missing directory creation in DataFileWriter**: Temporary parquet file creation would fail with FileNotFoundError if the target directory didn't exist. Now ensures parent directory exists before creating temporary files.
+- **Fixed relative path handling for local filesystem**: File paths were not converted to absolute paths, causing files to be written relative to current working directory. Now correctly converts relative paths to absolute paths by joining with storage.base_path.
+- **Impact**: Without these fixes, table.append_records() would fail for local filesystem tables.
+
+Version 0.2.3 (2025-11-14)
+----------------------------
+
+- Fixed create_storage_backend() ignoring table_path for S3 storage
+- Now correctly combines DATASHARD_S3_PREFIX environment variable with table_path
+- Critical for multi-table applications using S3 storage
+
+Version 0.2.2 (2025-01-14)
+----------------------------
+
+- Complete S3-compatible storage support (AWS S3, MinIO, DigitalOcean Spaces, Wasabi)
+- Storage backend abstraction with LocalStorageBackend and S3StorageBackend
+- PyArrow S3FileSystem integration for efficient columnar data I/O
+- Comprehensive S3 documentation and integration tests
+
 Version 0.2.1 (2025-01-15)
 ----------------------------
 

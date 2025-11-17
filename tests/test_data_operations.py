@@ -38,8 +38,12 @@ def test_data_reader_writer():
         parquet_file = os.path.join(temp_dir, "test.parquet")
 
         # Test writing data
-        file_manager = FileManager(temp_dir, MetadataManager(temp_dir))
-        data_manager = DataFileManager(file_manager)
+        from datashard.storage_backend import create_storage_backend
+
+        storage = create_storage_backend(temp_dir)
+        metadata_manager = MetadataManager(temp_dir, storage)
+        file_manager = FileManager(temp_dir, metadata_manager, storage)
+        data_manager = DataFileManager(file_manager, storage)
 
         data_file = data_manager.write_data_file(
             file_path=parquet_file, records=sample_records, iceberg_schema=iceberg_schema
@@ -132,8 +136,12 @@ def test_schema_compatibility():
     print("\nTesting schema compatibility...")
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        file_manager = FileManager(temp_dir, MetadataManager(temp_dir))
-        data_manager = DataFileManager(file_manager)
+        from datashard.storage_backend import create_storage_backend
+
+        storage = create_storage_backend(temp_dir)
+        metadata_manager = MetadataManager(temp_dir, storage)
+        file_manager = FileManager(temp_dir, metadata_manager, storage)
+        data_manager = DataFileManager(file_manager, storage)
 
         # Valid records
         valid_records = [{"id": 1, "name": "Alice", "score": 95.5}]

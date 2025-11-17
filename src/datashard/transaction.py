@@ -253,7 +253,9 @@ class Transaction:
 
         return True
 
-    def _apply_operation(self, metadata: TableMetadata, operation: Dict[str, Any]) -> TableMetadata:
+    def _apply_operation(
+        self, metadata: TableMetadata, operation: Dict[str, Any]
+    ) -> TableMetadata:
         """Apply a single operation to the metadata"""
         op_type = operation["type"]
 
@@ -312,7 +314,10 @@ class Transaction:
         return manifest_list_path
 
     def _create_manifest_list_with_id(
-        self, metadata: TableMetadata, snapshot_id: int, data_files: Optional[List[DataFile]] = None
+        self,
+        metadata: TableMetadata,
+        snapshot_id: int,
+        data_files: Optional[List[DataFile]] = None,
     ) -> str:
         """Create a manifest list file for a specific snapshot ID"""
         if data_files is None:

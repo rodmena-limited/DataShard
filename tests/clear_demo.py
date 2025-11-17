@@ -137,7 +137,9 @@ def iceberg_demo():
         # Start 12 processes for incrementing
         processes = []
         for i in range(12):
-            p = multiprocessing.Process(target=iceberg_increment_worker, args=(table_dir, 10000, i))
+            p = multiprocessing.Process(
+                target=iceberg_increment_worker, args=(table_dir, 10000, i)
+            )
             processes.append(p)
             p.start()
 

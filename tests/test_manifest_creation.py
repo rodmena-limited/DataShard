@@ -99,15 +99,17 @@ def test_manifest_reading_returns_data_files():
         snapshot = table.current_snapshot()
         assert snapshot is not None
 
-        file_manager = FileManager(table_path, table.metadata_manager)
-        manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
+        file_manager = FileManager(table_path, table.metadata_manager, table.storage)
+        # snapshot.manifest_list is already a relative path, use it directly
+        manifest_list_path = snapshot.manifest_list
 
         manifests = file_manager.read_manifest_list_file(manifest_list_path)
         assert len(manifests) > 0, "Should have at least one manifest"
 
         # Read data files from manifest
         first_manifest = manifests[0]
-        manifest_path = os.path.join(table_path, first_manifest.manifest_path)
+        # first_manifest.manifest_path is also relative, use it directly
+        manifest_path = first_manifest.manifest_path
         data_files = file_manager.read_manifest_file(manifest_path)
 
         assert len(data_files) > 0, "Manifest should contain data files"
@@ -255,7 +257,7 @@ def test_pandas_query_returns_data():
         snapshot = table.current_snapshot()
         assert snapshot is not None
 
-        file_manager = FileManager(table_path, table.metadata_manager)
+        file_manager = FileManager(table_path, table.metadata_manager, table.storage)
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
 
         manifests = file_manager.read_manifest_list_file(manifest_list_path)

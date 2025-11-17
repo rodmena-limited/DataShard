@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Union
 try:
     import boto3
     from botocore.exceptions import ClientError
+
     BOTO3_AVAILABLE = True
 except ImportError:
     BOTO3_AVAILABLE = False
@@ -112,10 +113,10 @@ class LocalStorageBackend(StorageBackend):
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
-        return json.loads(content.decode('utf-8'))
+        return json.loads(content.decode("utf-8"))
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
-        content = json.dumps(data, indent=2).encode('utf-8')
+        content = json.dumps(data, indent=2).encode("utf-8")
         self.write_file(path, content)
 
     def exists(self, path: str) -> bool:
@@ -217,10 +218,10 @@ class S3StorageBackend(StorageBackend):
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
-        return json.loads(content.decode('utf-8'))
+        return json.loads(content.decode("utf-8"))
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
-        content = json.dumps(data, indent=2).encode('utf-8')
+        content = json.dumps(data, indent=2).encode("utf-8")
         self.write_file(path, content)
 
     def exists(self, path: str) -> bool:
@@ -238,11 +239,7 @@ class S3StorageBackend(StorageBackend):
         # by checking if any objects exist with this prefix
         prefix = key if key.endswith("/") else key + "/"
         try:
-            response = self.s3.list_objects_v2(
-                Bucket=self.bucket,
-                Prefix=prefix,
-                MaxKeys=1
-            )
+            response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=1)
             return "Contents" in response and len(response["Contents"]) > 0
         except ClientError:
             return False
@@ -261,7 +258,7 @@ class S3StorageBackend(StorageBackend):
                 key = obj["Key"]
                 # Remove prefix to get relative path
                 if self.prefix and key.startswith(self.prefix + "/"):
-                    rel_path = key[len(self.prefix) + 1:]
+                    rel_path = key[len(self.prefix) + 1 :]
                 else:
                     rel_path = key
                 result.append(rel_path)
@@ -314,9 +311,7 @@ def create_storage_backend(table_path: str) -> StorageBackend:
         # S3 configuration
         bucket = os.getenv("DATASHARD_S3_BUCKET")
         if not bucket:
-            raise ValueError(
-                "DATASHARD_S3_BUCKET environment variable is required for S3 storage"
-            )
+            raise ValueError("DATASHARD_S3_BUCKET environment variable is required for S3 storage")
 
         endpoint_url = os.getenv("DATASHARD_S3_ENDPOINT")
         access_key = os.getenv("DATASHARD_S3_ACCESS_KEY")

@@ -37,7 +37,7 @@ def test_s3_storage_create_table():
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "name", "type": "string", "required": False},
                 {"id": 3, "name": "value", "type": "double", "required": False},
-            ]
+            ],
         )
 
         # Create table on S3
@@ -52,9 +52,14 @@ def test_s3_storage_create_table():
 
     finally:
         # Cleanup env vars
-        for key in ["DATASHARD_STORAGE_TYPE", "DATASHARD_S3_ENDPOINT",
-                    "DATASHARD_S3_ACCESS_KEY", "DATASHARD_S3_SECRET_KEY",
-                    "DATASHARD_S3_BUCKET", "DATASHARD_S3_REGION"]:
+        for key in [
+            "DATASHARD_STORAGE_TYPE",
+            "DATASHARD_S3_ENDPOINT",
+            "DATASHARD_S3_ACCESS_KEY",
+            "DATASHARD_S3_SECRET_KEY",
+            "DATASHARD_S3_BUCKET",
+            "DATASHARD_S3_REGION",
+        ]:
             if key in os.environ:
                 del os.environ[key]
 
@@ -80,7 +85,7 @@ def test_s3_storage_write_and_read():
                 {"id": 1, "name": "id", "type": "long", "required": True},
                 {"id": 2, "name": "message", "type": "string", "required": False},
                 {"id": 3, "name": "count", "type": "long", "required": False},
-            ]
+            ],
         )
 
         # Create table
@@ -119,9 +124,14 @@ def test_s3_storage_write_and_read():
 
     finally:
         # Cleanup env vars
-        for key in ["DATASHARD_STORAGE_TYPE", "DATASHARD_S3_ENDPOINT",
-                    "DATASHARD_S3_ACCESS_KEY", "DATASHARD_S3_SECRET_KEY",
-                    "DATASHARD_S3_BUCKET", "DATASHARD_S3_REGION"]:
+        for key in [
+            "DATASHARD_STORAGE_TYPE",
+            "DATASHARD_S3_ENDPOINT",
+            "DATASHARD_S3_ACCESS_KEY",
+            "DATASHARD_S3_SECRET_KEY",
+            "DATASHARD_S3_BUCKET",
+            "DATASHARD_S3_REGION",
+        ]:
             if key in os.environ:
                 del os.environ[key]
 
@@ -147,7 +157,7 @@ def test_s3_multiple_transactions():
                 {"id": 1, "name": "batch_id", "type": "long", "required": True},
                 {"id": 2, "name": "item_id", "type": "long", "required": True},
                 {"id": 3, "name": "data", "type": "string", "required": False},
-            ]
+            ],
         )
 
         # Create table
@@ -178,9 +188,14 @@ def test_s3_multiple_transactions():
 
     finally:
         # Cleanup env vars
-        for key in ["DATASHARD_STORAGE_TYPE", "DATASHARD_S3_ENDPOINT",
-                    "DATASHARD_S3_ACCESS_KEY", "DATASHARD_S3_SECRET_KEY",
-                    "DATASHARD_S3_BUCKET", "DATASHARD_S3_REGION"]:
+        for key in [
+            "DATASHARD_STORAGE_TYPE",
+            "DATASHARD_S3_ENDPOINT",
+            "DATASHARD_S3_ACCESS_KEY",
+            "DATASHARD_S3_SECRET_KEY",
+            "DATASHARD_S3_BUCKET",
+            "DATASHARD_S3_REGION",
+        ]:
             if key in os.environ:
                 del os.environ[key]
 
