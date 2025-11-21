@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
 # Try to import pandas as optional dependency
 try:
     import pandas as pd
@@ -20,8 +19,7 @@ except ImportError:
     pd = None  # Define as None to avoid reference errors
 
 from .data_structures import DataFile, FileFormat, Schema
-from .storage_backend import StorageBackend, S3StorageBackend
-
+from .storage_backend import S3StorageBackend, StorageBackend
 
 if TYPE_CHECKING:
     from .file_manager import FileManager
@@ -41,7 +39,7 @@ class DataFileReader:
         self.file_format = file_format
         self._schema = schema  # Use private attribute to not conflict with schema method
         self._filesystem = filesystem
-        self._reader = None
+        self._reader: Optional[Any] = None
 
     def __enter__(self) -> "DataFileReader":
         self.open()
@@ -73,6 +71,7 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
+        assert self._reader is not None
         return self._reader.read()
 
     def read_batches(self, batch_size: int = 1000) -> Iterator[pa.RecordBatch]:
@@ -80,6 +79,7 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
+        assert self._reader is not None
         for batch in self._reader.iter_batches(batch_size=batch_size):
             yield batch
 
@@ -88,6 +88,7 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
+        assert self._reader is not None
         return self._reader.read(columns=column_names)
 
     def read_pandas(self) -> Optional["pd.DataFrame"]:
@@ -100,10 +101,9 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
-        if self._reader:
-            table = self._reader.read()
-            return table.to_pandas()
-        return None
+        assert self._reader is not None
+        table = self._reader.read()
+        return table.to_pandas()
 
     def read_batches_pandas(self, batch_size: int = 1000) -> Iterator["pd.DataFrame"]:
         """Read data in pandas DataFrame batches (requires pandas)"""
@@ -115,9 +115,9 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
-        if self._reader:
-            for batch in self._reader.iter_batches(batch_size=batch_size):
-                yield batch.to_pandas()
+        assert self._reader is not None
+        for batch in self._reader.iter_batches(batch_size=batch_size):
+            yield batch.to_pandas()
 
     def read_columns_pandas(self, column_names: List[str]) -> Optional["pd.DataFrame"]:
         """Read specific columns from the file as pandas DataFrame (requires pandas)"""
@@ -129,11 +129,9 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
-        if self._reader:
-            table = self._reader.read(columns=column_names)
-            return table.to_pandas()
-        else:
-            return pd.DataFrame() if pd else None
+        assert self._reader is not None
+        table = self._reader.read(columns=column_names)
+        return table.to_pandas()
 
     def schema(self) -> Optional[pa.Schema]:
         """Get the schema of the file"""
@@ -141,10 +139,8 @@ class DataFileReader:
         if not self._reader:
             self.open()
 
-        if self._reader:
-            return self._reader.schema
-        else:
-            return self._schema  # Return stored schema if reader not available
+        assert self._reader is not None
+        return self._reader.schema
 
 
 class DataFileWriter:
@@ -163,8 +159,8 @@ class DataFileWriter:
         self._schema = schema  # Use private attribute to not conflict with any method
         self.metadata = metadata or {}
         self._filesystem = filesystem
-        self._writer = None
-        self._temp_file = None
+        self._writer: Optional[Any] = None
+        self._temp_file: Optional[Any] = None
         self._row_count = 0
 
     def __enter__(self) -> "DataFileWriter":
@@ -211,6 +207,7 @@ class DataFileWriter:
         if not self._writer:
             self.open()
 
+        assert self._writer is not None
         # Convert to RecordBatch if it's a Table
         if isinstance(batch, pa.Table):
             for record_batch in batch.to_batches():
@@ -225,6 +222,7 @@ class DataFileWriter:
         if not self._writer:
             self.open()
 
+        assert self._writer is not None
         if records:
             # Convert records to Arrow Table
             table = pa.Table.from_pylist(records, schema=self._schema)
@@ -240,6 +238,7 @@ class DataFileWriter:
         if not self._writer:
             self.open()
 
+        assert self._writer is not None
         # Convert pandas DataFrame to Arrow Table
         table = pa.Table.from_pandas(df, schema=self._schema)
         self.write_batch(table)
@@ -247,6 +246,7 @@ class DataFileWriter:
     def close(self) -> None:
         """Close the writer and finalize the file"""
         if self._writer:
+            assert self._writer is not None
             self._writer.close()
             # Move temp file to final location (only for local filesystem)
             if self._temp_file:
@@ -281,11 +281,11 @@ class DataFileManager:
                     endpoint_override=self.storage.endpoint_url,
                     region=self.storage.region,
                 )
-            except ImportError:
+            except ImportError as e:
                 raise ImportError(
                     "pyarrow with S3 support is required for S3 storage backend. "
                     "Install with: pip install pyarrow"
-                )
+                ) from e
         return None  # Local filesystem
 
     def _get_arrow_path(self, path: str) -> str:
@@ -296,7 +296,7 @@ class DataFileManager:
             return f"{self.storage.bucket}/{key}"
         # For local filesystem, convert relative path to absolute path
         # by joining with the storage base path
-        if not os.path.isabs(path):
+        if not os.path.isabs(path) and hasattr(self.storage, "base_path"):
             path = os.path.join(self.storage.base_path, path)
         return path
 

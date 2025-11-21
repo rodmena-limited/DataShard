@@ -2,11 +2,9 @@
 Metadata management for the Python Iceberg implementation
 """
 
-import json
-import os
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
 
@@ -111,7 +109,14 @@ class MetadataManager:
 
             # Update sequence number and timestamp
             new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
-            self.current_version += 1  # This creates the next version
+
+            # CRITICAL: Read current version from filesystem for multi-process safety
+            # Each process instance starts with current_version=0, so we MUST
+            # re-read from the version hint to get the actual latest version
+            filesystem_version = self._read_version_hint()
+            if filesystem_version is None:
+                filesystem_version = 0
+            self.current_version = filesystem_version + 1  # Increment from filesystem state
 
             # Write new metadata file
             metadata_file = f"v{self.current_version}.metadata.json"
@@ -243,13 +248,11 @@ class MetadataManager:
 
     def _dict_to_metadata(self, metadata_dict: Dict[str, Any]) -> TableMetadata:
         """Convert dictionary back to TableMetadata"""
-        from .data_structures import HistoryEntry as HistoryEntryStruct
         from .data_structures import (
+            HistoryEntry as HistoryEntryStruct,
             PartitionField,
             PartitionSpec,
-        )
-        from .data_structures import Snapshot as SnapshotStruct
-        from .data_structures import (
+            Snapshot as SnapshotStruct,
             SortField,
             SortOrder,
         )

@@ -4,19 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.2.6"
+version = "0.2.7"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts with S3 support"
 readme = "README.md"
 requires-python = ">=3.7"
-license = {text = "Apache Software License 2.0"}
+license = "Apache-2.0"
 authors = [
     {name = "RODMENA LIMITED", email = "contact@rodmena.com"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research", 
-    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.7",
@@ -142,8 +141,8 @@ ignore = [
 combine-as-imports = true
 
 [tool.mypy]
-python_version = "3.8"
-warn_return_any = true
+python_version = "3.9"
+warn_return_any = false
 warn_unused_configs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
@@ -157,3 +156,7 @@ implicit_reexport = false
 show_error_codes = true
 show_error_context = true
 pretty = true
+
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore.*", "pyarrow.*", "pandas"]
+ignore_missing_imports = true

@@ -4,7 +4,6 @@ File system operations and manifest management for the Python Iceberg implementa
 Supports both local filesystem and S3-compatible storage via StorageBackend abstraction
 """
 
-import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -59,7 +58,7 @@ class FileManager:
                 raise FileNotFoundError(f"Data file does not exist: {data_file.file_path}")
         return True
 
-    def _safe_int(self, value, default=0) -> int:
+    def _safe_int(self, value: Any, default: int = 0) -> int:
         """Safely convert a value to int, returning default if conversion fails"""
         if value is None:
             return default
@@ -72,7 +71,7 @@ class FileManager:
                 return default
         if isinstance(value, (float, bool)):
             return int(value)
-        return default  # type: ignore[return-value]
+        return default
 
     def create_manifest_file(
         self,
@@ -131,7 +130,7 @@ class FileManager:
             manifest_path=manifest_path,
             manifest_length=self._safe_int(manifest_data["manifest_length"]),
             partition_spec_id=self._safe_int(manifest_data["partition_spec_id"]),
-            added_snapshot_id=self._safe_int(manifest_data["added_snapshot_id"], None),
+            added_snapshot_id=self._safe_int(manifest_data["added_snapshot_id"], 0),
             added_data_files_count=self._safe_int(manifest_data["added_data_files_count"]),
             existing_data_files_count=self._safe_int(manifest_data["existing_data_files_count"]),
             deleted_data_files_count=self._safe_int(manifest_data["deleted_data_files_count"]),
@@ -141,8 +140,8 @@ class FileManager:
                 else []
             ),
             content=ManifestContent(manifest_data["content"]),
-            sequence_number=self._safe_int(manifest_data.get("sequence_number"), None),
-            min_sequence_number=self._safe_int(manifest_data.get("min_sequence_number"), None),
+            sequence_number=self._safe_int(manifest_data.get("sequence_number"), 0) or None,
+            min_sequence_number=self._safe_int(manifest_data.get("min_sequence_number"), 0) or None,
         )
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:

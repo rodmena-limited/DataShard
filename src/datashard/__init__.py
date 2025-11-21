@@ -7,7 +7,7 @@ time travel, and safe concurrent access.
 Supports both local filesystem and S3-compatible storage (AWS S3, MinIO, etc.)
 """
 
-__version__ = "0.2.4"
+__version__ = "0.2.7"
 __author__ = "RODMENA LIMITED"
 
 
@@ -23,7 +23,6 @@ from .data_structures import (
 )
 from .iceberg import DataFile, FileFormat, create_table, load_table
 from .transaction import Table, Transaction
-
 
 __all__ = [
     "create_table",

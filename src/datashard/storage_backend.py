@@ -17,12 +17,10 @@ S3-compatible storage:
     DATASHARD_S3_PREFIX=optional/prefix/ (optional, default: "")
 """
 
-import io
 import json
 import os
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 try:
     import boto3
@@ -129,7 +127,7 @@ class LocalStorageBackend(StorageBackend):
             return []
 
         result = []
-        for root, dirs, files in os.walk(full_prefix):
+        for root, _dirs, files in os.walk(full_prefix):
             for file in files:
                 full_path = os.path.join(root, file)
                 # Return path relative to base_path
@@ -209,7 +207,7 @@ class S3StorageBackend(StorageBackend):
             return response["Body"].read()
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
-                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}")
+                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
             raise
 
     def write_file(self, path: str, content: bytes) -> None:
@@ -280,7 +278,7 @@ class S3StorageBackend(StorageBackend):
             return response["ContentLength"]
         except ClientError as e:
             if e.response["Error"]["Code"] == "404":
-                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}")
+                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
             raise
 
 

@@ -3,7 +3,6 @@ Main module for the Python Iceberg implementation
 Provides the primary API for working with Iceberg tables
 """
 
-import os
 from typing import Optional
 
 from .data_structures import DataFile, FileFormat, PartitionSpec, Schema

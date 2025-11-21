@@ -151,7 +151,7 @@ class Transaction:
 
         return self
 
-    def commit(self) -> bool:
+    def commit(self) -> bool:  # noqa: C901
         """Commit the transaction with ACID properties using Optimistic Concurrency Control"""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
