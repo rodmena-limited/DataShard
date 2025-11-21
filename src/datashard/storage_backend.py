@@ -19,6 +19,7 @@ S3-compatible storage:
 
 import json
 import os
+import tempfile
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -104,18 +105,74 @@ class LocalStorageBackend(StorageBackend):
             return f.read()
 
     def write_file(self, path: str, content: bytes) -> None:
+        """Atomically write file with fsync for durability.
+
+        Uses temp file + fsync + atomic rename pattern to ensure:
+        1. No partial writes visible to readers
+        2. Crash during write doesn't corrupt existing file
+        3. Data is persisted to disk before success is reported
+        """
         full_path = self._resolve_path(path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "wb") as f:
-            f.write(content)
+        dir_path = os.path.dirname(full_path)
+        os.makedirs(dir_path, exist_ok=True)
+
+        # Create temp file in same directory for atomic rename
+        # Using same filesystem ensures os.replace() is atomic
+        fd, temp_path = tempfile.mkstemp(
+            dir=dir_path,
+            prefix=".tmp.",
+            suffix=f".{os.path.basename(full_path)}"
+        )
+
+        try:
+            # Write content to temp file
+            os.write(fd, content)
+
+            # Ensure data is written to disk (durability guarantee)
+            os.fsync(fd)
+
+            # Close file descriptor
+            os.close(fd)
+
+            # Atomic rename - makes new content visible atomically
+            # os.replace() is atomic on both POSIX and Windows
+            os.replace(temp_path, full_path)
+
+            # Sync directory to ensure rename is persisted
+            # This is critical for crash recovery
+            try:
+                dir_fd = os.open(dir_path, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (OSError, AttributeError):
+                # Some filesystems/OSes don't support directory fsync
+                # This is acceptable - the file fsync is the critical part
+                pass
+
+        except Exception:
+            # Clean up temp file on any error
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                # Ignore cleanup errors - we're already handling an exception
+                pass
+            raise
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
         return json.loads(content.decode("utf-8"))
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        """Atomically write JSON file with fsync.
+
+        JSON serialization happens before any file I/O to minimize
+        time spent with file handles open.
+        """
         content = json.dumps(data, indent=2).encode("utf-8")
-        self.write_file(path, content)
+        self.write_file(path, content)  # Uses atomic write
 
     def exists(self, path: str) -> bool:
         full_path = self._resolve_path(path)
@@ -211,6 +268,11 @@ class S3StorageBackend(StorageBackend):
             raise
 
     def write_file(self, path: str, content: bytes) -> None:
+        """Write file to S3 (inherently atomic).
+
+        S3 PutObject is atomic - either the entire object is written or nothing.
+        No partial writes are visible to readers.
+        """
         key = self._get_s3_key(path)
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=content)
 

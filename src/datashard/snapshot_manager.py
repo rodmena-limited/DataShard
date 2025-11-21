@@ -3,6 +3,7 @@ Snapshotting and time travel functionality for the Python Iceberg implementation
 """
 
 import os
+import uuid
 from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -28,14 +29,19 @@ class SnapshotManager:
         parent_snapshot_id: Optional[int] = None,
         summary: Optional[Dict[str, str]] = None,
     ) -> Snapshot:
-        """Create a new snapshot with proper OCC handling"""
+        """Create a new snapshot with proper OCC handling.
+
+        CRITICAL FIX: Use UUID-based IDs to prevent collisions when multiple
+        snapshots are created in rapid succession or concurrently.
+        """
         # Get the base metadata that will be used for comparison in commit
         base_metadata = self.metadata_manager.refresh()
         if base_metadata is None:
             raise ValueError("Cannot create snapshot: no current metadata")
 
-        # Generate a new snapshot ID
-        snapshot_id = int(datetime.now().timestamp() * 1000000)  # microseconds since epoch
+        # Generate a new snapshot ID using UUID to prevent collisions
+        # Use upper 64 bits of UUID4 to get a random positive integer
+        snapshot_id = int(uuid.uuid4().int >> 64)
 
         # Create new snapshot
         snapshot = Snapshot(
@@ -132,36 +138,43 @@ class SnapshotManager:
         return None
 
     def delete_snapshot(self, snapshot_id: int) -> bool:
-        """Delete a specific snapshot (soft delete for now)"""
-        current_metadata = self.metadata_manager.refresh()
-        if current_metadata is None:
+        """Delete a specific snapshot (soft delete for now).
+
+        CRITICAL FIX: Create deep copy for new_metadata to ensure OCC works correctly.
+        Using the same object for base and new breaks the comparison logic.
+        """
+        base_metadata = self.metadata_manager.refresh()
+        if base_metadata is None:
             return False
 
         # Find and remove the snapshot
         snapshot_to_remove = None
-        for i, snapshot in enumerate(current_metadata.snapshots):
+        for i, snapshot in enumerate(base_metadata.snapshots):
             if snapshot.snapshot_id == snapshot_id:
                 snapshot_to_remove = i
                 break
 
         if snapshot_to_remove is not None:
-            del current_metadata.snapshots[snapshot_to_remove]
+            # Create a NEW metadata object for the updated state
+            # CRITICAL: Must use deepcopy to create separate object for OCC
+            new_metadata = deepcopy(base_metadata)
+            del new_metadata.snapshots[snapshot_to_remove]
 
             # Update current snapshot if needed
-            if current_metadata.current_snapshot_id == snapshot_id:
+            if new_metadata.current_snapshot_id == snapshot_id:
                 # Set to the most recent snapshot
                 valid_snapshots = [
-                    s for s in current_metadata.snapshots if s.snapshot_id != snapshot_id
+                    s for s in new_metadata.snapshots if s.snapshot_id != snapshot_id
                 ]
                 if valid_snapshots:
-                    current_metadata.current_snapshot_id = max(
+                    new_metadata.current_snapshot_id = max(
                         s.snapshot_id for s in valid_snapshots
                     )
                 else:
-                    current_metadata.current_snapshot_id = None
+                    new_metadata.current_snapshot_id = None
 
-            # Commit the changes
-            self.metadata_manager.commit(current_metadata, current_metadata)
+            # Commit the changes with proper OCC (base vs new)
+            self.metadata_manager.commit(base_metadata, new_metadata)
             return True
 
         return False

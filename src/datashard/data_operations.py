@@ -244,14 +244,47 @@ class DataFileWriter:
         self.write_batch(table)
 
     def close(self) -> None:
-        """Close the writer and finalize the file"""
-        if self._writer:
+        """Close the writer and finalize the file atomically"""
+        if not self._writer:
+            return
+
+        try:
             assert self._writer is not None
             self._writer.close()
+
             # Move temp file to final location (only for local filesystem)
             if self._temp_file:
-                os.rename(self._temp_file.name, self.file_path)
+                temp_name = self._temp_file.name
+                try:
+                    # Ensure file is flushed to disk before rename
+                    # Note: ParquetWriter.close() already flushes
+                    # Atomic rename on both POSIX and Windows
+                    os.replace(temp_name, self.file_path)
+
+                    # Sync directory to persist rename
+                    try:
+                        dir_path = os.path.dirname(self.file_path)
+                        dir_fd = os.open(dir_path, os.O_RDONLY)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except (OSError, AttributeError):
+                        # Directory fsync not supported - acceptable
+                        pass
+
+                except Exception:
+                    # Clean up temp file if rename failed
+                    try:
+                        if os.path.exists(temp_name):
+                            os.remove(temp_name)
+                    except Exception:
+                        pass  # Ignore cleanup errors
+                    raise
+
                 self._temp_file = None
+
+        finally:
             self._writer = None
 
     @property

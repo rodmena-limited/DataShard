@@ -2,19 +2,27 @@
 Main test suite for pytest
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 
-from tests.clear_demo import main as demo_main
-from tests.test_data_operations import main as test_data_operations_main
-from tests.test_file_management import main as test_file_management_main
-from tests.test_iceberg import main as test_iceberg_main
-from tests.test_occ import main as test_occ_main
+# Add tests directory to path for imports
+tests_dir = Path(__file__).parent
+if str(tests_dir) not in sys.path:
+    sys.path.insert(0, str(tests_dir))
+
+import clear_demo
+import test_data_operations as data_ops_module
+import test_file_management as file_mgmt_module
+import test_iceberg
+import test_occ
 
 
 def test_iceberg_functionality():
     """Test core iceberg functionality"""
     try:
-        test_iceberg_main()
+        test_iceberg.main()
         assert True
     except Exception as e:
         pytest.fail(f"Core functionality test failed: {e}")
@@ -23,7 +31,7 @@ def test_iceberg_functionality():
 def test_occ_functionality():
     """Test optimistic concurrency control"""
     try:
-        test_occ_main()
+        test_occ.main()
         assert True
     except Exception as e:
         pytest.fail(f"OCC functionality test failed: {e}")
@@ -32,7 +40,7 @@ def test_occ_functionality():
 def test_file_management():
     """Test file management functionality"""
     try:
-        test_file_management_main()
+        file_mgmt_module.main()
         assert True
     except Exception as e:
         pytest.fail(f"File management test failed: {e}")
@@ -41,7 +49,7 @@ def test_file_management():
 def test_data_operations():
     """Test data operations functionality"""
     try:
-        test_data_operations_main()
+        data_ops_module.main()
         assert True
     except Exception as e:
         pytest.fail(f"Data operations test failed: {e}")
@@ -50,7 +58,7 @@ def test_data_operations():
 def test_concurrency_demo():
     """Test the concurrency safety demo"""
     try:
-        demo_main()
+        clear_demo.main()
         assert True
     except Exception as e:
         pytest.fail(f"Concurrency demo failed: {e}")

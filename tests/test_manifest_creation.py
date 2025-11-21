@@ -258,16 +258,17 @@ def test_pandas_query_returns_data():
         assert snapshot is not None
 
         file_manager = FileManager(table_path, table.metadata_manager, table.storage)
-        manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
 
-        manifests = file_manager.read_manifest_list_file(manifest_list_path)
+        # Use relative path for storage backend
+        # snapshot.manifest_list is already a relative path like "metadata/manifests/..."
+        manifests = file_manager.read_manifest_list_file(snapshot.manifest_list)
         assert len(manifests) > 0, "Should have manifests"
 
         # Read all data files
         all_data = []
         for manifest_file in manifests:
-            manifest_path = os.path.join(table_path, manifest_file.manifest_path)
-            data_files = file_manager.read_manifest_file(manifest_path)
+            # Use relative path for storage backend
+            data_files = file_manager.read_manifest_file(manifest_file.manifest_path)
 
             for data_file in data_files:
                 parquet_path = os.path.join(table_path, data_file.file_path.lstrip("/"))

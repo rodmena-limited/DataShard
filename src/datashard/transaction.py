@@ -5,7 +5,7 @@ ACID transaction implementation for the Python Iceberg implementation
 import json
 import os
 import threading
-from datetime import datetime
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from .data_structures import (
@@ -43,6 +43,9 @@ class Transaction:
         # Operations queue
         self._operations: List[Dict[str, Any]] = []
 
+        # Track files written during transaction for cleanup on rollback
+        self._written_files: List[str] = []
+
         self._lock = threading.RLock()
 
     def begin(self) -> "Transaction":
@@ -54,6 +57,7 @@ class Transaction:
             self._is_active = True
             self._is_committed = False
             self._is_rolled_back = False
+            self._written_files = []  # Reset written files tracker
 
             return self
 
@@ -82,13 +86,16 @@ class Transaction:
         schema: "Schema",
         partition_values: Optional[Dict[str, Any]] = None,
     ) -> "Transaction":
-        """Append actual data records to the table by creating new data files"""
+        """Append actual data records to the table by creating new data files.
+
+        CRITICAL FIX: Track written files for cleanup on rollback.
+        """
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
-        # Create a data file with the records
-        timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
-        file_name = f"auto_{timestamp}.parquet"
+        # Create a data file with the records using UUID for uniqueness
+        file_id = uuid.uuid4().hex[:16]  # Use 16 chars of UUID hex
+        file_name = f"auto_{file_id}.parquet"
         # Use relative path for storage backend (works for both local and S3)
         file_path = f"data/{file_name}"
 
@@ -100,6 +107,9 @@ class Transaction:
             file_format=FileFormat.PARQUET,
             partition_values=partition_values or {},
         )
+
+        # Track written file for cleanup on rollback
+        self._written_files.append(file_path)
 
         # When using append_files, the file path in the DataFile object should be
         # relative to the table for Iceberg-style path resolution
@@ -175,10 +185,9 @@ class Transaction:
                     for operation in self._operations:
                         new_metadata = self._apply_operation(new_metadata, operation)
 
-                    # Generate a snapshot ID for this transaction
-                    snapshot_id = int(
-                        datetime.now().timestamp() * 1000000
-                    )  # microseconds since epoch
+                    # Generate a unique snapshot ID using UUID to prevent collisions
+                    # CRITICAL FIX: Timestamp-based IDs could collide with concurrent transactions
+                    snapshot_id = int(uuid.uuid4().int >> 64)
 
                     # Extract data files from append_files operations
                     data_files = []
@@ -215,6 +224,9 @@ class Transaction:
                     self._is_active = False
                     self._is_committed = True
 
+                    # Clear written files on successful commit (don't clean them up)
+                    self._written_files = []
+
                     return True
 
             except ConcurrentModificationException as e:
@@ -247,9 +259,29 @@ class Transaction:
             return self._rollback()
 
     def _rollback(self) -> bool:
-        """Internal method to perform rollback"""
+        """Internal method to perform rollback.
+
+        CRITICAL FIX: Clean up files written during the transaction.
+        This prevents orphaned data files from accumulating on disk.
+        """
         self._is_active = False
         self._is_rolled_back = True
+
+        # Clean up files written during this transaction
+        # Use best-effort cleanup - log errors but don't fail rollback
+        for file_path in self._written_files:
+            try:
+                if self.file_manager.storage.exists(file_path):
+                    self.file_manager.storage.delete_file(file_path)
+            except Exception as e:
+                # Log the error but continue with rollback
+                # In production, this should use proper logging
+                import sys
+                print(f"Warning: Failed to clean up file {file_path} during rollback: {e}",
+                      file=sys.stderr)
+
+        # Clear the written files list
+        self._written_files = []
 
         return True
 

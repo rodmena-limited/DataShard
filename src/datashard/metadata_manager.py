@@ -2,11 +2,13 @@
 Metadata management for the Python Iceberg implementation
 """
 
+import os
 import threading
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
+from .file_lock import FileLock
 
 if TYPE_CHECKING:
     from .storage_backend import StorageBackend
@@ -27,6 +29,14 @@ class MetadataManager:
         self.metadata_path = "metadata"  # Relative to table_path
         self.current_version = 0
         self._lock = threading.RLock()  # For thread safety
+
+        # File-based lock for multi-process safety
+        # PHASE 2: Added file-based locking for true multi-process synchronization
+        lock_dir = os.path.join(
+            getattr(storage, "base_path", table_path), ".locks"
+        )
+        os.makedirs(lock_dir, exist_ok=True)
+        self._file_lock_path = os.path.join(lock_dir, "metadata.lock")
 
         # Ensure metadata directory exists
         self.storage.makedirs(self.metadata_path, exist_ok=True)
@@ -66,68 +76,69 @@ class MetadataManager:
             return self._read_metadata_file(metadata_path)
 
     def commit(self, base_metadata: TableMetadata, new_metadata: TableMetadata) -> TableMetadata:
-        """Commit new metadata with Optimistic Concurrency Control following Iceberg pattern"""
-        # In true Iceberg style, we need to check that the underlying metadata hasn't changed
-        # since we read it. This is done by comparing with current state during commit.
+        """Commit new metadata with Optimistic Concurrency Control following Iceberg pattern.
 
-        # Read the current metadata to compare with the base that the caller had
-        current = self.refresh()
+        CRITICAL RACE CONDITION FIX:
+        - Hold lock for entire operation (check + increment + write)
+        - PHASE 2: Use file-based locking for multi-process safety
+        - Write metadata file BEFORE updating version hint (two-phase commit)
+        """
+        # PHASE 2: Acquire file-based lock for multi-process safety
+        file_lock = FileLock(self._file_lock_path, timeout=30.0)
+        file_lock.acquire()
 
-        # Check UUID consistency
-        if current and current.table_uuid != base_metadata.table_uuid:
-            raise ValueError("Table UUID mismatch - concurrent modification detected")
+        try:
+            # Acquire thread lock for thread safety within same process
+            with self._lock:
+            # PHASE 1: Validation (inside lock to prevent races)
+            current = self.refresh()
 
-        # The key OCC check: verify that the metadata hasn't changed since the caller read it
-        # This implements the Iceberg atomic commit pattern
-        if current and current.current_snapshot_id != base_metadata.current_snapshot_id:
-            # A snapshot has been added while the operation was in progress
-            raise ConcurrentModificationException(
-                f"Cannot commit metadata: concurrent modification detected. "
-                f"Expected current_snapshot_id: {base_metadata.current_snapshot_id}, "
-                f"but found: {current.current_snapshot_id}"
-            )
+            # Check UUID consistency
+            if current and current.table_uuid != base_metadata.table_uuid:
+                raise ValueError("Table UUID mismatch - concurrent modification detected")
 
-        if current and current.last_updated_ms != base_metadata.last_updated_ms:
-            # The metadata was updated while this operation was in progress
-            raise ConcurrentModificationException(
-                f"Cannot commit metadata: concurrent modification detected. "
-                f"Expected last_updated_ms: {base_metadata.last_updated_ms}, "
-                f"but found: {current.last_updated_ms}"
-            )
-
-        # After validation passes, perform the atomic update
-        with self._lock:
-            # Double-check the state right before committing (double-checked locking pattern)
-            fresh_current = self.refresh()
-            if fresh_current and (
-                fresh_current.current_snapshot_id != base_metadata.current_snapshot_id
-                or fresh_current.last_updated_ms != base_metadata.last_updated_ms
-            ):
+            # The key OCC check: verify that the metadata hasn't changed since the caller read it
+            if current and current.current_snapshot_id != base_metadata.current_snapshot_id:
                 raise ConcurrentModificationException(
-                    "Concurrent modification detected during commit - retry operation"
+                    f"Cannot commit metadata: concurrent modification detected. "
+                    f"Expected current_snapshot_id: {base_metadata.current_snapshot_id}, "
+                    f"but found: {current.current_snapshot_id}"
                 )
 
-            # Update sequence number and timestamp
+            if current and current.last_updated_ms != base_metadata.last_updated_ms:
+                raise ConcurrentModificationException(
+                    f"Cannot commit metadata: concurrent modification detected. "
+                    f"Expected last_updated_ms: {base_metadata.last_updated_ms}, "
+                    f"but found: {current.last_updated_ms}"
+                )
+
+            # PHASE 2: Prepare new version
             new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
 
-            # CRITICAL: Read current version from filesystem for multi-process safety
-            # Each process instance starts with current_version=0, so we MUST
-            # re-read from the version hint to get the actual latest version
+            # Read current version from filesystem for multi-process safety
+            # CRITICAL: This must be inside the lock to prevent race on version increment
             filesystem_version = self._read_version_hint()
             if filesystem_version is None:
                 filesystem_version = 0
-            self.current_version = filesystem_version + 1  # Increment from filesystem state
+            next_version = filesystem_version + 1
 
-            # Write new metadata file
-            metadata_file = f"v{self.current_version}.metadata.json"
+            # PHASE 3: Write new metadata file (but don't make it visible yet)
+            metadata_file = f"v{next_version}.metadata.json"
             metadata_path = f"{self.metadata_path}/{metadata_file}"
-
             self._write_metadata_file(metadata_path, new_metadata)
 
-            # Atomically update the version hint to point to the new version
-            self._write_version_hint(self.current_version)
+            # PHASE 4: Atomically make new version visible
+            # This is the commit point - after this, the new metadata is visible
+            # If we crash before this, the new metadata file is orphaned but table is consistent
+            self._write_version_hint(next_version)
 
-            return new_metadata
+                # Success - update in-memory version
+                self.current_version = next_version
+
+                return new_metadata
+        finally:
+            # PHASE 2: Always release file lock
+            file_lock.release()
 
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """Get a specific snapshot by ID"""
