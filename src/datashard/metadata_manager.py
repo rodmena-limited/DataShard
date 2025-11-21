@@ -90,47 +90,47 @@ class MetadataManager:
         try:
             # Acquire thread lock for thread safety within same process
             with self._lock:
-            # PHASE 1: Validation (inside lock to prevent races)
-            current = self.refresh()
+                # PHASE 1: Validation (inside lock to prevent races)
+                current = self.refresh()
 
-            # Check UUID consistency
-            if current and current.table_uuid != base_metadata.table_uuid:
-                raise ValueError("Table UUID mismatch - concurrent modification detected")
+                # Check UUID consistency
+                if current and current.table_uuid != base_metadata.table_uuid:
+                    raise ValueError("Table UUID mismatch - concurrent modification detected")
 
-            # The key OCC check: verify that the metadata hasn't changed since the caller read it
-            if current and current.current_snapshot_id != base_metadata.current_snapshot_id:
-                raise ConcurrentModificationException(
-                    f"Cannot commit metadata: concurrent modification detected. "
-                    f"Expected current_snapshot_id: {base_metadata.current_snapshot_id}, "
-                    f"but found: {current.current_snapshot_id}"
-                )
+                # The key OCC check: verify that the metadata hasn't changed since the caller read it
+                if current and current.current_snapshot_id != base_metadata.current_snapshot_id:
+                    raise ConcurrentModificationException(
+                        f"Cannot commit metadata: concurrent modification detected. "
+                        f"Expected current_snapshot_id: {base_metadata.current_snapshot_id}, "
+                        f"but found: {current.current_snapshot_id}"
+                    )
 
-            if current and current.last_updated_ms != base_metadata.last_updated_ms:
-                raise ConcurrentModificationException(
-                    f"Cannot commit metadata: concurrent modification detected. "
-                    f"Expected last_updated_ms: {base_metadata.last_updated_ms}, "
-                    f"but found: {current.last_updated_ms}"
-                )
+                if current and current.last_updated_ms != base_metadata.last_updated_ms:
+                    raise ConcurrentModificationException(
+                        f"Cannot commit metadata: concurrent modification detected. "
+                        f"Expected last_updated_ms: {base_metadata.last_updated_ms}, "
+                        f"but found: {current.last_updated_ms}"
+                    )
 
-            # PHASE 2: Prepare new version
-            new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
+                # PHASE 2: Prepare new version
+                new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
 
-            # Read current version from filesystem for multi-process safety
-            # CRITICAL: This must be inside the lock to prevent race on version increment
-            filesystem_version = self._read_version_hint()
-            if filesystem_version is None:
-                filesystem_version = 0
-            next_version = filesystem_version + 1
+                # Read current version from filesystem for multi-process safety
+                # CRITICAL: This must be inside the lock to prevent race on version increment
+                filesystem_version = self._read_version_hint()
+                if filesystem_version is None:
+                    filesystem_version = 0
+                next_version = filesystem_version + 1
 
-            # PHASE 3: Write new metadata file (but don't make it visible yet)
-            metadata_file = f"v{next_version}.metadata.json"
-            metadata_path = f"{self.metadata_path}/{metadata_file}"
-            self._write_metadata_file(metadata_path, new_metadata)
+                # PHASE 3: Write new metadata file (but don't make it visible yet)
+                metadata_file = f"v{next_version}.metadata.json"
+                metadata_path = f"{self.metadata_path}/{metadata_file}"
+                self._write_metadata_file(metadata_path, new_metadata)
 
-            # PHASE 4: Atomically make new version visible
-            # This is the commit point - after this, the new metadata is visible
-            # If we crash before this, the new metadata file is orphaned but table is consistent
-            self._write_version_hint(next_version)
+                # PHASE 4: Atomically make new version visible
+                # This is the commit point - after this, the new metadata is visible
+                # If we crash before this, the new metadata file is orphaned but table is consistent
+                self._write_version_hint(next_version)
 
                 # Success - update in-memory version
                 self.current_version = next_version

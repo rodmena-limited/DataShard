@@ -23,6 +23,12 @@ import tempfile
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
+from .disk_utils import check_disk_space, estimate_write_size
+from .integrity import IntegrityChecker
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
 try:
     import boto3
     from botocore.exceptions import ClientError
@@ -111,10 +117,29 @@ class LocalStorageBackend(StorageBackend):
         1. No partial writes visible to readers
         2. Crash during write doesn't corrupt existing file
         3. Data is persisted to disk before success is reported
+
+        PHASE 2 improvements:
+        - Disk space checking before write
+        - Comprehensive logging
+        - Checksum computation for integrity
         """
+        logger.info(f"Writing file: {path} ({len(content)} bytes)")
+
         full_path = self._resolve_path(path)
         dir_path = os.path.dirname(full_path)
         os.makedirs(dir_path, exist_ok=True)
+
+        # PHASE 2: Check disk space before writing
+        required_space = estimate_write_size(content)
+        try:
+            check_disk_space(dir_path, required_space)
+        except IOError as e:
+            logger.error(f"Disk space check failed for {path}: {e}")
+            raise
+
+        # PHASE 2: Compute checksum for integrity verification
+        checksum = IntegrityChecker.compute_checksum(content)
+        logger.debug(f"Computed checksum for {path}: {checksum[:16]}...")
 
         # Create temp file in same directory for atomic rename
         # Using same filesystem ensures os.replace() is atomic
@@ -157,9 +182,11 @@ class LocalStorageBackend(StorageBackend):
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
             except Exception:
-                # Ignore cleanup errors - we're already handling an exception
+                    # Ignore cleanup errors - we're already handling an exception
                 pass
             raise
+
+        logger.info(f"Successfully wrote file: {path}")
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
@@ -258,23 +285,57 @@ class S3StorageBackend(StorageBackend):
         return path
 
     def read_file(self, path: str) -> bytes:
+        """Read file from S3 with retry logic for eventual consistency.
+
+        PHASE 2: Added retry logic to handle S3 eventual consistency.
+        """
+        from .s3_consistency import with_s3_retry
+
         key = self._get_s3_key(path)
-        try:
-            response = self.s3.get_object(Bucket=self.bucket, Key=key)
-            return response["Body"].read()
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
-            raise
+        logger.debug(f"Reading S3 file: s3://{self.bucket}/{key}")
+
+        def read_op() -> bytes:
+            try:
+                response = self.s3.get_object(Bucket=self.bucket, Key=key)
+                return response["Body"].read()
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "NoSuchKey":
+                    raise FileNotFoundError(
+                        f"S3 object not found: s3://{self.bucket}/{key}"
+                    ) from e
+                raise
+
+        data = with_s3_retry(read_op, f"S3 read: {key}")
+        logger.debug(f"Read {len(data)} bytes from s3://{self.bucket}/{key}")
+        return data
 
     def write_file(self, path: str, content: bytes) -> None:
         """Write file to S3 (inherently atomic).
 
         S3 PutObject is atomic - either the entire object is written or nothing.
         No partial writes are visible to readers.
+
+        PHASE 2 improvements:
+        - S3 consistency handling with retries
+        - Comprehensive logging
+        - Checksum computation
         """
+        from .s3_consistency import with_s3_retry
+
+        logger.info(f"Writing S3 file: {path} ({len(content)} bytes)")
+
         key = self._get_s3_key(path)
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=content)
+
+        # PHASE 2: Compute checksum
+        checksum = IntegrityChecker.compute_checksum(content)
+        logger.debug(f"Computed checksum for s3://{self.bucket}/{key}: {checksum[:16]}...")
+
+        # PHASE 2: Write with retry logic for S3 eventual consistency
+        def write_op() -> None:
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=content)
+
+        with_s3_retry(write_op, f"S3 write: {key}")
+        logger.info(f"Successfully wrote S3 file: {path}")
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
