@@ -8,7 +8,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from .data_structures import HistoryEntry, Snapshot
+from .data_structures import HistoryEntry, Snapshot, TableMetadata
 from .metadata_manager import MetadataManager
 
 
@@ -28,14 +28,29 @@ class SnapshotManager:
         operation: str = "append",
         parent_snapshot_id: Optional[int] = None,
         summary: Optional[Dict[str, str]] = None,
+        base_metadata: Optional[TableMetadata] = None,
     ) -> Snapshot:
         """Create a new snapshot with proper OCC handling.
 
         CRITICAL FIX: Use UUID-based IDs to prevent collisions when multiple
         snapshots are created in rapid succession or concurrently.
+
+        Args:
+            manifest_list_path: Path to the manifest list file
+            operation: Type of operation (append, overwrite, etc.)
+            parent_snapshot_id: ID of the parent snapshot
+            summary: Optional summary metadata
+            base_metadata: Optional base metadata for OCC. If provided, this will be
+                used instead of refreshing. This is critical for proper retry handling
+                in Transaction.commit() - passing the base ensures retries use fresh
+                metadata read by the caller rather than an independent stale read.
         """
-        # Get the base metadata that will be used for comparison in commit
-        base_metadata = self.metadata_manager.refresh()
+        # Use provided base_metadata or refresh if not provided
+        # CRITICAL: When called from Transaction.commit(), base_metadata should be passed
+        # to avoid a race condition where this refresh() returns stale data compared to
+        # what the Transaction already read.
+        if base_metadata is None:
+            base_metadata = self.metadata_manager.refresh()
         if base_metadata is None:
             raise ValueError("Cannot create snapshot: no current metadata")
 

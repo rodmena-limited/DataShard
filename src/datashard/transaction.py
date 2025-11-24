@@ -163,12 +163,17 @@ class Transaction:
 
     def commit(self) -> bool:  # noqa: C901
         """Commit the transaction with ACID properties using Optimistic Concurrency Control"""
+        import random
+        import time
+
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
         # Implement retry logic for OCC - this is essential for handling concurrent modifications
-        max_retries = 5
+        # CRITICAL FIX: Increased retries and improved backoff for high-contention scenarios
+        max_retries = 10
         retry_count = 0
+        base_delay = 0.005  # 5ms base delay
 
         while retry_count < max_retries:
             try:
@@ -201,7 +206,9 @@ class Transaction:
                     )
 
                     # Create a new snapshot for this transaction
-                    # We need to pass the base metadata for proper OCC checking
+                    # CRITICAL FIX: Pass base_metadata to avoid race condition where
+                    # create_snapshot() would do its own refresh() and potentially
+                    # get stale metadata compared to what we just read above.
                     self.snapshot_manager.create_snapshot(
                         manifest_list_path=manifest_list_path,
                         operation=(
@@ -213,7 +220,8 @@ class Transaction:
                             base_metadata.current_snapshot_id
                             if base_metadata.current_snapshot_id is not None
                             else -1
-                        ),  # Use base as parent
+                        ),
+                        base_metadata=base_metadata,  # Pass our fresh base for OCC
                     )
 
                     # The snapshot manager already updated the metadata, so get the latest
@@ -236,10 +244,10 @@ class Transaction:
                     self._rollback()
                     raise e
                 else:
-                    # Wait a bit before retrying (exponential backoff could be added here)
-                    import time
-
-                    time.sleep(0.01 * retry_count)  # Simple backoff
+                    # Exponential backoff with jitter to reduce contention
+                    # Formula: base_delay * 2^retry + random jitter
+                    delay = base_delay * (2 ** retry_count) + random.uniform(0, base_delay)
+                    time.sleep(delay)
                     continue  # Retry the transaction
             except Exception as e:
                 # Any other exception - rollback
