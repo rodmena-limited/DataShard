@@ -129,7 +129,14 @@ class FileLock:
             time.sleep(0.01)
 
     def release(self) -> None:
-        """Release the lock."""
+        """Release the lock.
+
+        IMPORTANT: We intentionally do NOT delete the lock file after releasing.
+        fcntl.flock() operates on file inodes, not paths. If we delete the file,
+        a new process creating the same path gets a different inode, so they won't
+        actually synchronize. By keeping the lock file, all processes lock the
+        same inode and proper synchronization is maintained.
+        """
         if not self._locked or self._lock_fd is None:
             return
 
@@ -143,12 +150,10 @@ class FileLock:
             self._lock_fd = None
             self._locked = False
 
-            # Clean up lock file
-            try:
-                os.remove(self.lock_file)
-            except (IOError, OSError):
-                # Ignore errors - another process may have cleaned it up
-                pass
+            # NOTE: Do NOT delete the lock file here!
+            # Deleting causes race conditions because fcntl.flock operates on inodes.
+            # If we delete the file, concurrent processes may create new files with
+            # different inodes and fail to synchronize properly.
         except Exception:
             # Best effort cleanup
             pass
