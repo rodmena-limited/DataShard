@@ -171,9 +171,10 @@ class Transaction:
 
         # Implement retry logic for OCC - this is essential for handling concurrent modifications
         # CRITICAL FIX: Increased retries and improved backoff for high-contention scenarios
-        max_retries = 10
+        # With 8+ concurrent workers, we need more aggressive retry parameters
+        max_retries = 50  # Increased from 10 for high-contention production environments
         retry_count = 0
-        base_delay = 0.005  # 5ms base delay
+        base_delay = 0.010  # 10ms base delay (doubled from 5ms)
 
         while retry_count < max_retries:
             try:
@@ -244,9 +245,11 @@ class Transaction:
                     self._rollback()
                     raise e
                 else:
-                    # Exponential backoff with jitter to reduce contention
-                    # Formula: base_delay * 2^retry + random jitter
-                    delay = base_delay * (2 ** retry_count) + random.uniform(0, base_delay)
+                    # Exponential backoff with jitter and cap to reduce contention
+                    # Formula: min(base_delay * 2^retry + random jitter, max_delay)
+                    max_delay = 2.0  # Cap at 2 seconds
+                    delay = min(base_delay * (2 ** retry_count), max_delay)
+                    delay += random.uniform(0, delay * 0.5)  # Add up to 50% jitter
                     time.sleep(delay)
                     continue  # Retry the transaction
             except Exception as e:
