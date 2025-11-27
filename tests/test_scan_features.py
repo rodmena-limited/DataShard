@@ -13,6 +13,7 @@ import time
 import pytest
 
 from datashard import Schema, create_table
+from datashard.data_structures import DataFile, FileFormat
 from datashard.filters import (
     FilterExpression,
     FilterOp,
@@ -21,8 +22,6 @@ from datashard.filters import (
     to_pyarrow_compute_expression,
     to_pyarrow_filter,
 )
-from datashard.data_structures import DataFile, FileFormat
-
 
 # ============================================================================
 # Test Fixtures

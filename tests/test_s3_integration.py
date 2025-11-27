@@ -12,8 +12,8 @@ These tests require S3 credentials to be set via environment variables:
 
 import os
 import uuid
-import pytest
-from datashard import create_table, load_table, Schema
+
+from datashard import Schema, create_table, load_table
 
 
 def test_s3_storage_create_table():
@@ -48,7 +48,7 @@ def test_s3_storage_create_table():
 
         # Verify metadata exists
         assert table.storage.exists("metadata")
-        print(f"✅ Metadata directory exists on S3")
+        print("✅ Metadata directory exists on S3")
 
     finally:
         # Cleanup env vars
@@ -120,7 +120,7 @@ def test_s3_storage_write_and_read():
 
         # Check data path exists
         assert loaded.storage.exists("data")
-        print(f"✅ Data directory exists on S3")
+        print("✅ Data directory exists on S3")
 
     finally:
         # Cleanup env vars

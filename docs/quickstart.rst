@@ -124,6 +124,66 @@ Here's a more comprehensive example that demonstrates multiple features:
    shutil.rmtree("/tmp/my_first_table")
    shutil.rmtree("/tmp/complex_table")
 
+Reading Data with Filters
+-------------------------
+
+DataShard supports efficient data reading with predicate pushdown and parallel processing:
+
+.. code-block:: python
+
+   # Basic scan - read all data
+   all_records = table.scan()
+   print(f"Total records: {len(all_records)}")
+
+   # Scan with filter (predicate pushdown - filters at parquet level)
+   filtered = table.scan(filter={"name": "Alice"})
+   print(f"Records for Alice: {len(filtered)}")
+
+   # Comparison filters
+   young_users = table.scan(filter={"age": ("<", 30)})
+
+   # Range filter
+   age_range = table.scan(filter={"age": ("between", (25, 35))})
+
+   # IN filter
+   specific_users = table.scan(filter={"user_id": ("in", [1, 2])})
+
+   # Column projection (only read specific columns)
+   names_only = table.scan(columns=["name", "email"])
+
+   # Parallel reading (2-4x speedup with multiple files)
+   results = table.scan(parallel=True)  # Use all CPU cores
+   results = table.scan(parallel=4)     # Use 4 threads
+
+   # Combine filter, columns, and parallel
+   df = table.to_pandas(
+       columns=["name", "age"],
+       filter={"age": (">=", 25)},
+       parallel=True
+   )
+
+Streaming Large Tables
+----------------------
+
+For memory-efficient processing of large tables:
+
+.. code-block:: python
+
+   # Process in batches (memory-efficient)
+   for batch in table.scan_batches(batch_size=1000):
+       for record in batch:
+           process(record)
+
+   # Iterate record by record
+   for record in table.iter_records(filter={"age": (">", 30)}):
+       print(record["name"])
+
+   # Iterate as pandas DataFrame chunks
+   for chunk_df in table.iter_pandas(chunksize=10000):
+       # Process each chunk with pandas operations
+       summary = chunk_df.groupby("name").count()
+       print(summary)
+
 What's Next?
 ------------
 

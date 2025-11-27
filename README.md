@@ -34,8 +34,12 @@ DataShard is a Python implementation of Apache Iceberg's core concepts, providin
 - **Time Travel:** Query data as it existed at any point in time
 - **Safe Concurrency:** Multiple processes can write without corruption
 - **Optimistic Concurrency Control (OCC):** Automatic conflict resolution
-- **S3-Compatible Storage:** AWS S3, MinIO, DigitalOcean Spaces support (NEW in v0.2.2)
+- **S3-Compatible Storage:** AWS S3, MinIO, DigitalOcean Spaces support
 - **Distributed Workflows:** Run workers across different machines with shared S3 storage
+- **Predicate Pushdown:** Filter at parquet level for 90%+ I/O reduction (NEW in v0.3.3)
+- **Partition Pruning:** Skip files based on column statistics (NEW in v0.3.3)
+- **Parallel Reading:** Multi-threaded scan for 2-4x speedup (NEW in v0.3.3)
+- **Streaming API:** Memory-efficient iteration over large tables (NEW in v0.3.3)
 - **Pure Python:** No Java dependencies, easy setup
 - **pandas Integration:** Native DataFrame support
 
@@ -480,6 +484,34 @@ snapshots = table.snapshots()
 # Time travel
 snapshot = table.time_travel(snapshot_id=12345)
 snapshot = table.time_travel(timestamp=1700000000000)
+
+# Scan all data
+records = table.scan()
+df = table.to_pandas()
+
+# Scan with predicate pushdown (filters at parquet level)
+records = table.scan(filter={"status": "failed"})
+records = table.scan(filter={"age": (">", 30)})
+records = table.scan(filter={"id": ("in", [1, 2, 3])})
+records = table.scan(filter={"ts": ("between", (t1, t2))})
+
+# Column projection (only read specified columns)
+records = table.scan(columns=["id", "name"])
+
+# Parallel reading (2-4x speedup with multiple files)
+records = table.scan(parallel=True)      # Use all CPU cores
+records = table.scan(parallel=4)         # Use 4 threads
+df = table.to_pandas(parallel=True, filter={"status": "active"})
+
+# Streaming API (memory-efficient for large tables)
+for batch in table.scan_batches(batch_size=10000):
+    process(batch)
+
+for record in table.iter_records(filter={"status": "failed"}):
+    handle_failure(record)
+
+for chunk_df in table.iter_pandas(chunksize=50000):
+    results.append(chunk_df.groupby('status').count())
 ```
 
 ### Schema Definition

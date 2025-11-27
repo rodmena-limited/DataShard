@@ -9,7 +9,6 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from datashard import DataFile, FileFormat, create_table
 

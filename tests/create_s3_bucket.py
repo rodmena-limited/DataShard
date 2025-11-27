@@ -2,8 +2,8 @@
 Create S3 bucket on MinIO for testing
 """
 
+
 import boto3
-import os
 
 # S3 configuration
 endpoint_url = "https://s3.london.cloudsci.uk"

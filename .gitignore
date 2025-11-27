@@ -58,3 +58,4 @@ target/
 S3_IMPLEMENTATION_PLAN.md
 COMPLETE_S3_INTEGRATION.sh
 data/
+test_table*

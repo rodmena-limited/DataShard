@@ -7,7 +7,6 @@
 import os
 import sys
 
-
 # Add the source directory to the path
 sys.path.insert(0, os.path.abspath("../src"))
 
