@@ -4,7 +4,7 @@ Data file operations and readers/writers for the Python Iceberg implementation
 
 import os
 import tempfile
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -409,6 +409,13 @@ class DataFileManager:
         # Convert path for PyArrow (adds bucket prefix for S3)
         arrow_path = self._get_arrow_path(file_path)
 
+        # Convert records to Arrow table to compute statistics before writing
+        lower_bounds = None
+        upper_bounds = None
+        if records:
+            table = pa.Table.from_pylist(records, schema=arrow_schema)
+            lower_bounds, upper_bounds = self._compute_column_bounds(table, iceberg_schema)
+
         with DataFileWriter(arrow_path, file_format, arrow_schema, {}, self._pyarrow_fs) as writer:
             if records:
                 # Write in batches to handle large datasets efficiently
@@ -431,7 +438,66 @@ class DataFileManager:
             partition_values=partition_values or {},
             record_count=writer.row_count,
             file_size_in_bytes=file_size,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
         )
+
+    def _compute_column_bounds(
+        self,
+        table: pa.Table,
+        iceberg_schema: Schema,
+    ) -> Tuple[Optional[Dict[int, Any]], Optional[Dict[int, Any]]]:
+        """Compute min/max bounds for each column.
+
+        These bounds are used for partition pruning - allowing scan() to
+        skip files that cannot contain matching records.
+
+        Args:
+            table: PyArrow Table with the data
+            iceberg_schema: Iceberg schema for field ID mapping
+
+        Returns:
+            Tuple of (lower_bounds, upper_bounds) dicts mapping field ID to value
+        """
+        import pyarrow.compute as pc
+
+        lower_bounds: Dict[int, Any] = {}
+        upper_bounds: Dict[int, Any] = {}
+
+        for field_dict in iceberg_schema.fields:
+            field_id = field_dict.get("id")
+            field_name = field_dict.get("name")
+            field_type = field_dict.get("type", "string")
+
+            if field_id is None or field_name is None:
+                continue
+
+            if field_name not in table.column_names:
+                continue
+
+            # Skip complex types and binary - can't compute meaningful bounds
+            if field_type in ("binary", "fixed", "list", "map", "struct"):
+                continue
+
+            column = table.column(field_name)
+
+            try:
+                # Compute min/max using PyArrow compute
+                min_scalar = pc.min(column)
+                max_scalar = pc.max(column)
+
+                min_val = min_scalar.as_py()
+                max_val = max_scalar.as_py()
+
+                if min_val is not None:
+                    lower_bounds[field_id] = min_val
+                if max_val is not None:
+                    upper_bounds[field_id] = max_val
+            except Exception:
+                # Skip columns that can't compute bounds (e.g., all nulls)
+                continue
+
+        return lower_bounds if lower_bounds else None, upper_bounds if upper_bounds else None
 
     def write_pandas_file(
         self,
@@ -493,7 +559,8 @@ class DataFileManager:
                 table = reader.read_all()
 
             # Convert to list of dictionaries
-            return table.to_pylist()
+            result: List[Dict[str, Any]] = table.to_pylist()
+            return result
 
     def read_pandas_file(
         self,

@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 from .data_structures import (
     DataFile,
@@ -527,3 +527,546 @@ class Table:
         """Refresh the table metadata from storage"""
         metadata = self.metadata_manager.refresh()
         return metadata is not None
+
+    def scan(
+        self,
+        columns: Optional[List[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+        parallel: Union[bool, int] = False,
+    ) -> List[Dict[str, Any]]:
+        """Scan all data in the table and return as list of records.
+
+        This method reads all parquet files in the data directory, providing
+        a complete view of all data across all snapshots.
+
+        Args:
+            columns: Optional list of column names to read. If None, reads all columns.
+            filter: Optional filter dict for predicate pushdown.
+                Examples:
+                    {"status": "failed"}              # status == "failed"
+                    {"age": (">", 18)}                # age > 18
+                    {"id": ("in", [1, 2, 3])}         # id in [1, 2, 3]
+                    {"ts": ("between", (t1, t2))}     # t1 <= ts <= t2
+            parallel: Enable parallel reading.
+                - False: Sequential reading (default)
+                - True: Use all CPU cores
+                - int: Use specified number of threads
+
+        Returns:
+            List of dictionaries, each representing a record.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from .filters import parse_filter_dict, prune_files_by_bounds, to_pyarrow_filter
+
+        return self._scan_impl(
+            columns=columns,
+            filter_dict=filter,
+            parallel=parallel,
+            parse_filter_dict=parse_filter_dict,
+            prune_files_by_bounds=prune_files_by_bounds,
+            to_pyarrow_filter=to_pyarrow_filter,
+            pa=pa,
+            pq=pq,
+            ThreadPoolExecutor=ThreadPoolExecutor,
+        )
+
+    def _scan_impl(
+        self,
+        columns: Optional[List[str]],
+        filter_dict: Optional[Dict[str, Any]],
+        parallel: Union[bool, int],
+        parse_filter_dict: Any,
+        prune_files_by_bounds: Any,
+        to_pyarrow_filter: Any,
+        pa: Any,
+        pq: Any,
+        ThreadPoolExecutor: Any,
+    ) -> List[Dict[str, Any]]:
+        """Internal implementation of scan logic."""
+        # Get ALL data files from ALL snapshots for full table scan
+        # Note: current_snapshot() only returns latest snapshot's manifest,
+        # but we need files from ALL snapshots to get complete data.
+        data_files = self._get_all_data_files()
+
+        # Parse filter if provided
+        expressions = []
+        pa_filters = None
+        if filter_dict:
+            expressions = parse_filter_dict(filter_dict)
+            pa_filters = to_pyarrow_filter(expressions)
+
+        # Apply partition pruning if we have manifest data with bounds
+        if expressions and data_files:
+            schema = self._get_current_schema()
+            if schema:
+                data_files = prune_files_by_bounds(data_files, expressions, schema)
+
+        # Get file paths
+        parquet_files = self._get_parquet_files(data_files)
+
+        if not parquet_files:
+            return []
+
+        # Define file reader function
+        def read_file(file_path: str) -> Optional[pa.Table]:
+            try:
+                if pa_filters:
+                    return pq.read_table(file_path, columns=columns, filters=pa_filters)
+                else:
+                    return pq.read_table(file_path, columns=columns)
+            except Exception:
+                return None
+
+        # Read files (parallel or sequential)
+        if parallel:
+            n_workers = parallel if isinstance(parallel, int) else (os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                tables = list(executor.map(read_file, parquet_files))
+        else:
+            tables = [read_file(f) for f in parquet_files]
+
+        # Filter out None results
+        tables = [t for t in tables if t is not None]
+
+        if not tables:
+            return []
+
+        # Concatenate all tables
+        combined = pa.concat_tables(tables)
+        result: List[Dict[str, Any]] = combined.to_pylist()
+        return result
+
+    def _get_parquet_files(self, data_files: List[DataFile]) -> List[str]:
+        """Get list of parquet file paths from data files or fallback to directory listing."""
+        if data_files:
+            return [self._resolve_file_path(df.file_path) for df in data_files]
+
+        # Fallback to raw file listing if no manifest
+        data_path = os.path.join(self.table_path, "data")
+        if not os.path.exists(data_path):
+            return []
+        return [
+            os.path.join(data_path, f)
+            for f in os.listdir(data_path)
+            if f.endswith(".parquet")
+        ]
+
+    def to_pandas(
+        self,
+        columns: Optional[List[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+        parallel: Union[bool, int] = False,
+    ) -> Any:
+        """Read all data from the table as a pandas DataFrame.
+
+        This method reads all parquet files in the data directory, providing
+        a complete view of all data across all snapshots.
+
+        Args:
+            columns: Optional list of column names to read. If None, reads all columns.
+            filter: Optional filter dict for predicate pushdown.
+                Examples:
+                    {"status": "failed"}              # status == "failed"
+                    {"age": (">", 18)}                # age > 18
+                    {"id": ("in", [1, 2, 3])}         # id in [1, 2, 3]
+                    {"ts": ("between", (t1, t2))}     # t1 <= ts <= t2
+            parallel: Enable parallel reading.
+                - False: Sequential reading (default)
+                - True: Use all CPU cores
+                - int: Use specified number of threads
+
+        Returns:
+            pandas DataFrame with all records.
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise ImportError(
+                "pandas is required for to_pandas(). Install with: pip install pandas"
+            ) from e
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from .filters import parse_filter_dict, prune_files_by_bounds, to_pyarrow_filter
+
+        # Get ALL data files from ALL snapshots for full table scan
+        data_files = self._get_all_data_files()
+
+        # Parse filter if provided
+        expressions = []
+        pa_filters = None
+        if filter:
+            expressions = parse_filter_dict(filter)
+            pa_filters = to_pyarrow_filter(expressions)
+
+        # Apply partition pruning if we have manifest data with bounds
+        if expressions and data_files:
+            schema = self._get_current_schema()
+            if schema:
+                data_files = prune_files_by_bounds(data_files, expressions, schema)
+
+        # Get file paths
+        parquet_files = self._get_parquet_files(data_files)
+
+        if not parquet_files:
+            return pd.DataFrame()
+
+        # Define file reader function
+        def read_file(file_path: str) -> Optional[pa.Table]:
+            try:
+                if pa_filters:
+                    return pq.read_table(file_path, columns=columns, filters=pa_filters)
+                else:
+                    return pq.read_table(file_path, columns=columns)
+            except Exception:
+                return None
+
+        # Read files (parallel or sequential)
+        if parallel:
+            n_workers = parallel if isinstance(parallel, int) else (os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                tables = list(executor.map(read_file, parquet_files))
+        else:
+            tables = [read_file(f) for f in parquet_files]
+
+        # Filter out None results
+        tables = [t for t in tables if t is not None]
+
+        if not tables:
+            return pd.DataFrame()
+
+        # Concatenate and convert to pandas
+        combined = pa.concat_tables(tables)
+        return combined.to_pandas()
+
+    def scan_batches(
+        self,
+        batch_size: int = 10000,
+        columns: Optional[List[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """Scan data in batches for memory-efficient processing.
+
+        Yields batches of records, processing one parquet file at a time
+        using PyArrow's iter_batches for memory efficiency.
+
+        Args:
+            batch_size: Approximate number of records per batch
+            columns: Optional column projection
+            filter: Optional predicate pushdown filter
+
+        Yields:
+            List of records (dicts) per batch
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from .filters import (
+            parse_filter_dict,
+            prune_files_by_bounds,
+            to_pyarrow_compute_expression,
+        )
+
+        # Get ALL data files from ALL snapshots for full table scan
+        data_files = self._get_all_data_files()
+
+        # Parse filter
+        expressions = []
+        if filter:
+            expressions = parse_filter_dict(filter)
+
+            # Apply partition pruning
+            if data_files:
+                schema = self._get_current_schema()
+                if schema:
+                    data_files = prune_files_by_bounds(data_files, expressions, schema)
+
+        # Get file paths
+        parquet_files = self._get_parquet_files(data_files)
+
+        if not parquet_files:
+            return
+
+        # Build compute expression for filtering
+        compute_expr = to_pyarrow_compute_expression(expressions) if expressions else None
+
+        # Process files one at a time
+        yield from self._iter_file_batches(
+            parquet_files, batch_size, columns, compute_expr, pa, pq
+        )
+
+    def _iter_file_batches(
+        self,
+        parquet_files: List[str],
+        batch_size: int,
+        columns: Optional[List[str]],
+        compute_expr: Any,
+        pa: Any,
+        pq: Any,
+    ) -> Iterator[List[Dict[str, Any]]]:
+        """Iterate over batches from parquet files."""
+        for file_path in parquet_files:
+            try:
+                pf = pq.ParquetFile(file_path)
+
+                for batch in pf.iter_batches(batch_size=batch_size, columns=columns):
+                    # Convert batch to table for filtering
+                    table = pa.Table.from_batches([batch])
+
+                    # Apply filter if needed
+                    if compute_expr is not None:
+                        table = table.filter(compute_expr)
+
+                    if table.num_rows > 0:
+                        yield table.to_pylist()
+            except Exception:
+                continue
+
+    def iter_records(
+        self,
+        columns: Optional[List[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Iterate over records one at a time.
+
+        Memory efficient - only one record in memory at a time.
+        Ideal for row-by-row processing of large tables.
+
+        Args:
+            columns: Optional column projection
+            filter: Optional predicate pushdown filter
+
+        Yields:
+            Individual records as dicts
+        """
+        for batch in self.scan_batches(batch_size=1000, columns=columns, filter=filter):
+            for record in batch:
+                yield record
+
+    def iter_pandas(
+        self,
+        chunksize: int = 50000,
+        columns: Optional[List[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Any]:
+        """Iterate over data as pandas DataFrame chunks.
+
+        Memory efficient - only one chunk in memory at a time.
+        Ideal for processing large tables with pandas operations.
+
+        Args:
+            chunksize: Approximate rows per chunk
+            columns: Optional column projection
+            filter: Optional predicate pushdown filter
+
+        Yields:
+            pandas DataFrame chunks
+
+        Raises:
+            ImportError: If pandas is not installed.
+        """
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise ImportError(
+                "pandas is required for iter_pandas(). Install with: pip install pandas"
+            ) from e
+
+        for batch in self.scan_batches(batch_size=chunksize, columns=columns, filter=filter):
+            yield pd.DataFrame(batch)
+
+    def _get_all_data_files(self) -> List[DataFile]:
+        """Get ALL data files from ALL snapshots for full table scan.
+
+        This method traverses all snapshots to collect all data files,
+        which is necessary because each snapshot only references files
+        added in that specific append operation.
+
+        For performance, falls back to direct directory listing if
+        manifest traversal would be too slow (many snapshots).
+
+        Returns:
+            List of DataFile objects from all snapshots.
+        """
+        # Get all snapshots
+        all_snapshots = self.snapshot_manager.get_all_snapshots()
+
+        # If many snapshots, fall back to direct file listing (faster)
+        # Each snapshot typically has 1 manifest with 1 file, so traversing
+        # 1000+ snapshots means 2000+ JSON reads vs 1 listdir call
+        if len(all_snapshots) > 50:
+            return []  # Will fall back to _get_parquet_files directory listing
+
+        data_files: List[DataFile] = []
+        seen_paths: set = set()
+
+        for snapshot in all_snapshots:
+            try:
+                manifest_list_path = snapshot.manifest_list
+                if manifest_list_path.startswith("/"):
+                    manifest_list_path = manifest_list_path.lstrip("/")
+
+                if not self.storage.exists(manifest_list_path):
+                    continue
+
+                manifest_list = self.storage.read_json(manifest_list_path)
+
+                for manifest_ref in manifest_list.get("manifests", []):
+                    manifest_path = manifest_ref.get("manifest_path")
+                    if not manifest_path or not self.storage.exists(manifest_path):
+                        continue
+
+                    manifest = self.storage.read_json(manifest_path)
+
+                    for file_dict in manifest.get("files", []):
+                        file_path = file_dict["file_path"]
+
+                        # Skip duplicates (same file referenced by multiple snapshots)
+                        if file_path in seen_paths:
+                            continue
+                        seen_paths.add(file_path)
+
+                        # Convert bounds keys to integers
+                        lower_bounds = file_dict.get("lower_bounds")
+                        upper_bounds = file_dict.get("upper_bounds")
+
+                        if lower_bounds and isinstance(lower_bounds, dict):
+                            lower_bounds = {
+                                int(k) if isinstance(k, str) else k: v
+                                for k, v in lower_bounds.items()
+                            }
+                        if upper_bounds and isinstance(upper_bounds, dict):
+                            upper_bounds = {
+                                int(k) if isinstance(k, str) else k: v
+                                for k, v in upper_bounds.items()
+                            }
+
+                        data_files.append(DataFile(
+                            file_path=file_path,
+                            file_format=FileFormat(file_dict["file_format"]),
+                            partition_values=file_dict.get("partition_values", {}),
+                            record_count=file_dict.get("record_count", 0),
+                            file_size_in_bytes=file_dict.get("file_size_in_bytes", 0),
+                            lower_bounds=lower_bounds,
+                            upper_bounds=upper_bounds,
+                        ))
+            except Exception:
+                continue
+
+        return data_files
+
+    def _get_data_files_from_manifest(self) -> List[DataFile]:
+        """Get data files from current snapshot's manifest only.
+
+        Use this for operations that only need the latest snapshot's data.
+        For full table scan, use _get_all_data_files() instead.
+
+        Returns:
+            List of DataFile objects from the current snapshot's manifest,
+            or empty list if no snapshot exists.
+        """
+        snapshot = self.current_snapshot()
+        if not snapshot:
+            return []
+
+        try:
+            # Read manifest list
+            manifest_list_path = snapshot.manifest_list
+            if manifest_list_path.startswith("/"):
+                manifest_list_path = manifest_list_path.lstrip("/")
+
+            if not self.storage.exists(manifest_list_path):
+                return []
+
+            manifest_list = self.storage.read_json(manifest_list_path)
+
+            data_files = []
+            for manifest_ref in manifest_list.get("manifests", []):
+                manifest_path = manifest_ref.get("manifest_path")
+                if not manifest_path:
+                    continue
+
+                if not self.storage.exists(manifest_path):
+                    continue
+
+                manifest = self.storage.read_json(manifest_path)
+
+                for file_dict in manifest.get("files", []):
+                    # Convert lower_bounds/upper_bounds keys to integers if they're strings
+                    lower_bounds = file_dict.get("lower_bounds")
+                    upper_bounds = file_dict.get("upper_bounds")
+
+                    if lower_bounds and isinstance(lower_bounds, dict):
+                        lower_bounds = {
+                            int(k) if isinstance(k, str) else k: v
+                            for k, v in lower_bounds.items()
+                        }
+                    if upper_bounds and isinstance(upper_bounds, dict):
+                        upper_bounds = {
+                            int(k) if isinstance(k, str) else k: v
+                            for k, v in upper_bounds.items()
+                        }
+
+                    data_file = DataFile(
+                        file_path=file_dict["file_path"],
+                        file_format=FileFormat(file_dict["file_format"]),
+                        partition_values=file_dict.get("partition_values", {}),
+                        record_count=file_dict.get("record_count", 0),
+                        file_size_in_bytes=file_dict.get("file_size_in_bytes", 0),
+                        lower_bounds=lower_bounds,
+                        upper_bounds=upper_bounds,
+                    )
+                    data_files.append(data_file)
+
+            return data_files
+        except Exception:
+            return []
+
+    def _get_current_schema(self) -> Optional[Schema]:
+        """Get the current schema from metadata.
+
+        Returns:
+            Current Schema object, or None if not available.
+        """
+        try:
+            metadata = self.metadata_manager.refresh()
+            if metadata and metadata.schemas:
+                # Find current schema by ID
+                for schema in metadata.schemas:
+                    if schema.schema_id == metadata.current_schema_id:
+                        return schema
+                # Fallback to first schema
+                return metadata.schemas[0]
+        except Exception:
+            pass
+        return None
+
+    def _resolve_file_path(self, file_path: str) -> str:
+        """Resolve a file path to absolute path.
+
+        Handles Iceberg-style paths that start with '/' (relative to table).
+
+        Args:
+            file_path: File path (possibly Iceberg-style starting with '/')
+
+        Returns:
+            Absolute file path
+        """
+        if file_path.startswith("/"):
+            # Iceberg-style path relative to table location
+            return os.path.join(self.table_path, file_path.lstrip("/"))
+        else:
+            # Already relative or absolute
+            if os.path.isabs(file_path):
+                return file_path
+            return os.path.join(self.table_path, file_path)
