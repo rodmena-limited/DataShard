@@ -185,7 +185,7 @@ class DataFileWriter:
                 self._writer = pq.ParquetWriter(
                     self.file_path,
                     modified_schema,
-                    compression="snappy",
+                    compression="lz4",
                     filesystem=self._filesystem,
                 )
             else:
@@ -197,7 +197,7 @@ class DataFileWriter:
                     delete=False, dir=temp_dir, suffix=".parquet"
                 )
                 self._writer = pq.ParquetWriter(
-                    self._temp_file.name, modified_schema, compression="snappy"
+                    self._temp_file.name, modified_schema, compression="lz4"
                 )
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
