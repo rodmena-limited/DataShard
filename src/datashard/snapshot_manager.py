@@ -55,8 +55,9 @@ class SnapshotManager:
             raise ValueError("Cannot create snapshot: no current metadata")
 
         # Generate a new snapshot ID using UUID to prevent collisions
-        # Use upper 64 bits of UUID4 to get a random positive integer
-        snapshot_id = int(uuid.uuid4().int >> 64)
+        # Ensure it fits in signed 64-bit integer (Java/Avro long compatibility)
+        # Use 63 bits to guarantee positive signed long
+        snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
 
         # Create new snapshot
         snapshot = Snapshot(

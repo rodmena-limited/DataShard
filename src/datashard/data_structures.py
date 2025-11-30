@@ -21,8 +21,8 @@ class FileFormat(Enum):
 class ManifestContent(Enum):
     """Type of content in manifest files"""
 
-    DATA = "data"
-    DELETES = "deletes"
+    DATA = 0
+    DELETES = 1
 
 
 @dataclass

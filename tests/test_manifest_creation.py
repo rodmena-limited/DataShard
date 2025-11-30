@@ -5,13 +5,15 @@ Tests that manifest lists are properly created with data files when appending re
 and that queries return the written data.
 """
 
-import json
 import os
+import time
+import json
 import tempfile
+from typing import Any, Dict
 
+import fastavro
 import pytest
-
-from datashard import Schema, create_table
+from datashard import Schema, create_table, load_table
 
 
 def test_append_records_creates_non_empty_manifests():
@@ -52,12 +54,13 @@ def test_append_records_creates_non_empty_manifests():
 
         # Read manifest list file
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
-        assert os.path.exists(
-            manifest_list_path
-        ), f"Manifest list file should exist at {manifest_list_path}"
-
-        with open(manifest_list_path, "r") as f:
-            manifest_list_data = json.load(f)
+        with open(manifest_list_path, "rb") as f:
+            # Read Avro manifest list
+            reader = fastavro.reader(f)
+            # Convert iterator to list of dicts to match JSON structure expectation in test
+            manifests = list(reader)
+            # Synthesize the structure expected by the test (which expects {'manifests': [...]})
+            manifest_list_data = {"manifests": manifests}
 
         # BUG FIX VALIDATION: manifests array should NOT be empty
         assert "manifests" in manifest_list_data, "Manifest list should have 'manifests' key"
@@ -147,8 +150,10 @@ def test_multiple_appends_create_multiple_manifests():
 
         # Read manifest list
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
-        with open(manifest_list_path, "r") as f:
-            manifest_list_data = json.load(f)
+        with open(manifest_list_path, "rb") as f:
+            reader = fastavro.reader(f)
+            manifests = list(reader)
+            manifest_list_data = {"manifests": manifests}
 
         # Should have manifests from the append
         assert (
@@ -185,8 +190,10 @@ def test_concurrent_appends_create_valid_manifests():
         assert snapshot is not None
 
         manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
-        with open(manifest_list_path, "r") as f:
-            manifest_list_data = json.load(f)
+        with open(manifest_list_path, "rb") as f:
+            reader = fastavro.reader(f)
+            manifests = list(reader)
+            manifest_list_data = {"manifests": manifests}
 
         # Final snapshot should have manifests
         assert (
@@ -213,8 +220,10 @@ def test_empty_append_creates_empty_manifest():
         if snapshot is not None and snapshot.manifest_list:
             manifest_list_path = os.path.join(table_path, snapshot.manifest_list)
             if os.path.exists(manifest_list_path):
-                with open(manifest_list_path, "r") as f:
-                    manifest_list_data = json.load(f)
+                with open(manifest_list_path, "rb") as f:
+                    reader = fastavro.reader(f)
+                    manifests = list(reader)
+                    manifest_list_data = {"manifests": manifests}
 
                 # Empty append should have empty manifests (this is correct behavior)
                 assert "manifests" in manifest_list_data

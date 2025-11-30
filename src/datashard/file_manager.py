@@ -5,8 +5,12 @@ Supports both local filesystem and S3-compatible storage via StorageBackend abst
 """
 
 from datetime import datetime
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+import fastavro
+
+from .avro_schemas import MANIFEST_ENTRY_SCHEMA, MANIFEST_FILE_SCHEMA
 from .data_operations import DataFileManager
 from .data_structures import DataFile, FileFormat, ManifestContent, ManifestFile
 from .metadata_manager import MetadataManager
@@ -84,90 +88,146 @@ class FileManager:
         timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
         manifest_filename = f"manifest_{timestamp}.avro"
         manifest_path = f"{self.manifests_path}/{manifest_filename}"
+        
+        snapshot_id_val = snapshot_id or int(datetime.now().timestamp() * 1000)
 
-        # Create manifest content
-        manifest_data = {
-            "manifest_path": manifest_path,
-            "manifest_length": 0,  # Will calculate after writing
-            "partition_spec_id": 0,  # Default partition spec
-            "added_snapshot_id": snapshot_id or int(datetime.now().timestamp() * 1000),
-            "added_data_files_count": len(data_files),
-            "existing_data_files_count": 0,
-            "deleted_data_files_count": 0,
-            "partitions": [],  # This would be populated based on actual partitions
-            "content": manifest_content.value,
-            "sequence_number": timestamp,
-            "min_sequence_number": timestamp,
-            "files": [
-                {
+        # Prepare records for Avro
+        records = []
+        for df in data_files:
+            # Flatten structure to match schema
+            # content is passed as argument manifest_content, which is Enum
+            
+            record = {
+                "status": 1, # 1 = ADDED
+                "snapshot_id": snapshot_id_val,
+                "sequence_number": None,
+                "file_sequence_number": None,
+                "data_file": {
                     "file_path": df.file_path,
-                    "file_format": df.file_format.value,
-                    "partition_values": df.partition_values,
+                    "file_format": df.file_format.value if hasattr(df.file_format, 'value') else str(df.file_format),
+                    "partition": {"values": {k: str(v) for k, v in df.partition_values.items()}},
                     "record_count": df.record_count,
                     "file_size_in_bytes": df.file_size_in_bytes,
                     "column_sizes": df.column_sizes,
                     "value_counts": df.value_counts,
                     "null_value_counts": df.null_value_counts,
-                    "lower_bounds": df.lower_bounds,
-                    "upper_bounds": df.upper_bounds,
+                    # Convert bounds to simple map if present, complex handling skipped for now
+                    "lower_bounds": {str(k): str(v) for k, v in df.lower_bounds.items()} if df.lower_bounds else None,
+                    "upper_bounds": {str(k): str(v) for k, v in df.upper_bounds.items()} if df.upper_bounds else None,
                 }
-                for df in data_files
-            ],
-        }
+            }
+            records.append(record)
 
-        # Write the manifest file using storage backend
-        self.storage.write_json(manifest_path, manifest_data)
+        # Write Avro to BytesIO
+        bytes_io = BytesIO()
+        fastavro.writer(bytes_io, MANIFEST_ENTRY_SCHEMA, records)
+        content = bytes_io.getvalue()
 
-        # Calculate actual file size
-        manifest_length = self.storage.get_size(manifest_path)
-        manifest_data["manifest_length"] = manifest_length
+        # Write using storage backend
+        self.storage.write_file(manifest_path, content)
 
-        # Update the file with correct length
-        self.storage.write_json(manifest_path, manifest_data)
+        # Get actual size
+        manifest_length = len(content)
 
-        # Return the manifest file structure using safe integer conversions
+        # Return the manifest file structure
         return ManifestFile(
             manifest_path=manifest_path,
-            manifest_length=self._safe_int(manifest_data["manifest_length"]),
-            partition_spec_id=self._safe_int(manifest_data["partition_spec_id"]),
-            added_snapshot_id=self._safe_int(manifest_data["added_snapshot_id"], 0),
-            added_data_files_count=self._safe_int(manifest_data["added_data_files_count"]),
-            existing_data_files_count=self._safe_int(manifest_data["existing_data_files_count"]),
-            deleted_data_files_count=self._safe_int(manifest_data["deleted_data_files_count"]),
-            partitions=(
-                manifest_data["partitions"]
-                if isinstance(manifest_data["partitions"], list)
-                else []
-            ),
-            content=ManifestContent(manifest_data["content"]),
-            sequence_number=self._safe_int(manifest_data.get("sequence_number"), 0) or None,
-            min_sequence_number=self._safe_int(manifest_data.get("min_sequence_number"), 0) or None,
+            manifest_length=manifest_length,
+            partition_spec_id=0,
+            added_snapshot_id=snapshot_id_val,
+            added_data_files_count=len(data_files),
+            existing_data_files_count=0,
+            deleted_data_files_count=0,
+            partitions=[],
+            content=manifest_content,
+            sequence_number=None,
+            min_sequence_number=None,
         )
+
+    def _infer_value(self, value: Any) -> Any:
+        """Best-effort type inference for bound values stored as strings"""
+        if not isinstance(value, str):
+            return value
+        if value.isdigit():
+            return int(value)
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        if value.lower() == 'true':
+            return True
+        if value.lower() == 'false':
+            return False
+        return value
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
         """Read and parse a manifest file to get data files"""
         if not self.storage.exists(manifest_path):
             raise FileNotFoundError(f"Manifest file does not exist: {manifest_path}")
 
-        manifest_data = self.storage.read_json(manifest_path)
+        # Read raw bytes
+        content = self.storage.read_file(manifest_path)
+        
+        try:
+            # Try reading as Avro
+            bytes_io = BytesIO(content)
+            reader = fastavro.reader(bytes_io)
+            
+            data_files = []
+            for record in reader:
+                # Extract data_file field
+                df_record = record["data_file"]
+                
+                # Parse bounds: convert keys to int, infer value types
+                lower_bounds = df_record.get("lower_bounds")
+                if lower_bounds:
+                    lower_bounds = {int(k): self._infer_value(v) for k, v in lower_bounds.items()}
+                    
+                upper_bounds = df_record.get("upper_bounds")
+                if upper_bounds:
+                    upper_bounds = {int(k): self._infer_value(v) for k, v in upper_bounds.items()}
 
-        data_files = []
-        for file_entry in manifest_data.get("files", []):
-            data_file = DataFile(
-                file_path=file_entry["file_path"],
-                file_format=FileFormat(file_entry["file_format"]),
-                partition_values=file_entry["partition_values"],
-                record_count=file_entry["record_count"],
-                file_size_in_bytes=file_entry["file_size_in_bytes"],
-                column_sizes=file_entry.get("column_sizes"),
-                value_counts=file_entry.get("value_counts"),
-                null_value_counts=file_entry.get("null_value_counts"),
-                lower_bounds=file_entry.get("lower_bounds"),
-                upper_bounds=file_entry.get("upper_bounds"),
-            )
-            data_files.append(data_file)
-
-        return data_files
+                data_file = DataFile(
+                    file_path=df_record["file_path"],
+                    file_format=FileFormat(df_record["file_format"]),
+                    partition_values=df_record["partition"]["values"],
+                    record_count=df_record["record_count"],
+                    file_size_in_bytes=df_record["file_size_in_bytes"],
+                    column_sizes=df_record.get("column_sizes"),
+                    value_counts=df_record.get("value_counts"),
+                    null_value_counts=df_record.get("null_value_counts"),
+                    lower_bounds=lower_bounds,
+                    upper_bounds=upper_bounds,
+                )
+                data_files.append(data_file)
+            return data_files
+            
+        except (ValueError, IndexError, StopIteration):
+            # Fallback: Try reading as JSON (backward compatibility for older files)
+            # If Avro read failed, it might be the old JSON format
+            import json
+            try:
+                manifest_data = json.loads(content.decode("utf-8"))
+                
+                data_files = []
+                for file_entry in manifest_data.get("files", []):
+                    data_file = DataFile(
+                        file_path=file_entry["file_path"],
+                        file_format=FileFormat(file_entry["file_format"]),
+                        partition_values=file_entry["partition_values"],
+                        record_count=file_entry["record_count"],
+                        file_size_in_bytes=file_entry["file_size_in_bytes"],
+                        column_sizes=file_entry.get("column_sizes"),
+                        value_counts=file_entry.get("value_counts"),
+                        null_value_counts=file_entry.get("null_value_counts"),
+                        lower_bounds=file_entry.get("lower_bounds"),
+                        upper_bounds=file_entry.get("upper_bounds"),
+                    )
+                    data_files.append(data_file)
+                return data_files
+            except Exception:
+                # If JSON also fails, raise original error or generic error
+                raise ValueError(f"Could not parse manifest file {manifest_path} (tried Avro and JSON)")
 
     def create_manifest_list_file(
         self, manifest_files: List[ManifestFile], snapshot_id: int
@@ -177,27 +237,34 @@ class FileManager:
         list_filename = f"manifest_list_{snapshot_id}_{timestamp}.avro"
         list_path = f"{self.manifests_path}/{list_filename}"
 
-        # Create manifest list content
-        list_data = {
-            "snapshot_id": snapshot_id,
-            "timestamp_ms": timestamp,
-            "manifests": [
-                {
-                    "manifest_path": mf.manifest_path,
-                    "manifest_length": mf.manifest_length,
-                    "partition_spec_id": mf.partition_spec_id,
-                    "added_snapshot_id": mf.added_snapshot_id,
-                    "content": mf.content.value,
-                    "added_data_files_count": mf.added_data_files_count,
-                    "existing_data_files_count": mf.existing_data_files_count,
-                    "deleted_data_files_count": mf.deleted_data_files_count,
-                }
-                for mf in manifest_files
-            ],
-        }
+        # Prepare records for Avro
+        records = []
+        for mf in manifest_files:
+            # Ensure content is an integer (handle Enum)
+            content_val = mf.content.value if hasattr(mf.content, 'value') else int(mf.content)
+            
+            record = {
+                "manifest_path": mf.manifest_path,
+                "manifest_length": mf.manifest_length,
+                "partition_spec_id": mf.partition_spec_id,
+                "content": content_val,
+                "sequence_number": mf.sequence_number or 0,
+                "min_sequence_number": mf.min_sequence_number or 0,
+                "added_snapshot_id": mf.added_snapshot_id,
+                "added_data_files_count": mf.added_data_files_count,
+                "existing_data_files_count": mf.existing_data_files_count,
+                "deleted_data_files_count": mf.deleted_data_files_count,
+                "partitions": [] # Simplified
+            }
+            records.append(record)
 
-        # Write the manifest list file using storage backend
-        self.storage.write_json(list_path, list_data)
+        # Write Avro to BytesIO
+        bytes_io = BytesIO()
+        fastavro.writer(bytes_io, MANIFEST_FILE_SCHEMA, records)
+        content = bytes_io.getvalue()
+
+        # Write using storage backend
+        self.storage.write_file(list_path, content)
 
         return list_path
 
@@ -206,24 +273,55 @@ class FileManager:
         if not self.storage.exists(list_path):
             raise FileNotFoundError(f"Manifest list file does not exist: {list_path}")
 
-        list_data = self.storage.read_json(list_path)
-
-        manifest_files = []
-        for manifest_entry in list_data.get("manifests", []):
-            manifest_file = ManifestFile(
-                manifest_path=manifest_entry["manifest_path"],
-                manifest_length=manifest_entry["manifest_length"],
-                partition_spec_id=manifest_entry["partition_spec_id"],
-                added_snapshot_id=manifest_entry["added_snapshot_id"],
-                added_data_files_count=manifest_entry["added_data_files_count"],
-                existing_data_files_count=manifest_entry["existing_data_files_count"],
-                deleted_data_files_count=manifest_entry["deleted_data_files_count"],
-                partitions=[],  # Would be populated from the manifest file itself
-                content=ManifestContent(manifest_entry["content"]),
-            )
-            manifest_files.append(manifest_file)
-
-        return manifest_files
+        # Read raw bytes
+        content = self.storage.read_file(list_path)
+        
+        try:
+            # Try reading as Avro
+            bytes_io = BytesIO(content)
+            reader = fastavro.reader(bytes_io)
+            
+            manifest_files = []
+            for record in reader:
+                manifest_file = ManifestFile(
+                    manifest_path=record["manifest_path"],
+                    manifest_length=record["manifest_length"],
+                    partition_spec_id=record["partition_spec_id"],
+                    added_snapshot_id=record["added_snapshot_id"],
+                    added_data_files_count=record["added_data_files_count"],
+                    existing_data_files_count=record["existing_data_files_count"],
+                    deleted_data_files_count=record["deleted_data_files_count"],
+                    partitions=[], 
+                    content=ManifestContent(record["content"]),
+                    sequence_number=record.get("sequence_number"),
+                    min_sequence_number=record.get("min_sequence_number")
+                )
+                manifest_files.append(manifest_file)
+            return manifest_files
+            
+        except (ValueError, IndexError, StopIteration):
+            # Fallback: JSON
+            import json
+            try:
+                list_data = json.loads(content.decode("utf-8"))
+                
+                manifest_files = []
+                for manifest_entry in list_data.get("manifests", []):
+                    manifest_file = ManifestFile(
+                        manifest_path=manifest_entry["manifest_path"],
+                        manifest_length=manifest_entry["manifest_length"],
+                        partition_spec_id=manifest_entry["partition_spec_id"],
+                        added_snapshot_id=manifest_entry["added_snapshot_id"],
+                        added_data_files_count=manifest_entry["added_data_files_count"],
+                        existing_data_files_count=manifest_entry["existing_data_files_count"],
+                        deleted_data_files_count=manifest_entry["deleted_data_files_count"],
+                        partitions=[],  # Would be populated from the manifest file itself
+                        content=ManifestContent(manifest_entry["content"]),
+                    )
+                    manifest_files.append(manifest_file)
+                return manifest_files
+            except Exception:
+                raise ValueError(f"Could not parse manifest list file {list_path}")
 
     def cleanup_orphaned_files(self, valid_file_paths: List[str]) -> int:
         """Clean up data files that are no longer referenced by any manifest"""

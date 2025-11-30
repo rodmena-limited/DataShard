@@ -193,7 +193,8 @@ class Transaction:
 
                     # Generate a unique snapshot ID using UUID to prevent collisions
                     # CRITICAL FIX: Timestamp-based IDs could collide with concurrent transactions
-                    snapshot_id = int(uuid.uuid4().int >> 64)
+                    # Ensure it fits in signed 64-bit integer (Java/Avro long compatibility)
+                    snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
 
                     # Extract data files from append_files operations
                     data_files = []
@@ -919,47 +920,26 @@ class Table:
                 if not self.storage.exists(manifest_list_path):
                     continue
 
-                manifest_list = self.storage.read_json(manifest_list_path)
+                # Use FileManager to read manifest list (supports Avro)
+                manifest_files = self.file_manager.read_manifest_list_file(manifest_list_path)
 
-                for manifest_ref in manifest_list.get("manifests", []):
-                    manifest_path = manifest_ref.get("manifest_path")
+                for manifest_ref in manifest_files:
+                    manifest_path = manifest_ref.manifest_path
                     if not manifest_path or not self.storage.exists(manifest_path):
                         continue
 
-                    manifest = self.storage.read_json(manifest_path)
+                    # Use FileManager to read manifest file (supports Avro)
+                    manifest_data_files = self.file_manager.read_manifest_file(manifest_path)
 
-                    for file_dict in manifest.get("files", []):
-                        file_path = file_dict["file_path"]
+                    for data_file in manifest_data_files:
+                        file_path = data_file.file_path
 
                         # Skip duplicates (same file referenced by multiple snapshots)
                         if file_path in seen_paths:
                             continue
                         seen_paths.add(file_path)
 
-                        # Convert bounds keys to integers
-                        lower_bounds = file_dict.get("lower_bounds")
-                        upper_bounds = file_dict.get("upper_bounds")
-
-                        if lower_bounds and isinstance(lower_bounds, dict):
-                            lower_bounds = {
-                                int(k) if isinstance(k, str) else k: v
-                                for k, v in lower_bounds.items()
-                            }
-                        if upper_bounds and isinstance(upper_bounds, dict):
-                            upper_bounds = {
-                                int(k) if isinstance(k, str) else k: v
-                                for k, v in upper_bounds.items()
-                            }
-
-                        data_files.append(DataFile(
-                            file_path=file_path,
-                            file_format=FileFormat(file_dict["file_format"]),
-                            partition_values=file_dict.get("partition_values", {}),
-                            record_count=file_dict.get("record_count", 0),
-                            file_size_in_bytes=file_dict.get("file_size_in_bytes", 0),
-                            lower_bounds=lower_bounds,
-                            upper_bounds=upper_bounds,
-                        ))
+                        data_files.append(data_file)
             except Exception:
                 continue
 
@@ -988,45 +968,21 @@ class Table:
             if not self.storage.exists(manifest_list_path):
                 return []
 
-            manifest_list = self.storage.read_json(manifest_list_path)
+            # Use FileManager to read manifest list (supports Avro)
+            manifest_files = self.file_manager.read_manifest_list_file(manifest_list_path)
 
             data_files = []
-            for manifest_ref in manifest_list.get("manifests", []):
-                manifest_path = manifest_ref.get("manifest_path")
+            for manifest_ref in manifest_files:
+                manifest_path = manifest_ref.manifest_path
                 if not manifest_path:
                     continue
 
                 if not self.storage.exists(manifest_path):
                     continue
 
-                manifest = self.storage.read_json(manifest_path)
-
-                for file_dict in manifest.get("files", []):
-                    # Convert lower_bounds/upper_bounds keys to integers if they're strings
-                    lower_bounds = file_dict.get("lower_bounds")
-                    upper_bounds = file_dict.get("upper_bounds")
-
-                    if lower_bounds and isinstance(lower_bounds, dict):
-                        lower_bounds = {
-                            int(k) if isinstance(k, str) else k: v
-                            for k, v in lower_bounds.items()
-                        }
-                    if upper_bounds and isinstance(upper_bounds, dict):
-                        upper_bounds = {
-                            int(k) if isinstance(k, str) else k: v
-                            for k, v in upper_bounds.items()
-                        }
-
-                    data_file = DataFile(
-                        file_path=file_dict["file_path"],
-                        file_format=FileFormat(file_dict["file_format"]),
-                        partition_values=file_dict.get("partition_values", {}),
-                        record_count=file_dict.get("record_count", 0),
-                        file_size_in_bytes=file_dict.get("file_size_in_bytes", 0),
-                        lower_bounds=lower_bounds,
-                        upper_bounds=upper_bounds,
-                    )
-                    data_files.append(data_file)
+                # Use FileManager to read manifest file (supports Avro)
+                manifest_data_files = self.file_manager.read_manifest_file(manifest_path)
+                data_files.extend(manifest_data_files)
 
             return data_files
         except Exception:

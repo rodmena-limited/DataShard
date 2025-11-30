@@ -5,6 +5,33 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2025-11-30
+
+### Breaking Changes ⚠️
+
+- **Manifest Format Migration (JSON to Avro)**
+  - Manifest and manifest list files are now written in Avro format using `fastavro` instead of JSON.
+  - This aligns with the Apache Iceberg specification and improves I/O performance and storage efficiency.
+  - **Backward Compatibility:** The reader includes a fallback mechanism to read legacy JSON manifests, so existing tables remain accessible. However, all new writes will generate Avro files.
+- **New Dependency:** Added `fastavro>=1.4.0` to requirements.
+
+### Added
+
+- **S3-Native Distributed Locking** 🔒
+  - Replaced the unsafe local `FileLock` for S3 tables with a robust S3-native locking mechanism using conditional writes (`If-None-Match`).
+  - Ensures safe concurrent writes in distributed environments (AWS Lambda, Kubernetes, EC2) without external dependencies like DynamoDB.
+  - Introduced `LockProvider` abstraction (`LocalLockProvider`, `S3LockProvider`) in `src/datashard/lock_provider.py`.
+
+- **Metadata Compaction / Snapshot Pruning** 🧹
+  - Implemented automatic pruning of old snapshots from `metadata.json` to prevent $O(N)$ file size growth.
+  - New table property `write.metadata.previous-versions-max` controls retention (default: 100 snapshots).
+  - Solves the scalability bottleneck where commit times increased linearly with table history.
+
+### Fixed
+
+- **Snapshot ID Overflow:** Fixed an issue where generated Snapshot IDs could exceed Avro's signed 64-bit integer limit.
+- **S3 Concurrency Safety:** Fixed a critical race condition where distributed workers could overwrite each other's commits on S3 due to reliance on local filesystem locks.
+
 ## [0.3.3] - 2025-11-27
 
 ### Added
