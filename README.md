@@ -562,9 +562,10 @@ schema = Schema(
 DataShard implements:
 - Optimistic Concurrency Control (OCC) with automatic retry
 - Snapshot isolation for consistent reads
-- Manifest-based metadata tracking (Iceberg's approach)
+- Manifest-based metadata tracking (Iceberg's approach) using Avro
 - Parquet format for efficient columnar storage
 - ACID transaction semantics
+- S3-native distributed locking for cloud storage
 
 ---
 
@@ -574,7 +575,7 @@ DataShard implements:
 - **Reads:** O(n) where n = number of data files in snapshot
 - **Concurrency:** Scales linearly with number of processes
 - **Storage:** Efficient columnar compression with Parquet
-- **Metadata:** Lightweight JSON-based manifest tracking
+- **Metadata:** Efficient Avro-based manifest tracking
 
 ---
 

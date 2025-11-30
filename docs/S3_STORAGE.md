@@ -32,8 +32,9 @@ S3-compatible storage backends implement the Amazon S3 API, allowing DataShard t
 DataShard uses a dual-API approach for S3 storage:
 
 1. **Metadata Layer** (boto3 S3 client)
-   - JSON metadata files
-   - Manifest files
+   - JSON metadata files (table metadata)
+   - Avro manifest files
+   
    - Version hints
    - Fast small-file operations
 

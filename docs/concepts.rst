@@ -66,7 +66,7 @@ While Apache Iceberg is a specification implemented in Java for use with Spark, 
 2. **Same Concurrency Model**: Implements Optimistic Concurrency Control (OCC)
 3. **Same Time Travel**: Provides the ability to examine historical data states
 4. **Same Schema Evolution**: Supports adding, removing, and changing columns
-5. **Same File Organization**: Uses similar manifest and metadata file structures
+5. **Same File Organization**: Uses similar manifest (Avro) and metadata (JSON) file structures
 
 Benefits of datashard
 ---------------------

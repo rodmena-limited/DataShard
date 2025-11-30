@@ -219,8 +219,9 @@ Architecture
 DataShard uses a dual-API approach for S3:
 
 **Metadata Layer** (boto3):
-  - JSON metadata files
-  - Manifest files
+  - JSON metadata files (table metadata)
+  - Avro manifest files
+  
   - Version hints
   - Fast small-file operations
 
