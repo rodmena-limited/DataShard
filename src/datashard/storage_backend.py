@@ -21,11 +21,14 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .disk_utils import check_disk_space, estimate_write_size
 from .integrity import IntegrityChecker
 from .logging_config import get_logger
+
+if TYPE_CHECKING:
+    from .lock_provider import LockProvider
 
 logger = get_logger(__name__)
 
@@ -84,6 +87,11 @@ class StorageBackend(ABC):
     @abstractmethod
     def get_size(self, path: str) -> int:
         """Get file size in bytes"""
+        pass
+
+    @abstractmethod
+    def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
+        """Create a distributed lock for the given path"""
         pass
 
 
@@ -231,6 +239,11 @@ class LocalStorageBackend(StorageBackend):
     def get_size(self, path: str) -> int:
         full_path = self._resolve_path(path)
         return os.path.getsize(full_path)
+
+    def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
+        from .lock_provider import LocalLockProvider
+        full_path = self._resolve_path(path)
+        return LocalLockProvider(full_path, timeout)
 
 
 class S3StorageBackend(StorageBackend):
@@ -403,6 +416,11 @@ class S3StorageBackend(StorageBackend):
             if e.response["Error"]["Code"] == "404":
                 raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
             raise
+
+    def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
+        from .lock_provider import S3LockProvider
+        key = self._get_s3_key(path)
+        return S3LockProvider(self.s3, self.bucket, key, timeout)
 
 
 def create_storage_backend(table_path: str) -> StorageBackend:

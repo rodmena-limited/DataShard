@@ -8,7 +8,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
-from .file_lock import FileLock
 
 if TYPE_CHECKING:
     from .storage_backend import StorageBackend
@@ -30,13 +29,9 @@ class MetadataManager:
         self.current_version = 0
         self._lock = threading.RLock()  # For thread safety
 
-        # File-based lock for multi-process safety
-        # PHASE 2: Added file-based locking for true multi-process synchronization
-        lock_dir = os.path.join(
-            getattr(storage, "base_path", table_path), ".locks"
-        )
-        os.makedirs(lock_dir, exist_ok=True)
-        self._file_lock_path = os.path.join(lock_dir, "metadata.lock")
+        # Distributed lock for multi-process/multi-host safety
+        # PHASE 2: Added distributed locking (FileLock for local, S3 Lock for cloud)
+        self.lock_provider = self.storage.create_lock(".locks/metadata.lock", timeout=30.0)
 
         # Ensure metadata directory exists
         self.storage.makedirs(self.metadata_path, exist_ok=True)
@@ -83,9 +78,8 @@ class MetadataManager:
         - PHASE 2: Use file-based locking for multi-process safety
         - Write metadata file BEFORE updating version hint (two-phase commit)
         """
-        # PHASE 2: Acquire file-based lock for multi-process safety
-        file_lock = FileLock(self._file_lock_path, timeout=30.0)
-        file_lock.acquire()
+        # PHASE 2: Acquire distributed lock for multi-process safety
+        self.lock_provider.acquire()
 
         try:
             # Acquire thread lock for thread safety within same process
@@ -137,8 +131,8 @@ class MetadataManager:
 
                 return new_metadata
         finally:
-            # PHASE 2: Always release file lock
-            file_lock.release()
+            # PHASE 2: Always release lock
+            self.lock_provider.release()
 
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """Get a specific snapshot by ID"""
