@@ -80,10 +80,49 @@ class Transaction:
 
         return self
 
+    def append_pandas(
+        self,
+        df: Any,
+        schema: Optional["Schema"] = None,
+    ) -> "Transaction":
+        """Append a pandas DataFrame to the table.
+        
+        Args:
+            df: pandas DataFrame to append
+            schema: Optional Schema. If None, uses the table's current schema.
+            
+        Returns:
+            Self for chaining
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            raise ImportError("pandas is required for append_pandas")
+            
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("Expected a pandas DataFrame")
+            
+        if schema is None:
+            # Try to get current schema from metadata
+            metadata = self.metadata_manager.refresh()
+            if metadata and metadata.schemas:
+                # Find current schema
+                current_schema_id = metadata.current_schema_id
+                for s in metadata.schemas:
+                    if s.schema_id == current_schema_id:
+                        schema = s
+                        break
+        
+        if schema is None:
+            raise ValueError("Schema must be provided or table must have an existing schema")
+            
+        records = df.to_dict("records")
+        return self.append_data(records, schema)
+
     def append_data(
         self,
         records: List[Dict[str, Any]],
-        schema: "Schema",
+        schema: Optional["Schema"] = None,
         partition_values: Optional[Dict[str, Any]] = None,
     ) -> "Transaction":
         """Append actual data records to the table by creating new data files.
@@ -92,6 +131,20 @@ class Transaction:
         """
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
+
+        if schema is None:
+            # Try to get current schema from metadata
+            metadata = self.metadata_manager.refresh()
+            if metadata and metadata.schemas:
+                # Find current schema
+                current_schema_id = metadata.current_schema_id
+                for s in metadata.schemas:
+                    if s.schema_id == current_schema_id:
+                        schema = s
+                        break
+        
+        if schema is None:
+            raise ValueError("Schema must be provided or table must have an existing schema")
 
         # Create a data file with the records using UUID for uniqueness
         file_id = uuid.uuid4().hex[:16]  # Use 16 chars of UUID hex
@@ -513,10 +566,21 @@ class Table:
             result = tx.commit()
             return bool(result)
 
+    def append_pandas(
+        self,
+        df: Any,
+        schema: Optional["Schema"] = None,
+    ) -> bool:
+        """Append pandas DataFrame to table (convenience method)"""
+        with self.new_transaction() as tx:
+            tx.append_pandas(df, schema)
+            result = tx.commit()
+            return bool(result)
+
     def append_records(
         self,
         records: List[Dict[str, Any]],
-        schema: "Schema",
+        schema: Optional["Schema"] = None,
         partition_values: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Append actual data records to the table by creating new data files (convenience method)"""

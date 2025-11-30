@@ -22,10 +22,20 @@ pip install datashard[pandas]
 Here's a quick tutorial to get you started with datashard:
 
 ```python
-from datashard import create_table
+from datashard import create_table, Schema
+
+# Define schema
+schema = Schema(
+    schema_id=1,
+    fields=[
+        {"id": 1, "name": "id", "type": "long", "required": True},
+        {"id": 2, "name": "name", "type": "string", "required": True},
+        {"id": 3, "name": "age", "type": "int", "required": True},
+    ]
+)
 
 # Create a new table
-table = create_table("/path/to/your/data/table")
+table = create_table("/path/to/your/data/table", schema)
 
 # Add data to your table
 data = [
@@ -52,10 +62,20 @@ datashard provides excellent pandas integration:
 
 ```python
 import pandas as pd
-from datashard import create_table
+from datashard import create_table, Schema
+
+# Define schema
+schema = Schema(
+    schema_id=1,
+    fields=[
+        {"id": 1, "name": "id", "type": "long", "required": True},
+        {"id": 2, "name": "name", "type": "string", "required": True},
+        {"id": 3, "name": "value", "type": "int", "required": True},
+    ]
+)
 
 # Create table
-table = create_table("/path/to/pandas_table")
+table = create_table("/path/to/pandas_table", schema)
 
 # Create a pandas DataFrame
 df = pd.DataFrame({
@@ -65,12 +85,10 @@ df = pd.DataFrame({
 })
 
 # Append pandas DataFrame to table
-with table.new_transaction() as tx:
-    # Assuming you have methods that handle pandas integration
-    tx.commit()
+table.append_pandas(df)
 
 # Read data back as DataFrame
-result_df = table.read_latest_snapshot_pandas()
+result_df = table.to_pandas()
 print(f"Retrieved {len(result_df)} records as DataFrame")
 ```
 
@@ -87,9 +105,18 @@ pip install datashard[pandas]
 Use pandas DataFrames directly with Iceberg tables:
 ```python
 import pandas as pd
-from datashard import create_table
+from datashard import create_table, Schema
 
-table = create_table("/path/to/your/table")
+# Define schema
+schema = Schema(
+    schema_id=1,
+    fields=[
+        {"id": 1, "name": "id", "type": "long", "required": True},
+        {"id": 2, "name": "name", "type": "string", "required": True},
+    ]
+)
+
+table = create_table("/path/to/your/table", schema)
 
 # Write pandas DataFrame to Iceberg table
 df = pd.DataFrame({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"]})
@@ -98,10 +125,10 @@ with table.new_transaction() as tx:
     tx.commit()
 
 # Read data back as pandas DataFrame  
-result_df = table.read_latest_snapshot_pandas()
+result_df = table.to_pandas()
 
 # Read specific columns
-subset_df = table.read_columns_pandas(["id", "name"])
+subset_df = table.to_pandas(columns=["id", "name"])
 ```
 
 ## Pandas Integration Features:

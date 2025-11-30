@@ -23,6 +23,7 @@ from .data_structures import (
 )
 from .filters import FilterExpression, FilterOp, parse_filter_dict
 from .iceberg import DataFile, FileFormat, create_table, load_table
+from .metadata_manager import ConcurrentModificationException
 from .transaction import Table, Transaction
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "FilterOp",
     "FilterExpression",
     "parse_filter_dict",
+    "ConcurrentModificationException",
     "__version__",
     "__author__",
 ]

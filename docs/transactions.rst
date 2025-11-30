@@ -130,7 +130,7 @@ The most common operation is appending new records:
        ]
    )
 
-   table = create_table("/path/to/metrics", metrics_schema)
+   metrics_table = create_table("/path/to/metrics", metrics_schema)
 
    # Using automatic transaction management
    metrics_data = [
@@ -138,7 +138,7 @@ The most common operation is appending new records:
        {"timestamp": 1700000001000, "metric_name": "memory_usage", "value": 62.8}
    ]
 
-   success = table.append_records(records=metrics_data, schema=metrics_schema)
+   success = metrics_table.append_records(records=metrics_data, schema=metrics_schema)
 
 Appending Files
 ^^^^^^^^^^^^^^^

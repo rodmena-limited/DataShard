@@ -119,11 +119,6 @@ Here's a more comprehensive example that demonstrates multiple features:
    # Verify the data was added
    print(f"Table has {len(complex_table.snapshots())} snapshots after adding complex data")
 
-   # Clean up (optional)
-   import shutil
-   shutil.rmtree("/tmp/my_first_table")
-   shutil.rmtree("/tmp/complex_table")
-
 Reading Data with Filters
 -------------------------
 
@@ -172,7 +167,7 @@ For memory-efficient processing of large tables:
    # Process in batches (memory-efficient)
    for batch in table.scan_batches(batch_size=1000):
        for record in batch:
-           process(record)
+           print(record)
 
    # Iterate record by record
    for record in table.iter_records(filter={"age": (">", 30)}):
@@ -183,6 +178,20 @@ For memory-efficient processing of large tables:
        # Process each chunk with pandas operations
        summary = chunk_df.groupby("name").count()
        print(summary)
+
+Cleaning Up
+-----------
+
+After you're done, you can remove the tables:
+
+.. code-block:: python
+
+   import shutil
+   # Clean up (optional)
+   if os.path.exists("/tmp/my_first_table"):
+       shutil.rmtree("/tmp/my_first_table")
+   if os.path.exists("/tmp/complex_table"):
+       shutil.rmtree("/tmp/complex_table")
 
 What's Next?
 ------------
