@@ -79,6 +79,25 @@ class SnapshotManager:
         )
         new_metadata.snapshot_log.append(history_entry)
 
+        # PHASE 2: Snapshot Pruning / Compaction
+        # Check table properties for retention policy
+        # Default to keeping last 100 snapshots if not specified
+        retention_count = int(new_metadata.properties.get("write.metadata.previous-versions-max", 100))
+        
+        if len(new_metadata.snapshots) > retention_count:
+            # Sort by timestamp to ensure we keep the most recent ones
+            # (Snapshots are usually appended, but sort ensures safety)
+            sorted_snapshots = sorted(new_metadata.snapshots, key=lambda s: s.timestamp_ms)
+            
+            # Keep the last N
+            new_metadata.snapshots = sorted_snapshots[-retention_count:]
+            
+            # Also prune the history log to match (approximately)
+            # We keep a bit more history than snapshots usually, but for now sync them
+            if len(new_metadata.snapshot_log) > retention_count:
+                 sorted_log = sorted(new_metadata.snapshot_log, key=lambda e: e.timestamp_ms)
+                 new_metadata.snapshot_log = sorted_log[-retention_count:]
+
         # Commit the updated metadata using OCC (base and new metadata)
         # This will fail if the base doesn't match the current state
         self.metadata_manager.commit(base_metadata, new_metadata)
