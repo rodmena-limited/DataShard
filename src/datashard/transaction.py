@@ -127,6 +127,7 @@ class Transaction:
             null_value_counts=data_file.null_value_counts,
             lower_bounds=data_file.lower_bounds,
             upper_bounds=data_file.upper_bounds,
+            checksum=data_file.checksum,
         )
 
         # Queue the newly created file for appending

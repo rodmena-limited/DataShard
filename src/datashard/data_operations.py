@@ -19,6 +19,7 @@ except ImportError:
     pd = None  # Define as None to avoid reference errors
 
 from .data_structures import DataFile, FileFormat, Schema
+from .integrity import IntegrityChecker
 from .storage_backend import S3StorageBackend, StorageBackend
 
 if TYPE_CHECKING:
@@ -427,10 +428,16 @@ class DataFileManager:
         # Create and return the DataFile object with statistics
         # For S3, use storage backend to get size
         if isinstance(self.storage, S3StorageBackend):
-            file_size = self.storage.get_size(file_path.lstrip("/"))
+            clean_path = file_path.lstrip("/")
+            file_size = self.storage.get_size(clean_path)
+            # Compute checksum by reading file content (S3)
+            # Note: Reading back large files for checksum is expensive but required for verification
+            file_content = self.storage.read_file(clean_path)
+            checksum = IntegrityChecker.compute_checksum(file_content)
         else:
             # For local filesystem, use the absolute arrow_path
             file_size = os.path.getsize(arrow_path)
+            checksum = IntegrityChecker.compute_file_checksum(arrow_path)
 
         return DataFile(
             file_path=file_path,
@@ -440,6 +447,7 @@ class DataFileManager:
             file_size_in_bytes=file_size,
             lower_bounds=lower_bounds,
             upper_bounds=upper_bounds,
+            checksum=checksum,
         )
 
     def _compute_column_bounds(

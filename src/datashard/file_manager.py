@@ -114,6 +114,7 @@ class FileManager:
                     # Convert bounds to simple map if present, complex handling skipped for now
                     "lower_bounds": {str(k): str(v) for k, v in df.lower_bounds.items()} if df.lower_bounds else None,
                     "upper_bounds": {str(k): str(v) for k, v in df.upper_bounds.items()} if df.upper_bounds else None,
+                    "checksum": df.checksum,
                 }
             }
             records.append(record)
@@ -198,6 +199,7 @@ class FileManager:
                     null_value_counts=df_record.get("null_value_counts"),
                     lower_bounds=lower_bounds,
                     upper_bounds=upper_bounds,
+                    checksum=df_record.get("checksum"),
                 )
                 data_files.append(data_file)
             return data_files
@@ -370,10 +372,24 @@ class FileManager:
                 data_files = self.read_manifest_file(manifest.manifest_path)
                 report["valid_manifests"] += 1
 
+                from .integrity import IntegrityChecker
+
                 for data_file in data_files:
                     report["total_files"] += 1
                     if self.validate_file_exists(data_file.file_path):
                         report["existing_files"] += 1
+                        
+                        # Verify checksum if available
+                        if data_file.checksum:
+                            try:
+                                # Read file content
+                                clean_path = data_file.file_path.lstrip("/") if data_file.file_path.startswith("/") else data_file.file_path
+                                content = self.storage.read_file(clean_path)
+                                
+                                if not IntegrityChecker.verify_checksum(content, data_file.checksum):
+                                    report["checksum_mismatches"].append(data_file.file_path)
+                            except Exception as e:
+                                report["checksum_mismatches"].append(f"{data_file.file_path} (read error: {e})")
                     else:
                         report["missing_files"].append(data_file.file_path)
             except Exception as e:

@@ -89,6 +89,7 @@ class DataFile:
     lower_bounds: Optional[Dict[int, Any]] = None
     upper_bounds: Optional[Dict[int, Any]] = None
     key_metadata: Optional[bytes] = None
+    checksum: Optional[str] = None
     split_offsets: Optional[List[int]] = None
     split_compressed_offsets: Optional[List[int]] = None
     equality_ids: Optional[List[int]] = None

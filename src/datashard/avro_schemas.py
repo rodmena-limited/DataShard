@@ -32,7 +32,8 @@ MANIFEST_ENTRY_SCHEMA = {
                     {"name": "value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": None},
                     {"name": "null_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": None},
                     {"name": "lower_bounds", "type": ["null", {"type": "map", "values": "string"}], "default": None},
-                    {"name": "upper_bounds", "type": ["null", {"type": "map", "values": "string"}], "default": None}
+                    {"name": "upper_bounds", "type": ["null", {"type": "map", "values": "string"}], "default": None},
+                    {"name": "checksum", "type": ["null", "string"], "default": None}
                 ]
             }
         }

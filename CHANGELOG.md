@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New table property `write.metadata.previous-versions-max` controls retention (default: 100 snapshots).
   - Solves the scalability bottleneck where commit times increased linearly with table history.
 
+- **Data Integrity Verification** 🛡️
+  - Computed SHA-256 checksums for all data files during write.
+  - Stored checksums in Avro manifests.
+  - Added verification logic to detect data corruption during reads.
+  - Added `checksum` field to `DataFile` structure.
+
 ### Fixed
 
 - **Snapshot ID Overflow:** Fixed an issue where generated Snapshot IDs could exceed Avro's signed 64-bit integer limit.
