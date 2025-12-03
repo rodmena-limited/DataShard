@@ -71,6 +71,11 @@ When multiple processes write to the same file, you get:
 - Cause: ACID transactions with OCC prevent all race conditions
 
 ---
+Already used in Highway Workflow Engine:
+
+![DataShard Screenshot](docs/Screenshot%202025-12-03%20at%2004.24.10.png)
+
+---
 
 ## Installation
 
