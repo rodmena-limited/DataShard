@@ -14,6 +14,15 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 
 
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+    # Catch specific S3 errors + generic IO errors
+    RETRYABLE_EXCEPTIONS = (ClientError, BotoCoreError, IOError, OSError)
+except ImportError:
+    # Fallback if boto3 not installed (though unlikely if using S3)
+    RETRYABLE_EXCEPTIONS = (IOError, OSError)
+
+
 class S3ConsistencyHandler:
     """Handles S3 eventual consistency with retry logic."""
 
@@ -23,6 +32,7 @@ class S3ConsistencyHandler:
         initial_delay: float = 0.1,
         max_delay: float = 5.0,
         backoff_factor: float = 2.0,
+        retryable_exceptions: tuple = RETRYABLE_EXCEPTIONS,
     ):
         """Initialize S3 consistency handler.
 
@@ -31,11 +41,13 @@ class S3ConsistencyHandler:
             initial_delay: Initial delay in seconds
             max_delay: Maximum delay in seconds
             backoff_factor: Exponential backoff multiplier
+            retryable_exceptions: Tuple of exceptions to retry
         """
         self.max_retries = max_retries
         self.initial_delay = initial_delay
         self.max_delay = max_delay
         self.backoff_factor = backoff_factor
+        self.retryable_exceptions = retryable_exceptions
 
     def retry_with_backoff(
         self,
@@ -54,7 +66,7 @@ class S3ConsistencyHandler:
             Result of operation
 
         Raises:
-            Exception: If all retries exhausted
+            Exception: If all retries exhausted or non-retryable exception occurs
         """
         delay = self.initial_delay
         last_exception = None
@@ -86,9 +98,12 @@ class S3ConsistencyHandler:
                 logger.debug(f"{operation_name} succeeded")
                 return result
 
-            except Exception as e:
+            except self.retryable_exceptions as e:
                 last_exception = e
                 if attempt < self.max_retries:
+                    # Check for ClientError 404/NoSuchKey - if we are reading, we might want to fail fast?
+                    # But due to eventual consistency, a 404 might be temporary.
+                    # So we stick to retrying.
                     logger.warning(
                         f"{operation_name} failed: {e}, retrying in {delay:.2f}s..."
                     )
@@ -97,6 +112,10 @@ class S3ConsistencyHandler:
                 else:
                     logger.error(f"{operation_name} - max retries exhausted: {e}")
                     raise
+            except Exception as e:
+                # Non-retryable exception (e.g. ValueError, TypeError)
+                logger.error(f"{operation_name} failed with non-retryable error: {e}")
+                raise
 
         # Should not reach here, but just in case
         if last_exception:

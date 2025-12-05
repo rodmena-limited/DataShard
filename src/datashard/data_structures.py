@@ -37,6 +37,27 @@ class Schema:
         if not self.schema_string:
             self.schema_string = json.dumps(self.fields)
 
+        # Validate fields
+        valid_primitive_types = {
+            "boolean", "int", "long", "float", "double", 
+            "date", "time", "timestamp", "string", 
+            "uuid", "fixed", "binary"
+        }
+
+        for field_def in self.fields:
+            if "id" not in field_def:
+                 raise ValueError(f"Invalid schema: Field missing required property 'id': {field_def}")
+            if "name" not in field_def:
+                 raise ValueError(f"Invalid schema: Field missing required property 'name': {field_def}")
+            if "type" not in field_def:
+                 raise ValueError(f"Invalid schema: Field missing required property 'type': {field_def}")
+
+            f_type = field_def["type"]
+            if isinstance(f_type, str):
+                if f_type not in valid_primitive_types:
+                     raise ValueError(f"Invalid schema: Unknown field type '{f_type}' in field '{field_def['name']}'. Supported primitive types: {valid_primitive_types}")
+            # We permit dict/list for complex types (struct, list, map) without deep validation for now
+
 
 @dataclass
 class PartitionField:

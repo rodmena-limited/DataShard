@@ -110,13 +110,24 @@ class LocalStorageBackend(StorageBackend):
         """Resolve path relative to base_path"""
         if path.startswith("/"):
             # Iceberg-style absolute path relative to table
-            return os.path.join(self.base_path, path.lstrip("/"))
+            joined_path = os.path.join(self.base_path, path.lstrip("/"))
         elif os.path.isabs(path):
-            # True system absolute path
-            return path
+            # True system absolute path - treat as relative to base for security
+            # This handles cases where a user might provide "/etc/passwd"
+            joined_path = os.path.join(self.base_path, path.lstrip("/"))
         else:
             # Relative path
-            return os.path.join(self.base_path, path)
+            joined_path = os.path.join(self.base_path, path)
+            
+        # Canonicalize paths to resolve '..'
+        full_path = os.path.abspath(joined_path)
+        base_path = os.path.abspath(self.base_path)
+        
+        # Ensure the resolved path is within the base directory
+        if not full_path.startswith(base_path):
+            raise ValueError(f"Security Error: Path traversal attempt detected. Resolved path '{full_path}' is outside base directory '{base_path}'")
+            
+        return full_path
 
     def read_file(self, path: str) -> bytes:
         full_path = self._resolve_path(path)
