@@ -88,6 +88,11 @@ class StorageBackend(ABC):
     def get_size(self, path: str) -> int:
         """Get file size in bytes"""
         pass
+        
+    @abstractmethod
+    def get_modified_time(self, path: str) -> float:
+        """Get file modification time as unix timestamp"""
+        pass
 
     @abstractmethod
     def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
@@ -239,6 +244,10 @@ class LocalStorageBackend(StorageBackend):
     def get_size(self, path: str) -> int:
         full_path = self._resolve_path(path)
         return os.path.getsize(full_path)
+        
+    def get_modified_time(self, path: str) -> float:
+        full_path = self._resolve_path(path)
+        return os.path.getmtime(full_path)
 
     def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
         from .lock_provider import LocalLockProvider
@@ -416,6 +425,16 @@ class S3StorageBackend(StorageBackend):
             if e.response["Error"]["Code"] == "404":
                 raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
             raise
+            
+    def get_modified_time(self, path: str) -> float:
+        key = self._get_s3_key(path)
+        try:
+            response = self.s3.head_object(Bucket=self.bucket, Key=key)
+            return response["LastModified"].timestamp()
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                 raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
+            raise
 
     def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
         from .lock_provider import S3LockProvider
@@ -470,11 +489,9 @@ def create_storage_backend(table_path: str) -> StorageBackend:
         else:
             full_prefix = ""
 
-        # Validate credentials
+        # Validate credentials - Optional, falls back to IAM/Env if missing
         if not (access_key and secret_key):
-            raise ValueError(
-                "DATASHARD_S3_ACCESS_KEY and DATASHARD_S3_SECRET_KEY are required for S3 storage"
-            )
+            logger.info("No explicit S3 credentials provided. Using default AWS credential chain (IAM Role, Env Vars, etc.)")
 
         return S3StorageBackend(
             bucket=bucket,

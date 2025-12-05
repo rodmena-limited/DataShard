@@ -12,6 +12,7 @@ from .data_structures import (
     DataFile,
     FileFormat,
     ManifestContent,
+    ManifestFile,
     Schema,
     Snapshot,
     TableMetadata,
@@ -250,16 +251,102 @@ class Transaction:
                     # Ensure it fits in signed 64-bit integer (Java/Avro long compatibility)
                     snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
 
-                    # Extract data files from append_files operations
-                    data_files = []
+                    # --- START OF MANIFEST PROCESSING ---
+                    
+                    # 1. Collect files to append and delete
+                    append_files = []
+                    deleted_paths = set()
+                    
                     for operation in self._operations:
                         if operation["type"] == "append_files":
-                            data_files.extend(operation["files"])
+                            append_files.extend(operation["files"])
+                        elif operation["type"] == "delete_files":
+                            deleted_paths.update(operation["file_paths"])
 
-                    # Create a new manifest list for this snapshot with actual data files
-                    manifest_list_path = self._create_manifest_list_with_id(
-                        new_metadata, snapshot_id, data_files
+                    # 2. Get existing manifests from base snapshot (if any)
+                    existing_manifests: List[ManifestFile] = []
+                    if base_metadata.current_snapshot_id is not None:
+                        # Find the snapshot object
+                        base_snapshot = None
+                        for s in base_metadata.snapshots:
+                            if s.snapshot_id == base_metadata.current_snapshot_id:
+                                base_snapshot = s
+                                break
+                        
+                        if base_snapshot:
+                             # Read the manifest list
+                             try:
+                                 # Remove leading slash if needed
+                                 path = base_snapshot.manifest_list
+                                 if path.startswith("/"):
+                                     path = path.lstrip("/")
+                                 existing_manifests = self.file_manager.read_manifest_list_file(path)
+                             except Exception:
+                                 # If we can't read it, start fresh (safety fallback)
+                                 existing_manifests = []
+
+                    # 3. Process Deletes (Rewrite manifests if needed)
+                    final_manifests: List[ManifestFile] = []
+                    
+                    if deleted_paths:
+                        for manifest in existing_manifests:
+                            # Read data files in this manifest
+                            try:
+                                manifest_path = manifest.manifest_path
+                                if manifest_path.startswith("/"):
+                                    manifest_path = manifest_path.lstrip("/")
+                                    
+                                data_files = self.file_manager.read_manifest_file(manifest_path)
+                                
+                                # Filter out deleted files
+                                surviving_files = [
+                                    f for f in data_files 
+                                    if f.file_path not in deleted_paths and f.file_path.lstrip("/") not in deleted_paths
+                                ]
+                                
+                                if len(surviving_files) == len(data_files):
+                                    # No changes, keep manifest
+                                    final_manifests.append(manifest)
+                                elif len(surviving_files) > 0:
+                                    # Partial delete: create new manifest
+                                    new_manifest = self.file_manager.create_manifest_file(
+                                        surviving_files, 
+                                        ManifestContent.DATA, 
+                                        snapshot_id
+                                    )
+                                    # Preserve partition spec ID if possible, else default 0
+                                    new_manifest.partition_spec_id = manifest.partition_spec_id
+                                    final_manifests.append(new_manifest)
+                                else:
+                                    # All files deleted: drop this manifest
+                                    pass
+                            except Exception:
+                                # If we can't read a manifest, we can't safely filter it.
+                                # For safety, keep it (fail safe) or fail transaction?
+                                # Failing is safer for consistency.
+                                raise RuntimeError(f"Failed to read manifest {manifest.manifest_path} during delete operation")
+                    else:
+                        final_manifests = list(existing_manifests)
+
+                    # 4. Process Appends (Create new manifest)
+                    if append_files:
+                        # Validate existence
+                        self.file_manager.validate_data_files(append_files)
+                        
+                        new_append_manifest = self.file_manager.create_manifest_file(
+                            append_files,
+                            ManifestContent.DATA,
+                            snapshot_id
+                        )
+                        final_manifests.append(new_append_manifest)
+
+                    # 5. Create the Master Manifest List
+                    # This list now contains ALL active manifests for the table
+                    manifest_list_path = self.file_manager.create_manifest_list_file(
+                        final_manifests, snapshot_id
                     )
+
+                    # --- END OF MANIFEST PROCESSING ---
 
                     # Create a new snapshot for this transaction
                     # CRITICAL FIX: Pass base_metadata to avoid race condition where
@@ -270,6 +357,7 @@ class Transaction:
                         operation=(
                             "append"
                             if any(op["type"] == "append_files" for op in self._operations)
+                            else "delete" if any(op["type"] == "delete_files" for op in self._operations)
                             else "update"
                         ),
                         parent_snapshot_id=(
@@ -594,6 +682,20 @@ class Table:
         metadata = self.metadata_manager.refresh()
         return metadata is not None
 
+    def garbage_collect(self, grace_period_ms: int = 3600000) -> Dict[str, int]:
+        """Delete orphaned files not referenced by any snapshot.
+        
+        Args:
+            grace_period_ms: Only delete orphaned files older than this age (default 1 hour).
+                             This protects against deleting files currently being written.
+        
+        Returns:
+            Dict with counts of deleted files by type.
+        """
+        from .garbage_collector import GarbageCollector
+        gc = GarbageCollector(self.table_path, self.metadata_manager, self.file_manager)
+        return gc.collect(grace_period_ms)
+
     def scan(
         self,
         columns: Optional[List[str]] = None,
@@ -707,19 +809,10 @@ class Table:
         return result
 
     def _get_parquet_files(self, data_files: List[DataFile]) -> List[str]:
-        """Get list of parquet file paths from data files or fallback to directory listing."""
+        """Get list of parquet file paths from data files."""
         if data_files:
             return [self._resolve_file_path(df.file_path) for df in data_files]
-
-        # Fallback to raw file listing if no manifest
-        data_path = os.path.join(self.table_path, "data")
-        if not os.path.exists(data_path):
-            return []
-        return [
-            os.path.join(data_path, f)
-            for f in os.listdir(data_path)
-            if f.endswith(".parquet")
-        ]
+        return []
 
     def to_pandas(
         self,
@@ -952,63 +1045,53 @@ class Table:
             yield pd.DataFrame(batch)
 
     def _get_all_data_files(self) -> List[DataFile]:
-        """Get ALL data files from ALL snapshots for full table scan.
-
-        This method traverses all snapshots to collect all data files,
-        which is necessary because each snapshot only references files
-        added in that specific append operation.
-
-        For performance, falls back to direct directory listing if
-        manifest traversal would be too slow (many snapshots).
-
-        Returns:
-            List of DataFile objects from all snapshots.
+        """Get ALL data files from current snapshot.
+        
+        Correctly uses the Iceberg model where the current snapshot's manifest list
+        contains references to ALL valid data in the table.
         """
-        # Get all snapshots
-        all_snapshots = self.snapshot_manager.get_all_snapshots()
+        snapshot = self.current_snapshot()
+        if not snapshot:
+            return []
 
-        # If many snapshots, fall back to direct file listing (faster)
-        # Each snapshot typically has 1 manifest with 1 file, so traversing
-        # 1000+ snapshots means 2000+ JSON reads vs 1 listdir call
-        if len(all_snapshots) > 50:
-            return []  # Will fall back to _get_parquet_files directory listing
+        try:
+            manifest_list_path = snapshot.manifest_list
+            if manifest_list_path.startswith("/"):
+                manifest_list_path = manifest_list_path.lstrip("/")
 
-        data_files: List[DataFile] = []
-        seen_paths: set = set()
+            if not self.storage.exists(manifest_list_path):
+                return []
 
-        for snapshot in all_snapshots:
-            try:
-                manifest_list_path = snapshot.manifest_list
-                if manifest_list_path.startswith("/"):
-                    manifest_list_path = manifest_list_path.lstrip("/")
+            # Use FileManager to read manifest list
+            manifest_files = self.file_manager.read_manifest_list_file(manifest_list_path)
+            
+            all_data_files = []
+            seen_paths = set()
 
-                if not self.storage.exists(manifest_list_path):
+            for manifest_ref in manifest_files:
+                manifest_path = manifest_ref.manifest_path
+                if not manifest_path:
+                    continue
+                if manifest_path.startswith("/"):
+                    manifest_path = manifest_path.lstrip("/")
+
+                if not self.storage.exists(manifest_path):
                     continue
 
-                # Use FileManager to read manifest list (supports Avro)
-                manifest_files = self.file_manager.read_manifest_list_file(manifest_list_path)
+                # Read manifest file
+                manifest_data_files = self.file_manager.read_manifest_file(manifest_path)
 
-                for manifest_ref in manifest_files:
-                    manifest_path = manifest_ref.manifest_path
-                    if not manifest_path or not self.storage.exists(manifest_path):
+                for data_file in manifest_data_files:
+                    file_path = data_file.file_path
+                    if file_path in seen_paths:
                         continue
+                    seen_paths.add(file_path)
+                    all_data_files.append(data_file)
+            
+            return all_data_files
 
-                    # Use FileManager to read manifest file (supports Avro)
-                    manifest_data_files = self.file_manager.read_manifest_file(manifest_path)
-
-                    for data_file in manifest_data_files:
-                        file_path = data_file.file_path
-
-                        # Skip duplicates (same file referenced by multiple snapshots)
-                        if file_path in seen_paths:
-                            continue
-                        seen_paths.add(file_path)
-
-                        data_files.append(data_file)
-            except Exception:
-                continue
-
-        return data_files
+        except Exception:
+            return []
 
     def _get_data_files_from_manifest(self) -> List[DataFile]:
         """Get data files from current snapshot's manifest only.

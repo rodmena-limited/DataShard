@@ -6,6 +6,8 @@ import time
 import uuid
 import logging
 import os
+import random
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -56,6 +58,8 @@ class S3LockProvider(LockProvider):
         self.lease_seconds = lease_seconds
         self.lock_id = str(uuid.uuid4())
         self.is_locked = False
+        self._heartbeat_thread = None
+        self._stop_heartbeat = threading.Event()
         
     def acquire(self) -> bool:
         start_time = time.time()
@@ -63,6 +67,7 @@ class S3LockProvider(LockProvider):
             # 1. Try to acquire lock
             if self._try_acquire():
                 self.is_locked = True
+                self._start_heartbeat()
                 return True
                 
             # 2. Check if existing lock is expired (deadlock prevention)
@@ -94,6 +99,64 @@ class S3LockProvider(LockProvider):
                 return False
             raise e
 
+    def _start_heartbeat(self) -> None:
+        """Start the heartbeat thread to renew lock lease."""
+        self._stop_heartbeat.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"S3Lock-Heartbeat-{self.lock_id[:8]}",
+            daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat_thread(self) -> None:
+        """Stop the heartbeat thread."""
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._stop_heartbeat.set()
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
+
+    def _heartbeat_loop(self) -> None:
+        """Periodically renew the lock lease."""
+        import botocore.exceptions
+        
+        # Renew every 1/3 of the lease time to be safe
+        interval = self.lease_seconds / 3.0
+        
+        while not self._stop_heartbeat.wait(interval):
+            if not self.is_locked:
+                break
+                
+            try:
+                # Verify we still own the lock by checking content
+                # Optimization: We could skip this and just write if we are confident,
+                # but checking guards against split-brain if we were partitioned.
+                resp = self.s3.get_object(Bucket=self.bucket, Key=self.key)
+                content = resp['Body'].read().decode('utf-8')
+                
+                if content != self.lock_id:
+                    logger.warning(f"Lost S3 lock at {self.key} (content mismatch). Stopping heartbeat.")
+                    self.is_locked = False
+                    break
+                    
+                # Renew: Overwrite with same content to update LastModified
+                self.s3.put_object(
+                    Bucket=self.bucket,
+                    Key=self.key,
+                    Body=self.lock_id.encode('utf-8')
+                )
+                logger.debug(f"Renewed S3 lock at {self.key}")
+                
+            except botocore.exceptions.ClientError as e:
+                logger.warning(f"Failed to renew S3 lock: {e}")
+                # If 404, we lost it.
+                error_code = e.response.get('Error', {}).get('Code', '')
+                if error_code == '404':
+                    self.is_locked = False
+                    break
+            except Exception as e:
+                logger.error(f"Unexpected error in lock heartbeat: {e}")
+
     def _check_and_break_expired_lock(self) -> bool:
         """Check if the lock file is older than lease_seconds. If so, delete it."""
         import botocore.exceptions
@@ -101,14 +164,30 @@ class S3LockProvider(LockProvider):
         
         try:
             resp = self.s3.head_object(Bucket=self.bucket, Key=self.key)
-            last_modified = resp['LastModified']
+            last_modified_1 = resp['LastModified']
+            etag_1 = resp.get('ETag')
             
             # S3 returns offset-aware datetime (usually UTC)
             now = datetime.now(timezone.utc)
             
-            age = (now - last_modified).total_seconds()
+            age = (now - last_modified_1).total_seconds()
             
             if age > self.lease_seconds:
+                # Potential expiration. Wait and double check to avoid racing with a renewal or new lock.
+                time.sleep(random.uniform(0.5, 1.5))
+
+                try:
+                    resp2 = self.s3.head_object(Bucket=self.bucket, Key=self.key)
+                    last_modified_2 = resp2['LastModified']
+                    etag_2 = resp2.get('ETag')
+                    
+                    # If lock changed while we waited, don't break it
+                    if last_modified_1 != last_modified_2 or etag_1 != etag_2:
+                        return False
+                except botocore.exceptions.ClientError:
+                    # Lock disappeared? Treat as handled
+                    return False
+
                 logger.warning(f"Breaking expired S3 lock at {self.key} (Age: {age}s > {self.lease_seconds}s)")
                 # We delete the object. The next acquire loop will try to create it.
                 # This handles the crash scenario.
@@ -129,6 +208,9 @@ class S3LockProvider(LockProvider):
         if not self.is_locked:
             return
             
+        # Stop heartbeat BEFORE deleting file
+        self._stop_heartbeat_thread()
+
         import botocore.exceptions
 
         try:
