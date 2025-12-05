@@ -78,12 +78,13 @@ class MetadataManager:
         - PHASE 2: Use file-based locking for multi-process safety
         - Write metadata file BEFORE updating version hint (two-phase commit)
         """
-        # PHASE 2: Acquire distributed lock for multi-process safety
-        self.lock_provider.acquire()
+        # Acquire thread lock for thread safety within same process
+        # This also protects the non-thread-safe FileLock instance from concurrent access
+        with self._lock:
+            # PHASE 2: Acquire distributed lock for multi-process safety
+            self.lock_provider.acquire()
 
-        try:
-            # Acquire thread lock for thread safety within same process
-            with self._lock:
+            try:
                 # PHASE 1: Validation (inside lock to prevent races)
                 current = self.refresh()
 
@@ -130,9 +131,9 @@ class MetadataManager:
                 self.current_version = next_version
 
                 return new_metadata
-        finally:
-            # PHASE 2: Always release lock
-            self.lock_provider.release()
+            finally:
+                # PHASE 2: Always release lock
+                self.lock_provider.release()
 
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """Get a specific snapshot by ID"""
