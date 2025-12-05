@@ -17,7 +17,7 @@ T = TypeVar("T")
 try:
     from botocore.exceptions import BotoCoreError, ClientError
     # Catch specific S3 errors + generic IO errors
-    RETRYABLE_EXCEPTIONS = (ClientError, BotoCoreError, IOError, OSError)
+    RETRYABLE_EXCEPTIONS: Any = (ClientError, BotoCoreError, IOError, OSError)
 except ImportError:
     # Fallback if boto3 not installed (though unlikely if using S3)
     RETRYABLE_EXCEPTIONS = (IOError, OSError)

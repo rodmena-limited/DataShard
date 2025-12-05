@@ -39,8 +39,8 @@ class Schema:
 
         # Validate fields
         valid_primitive_types = {
-            "boolean", "int", "long", "float", "double", 
-            "date", "time", "timestamp", "string", 
+            "boolean", "int", "long", "float", "double",
+            "date", "time", "timestamp", "string",
             "uuid", "fixed", "binary"
         }
 

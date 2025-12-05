@@ -1,7 +1,10 @@
-import pytest
 import os
 import tempfile
+
+import pytest
+
 from datashard.storage_backend import LocalStorageBackend
+
 
 def test_path_traversal_prevention():
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -10,7 +13,7 @@ def test_path_traversal_prevention():
 
         # Attack 1: Relative path traversal
         attack_path = "../../../../etc/passwd"
-        
+
         with pytest.raises(ValueError, match="Security Error: Path traversal attempt detected"):
             backend._resolve_path(attack_path)
 

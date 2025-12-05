@@ -161,7 +161,7 @@ def test_s3_multiple_transactions():
         )
 
         # Create table
-        table = create_table(table_name, schema)
+        create_table(table_name, schema)
         print(f"✅ Created table: {table_name}")
 
         # Write multiple batches

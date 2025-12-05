@@ -26,7 +26,7 @@ try:
     try:
         s3.head_bucket(Bucket=bucket_name)
         print(f"✅ Bucket '{bucket_name}' already exists")
-    except:
+    except Exception:
         # Create bucket
         s3.create_bucket(Bucket=bucket_name)
         print(f"✅ Created bucket: {bucket_name}")

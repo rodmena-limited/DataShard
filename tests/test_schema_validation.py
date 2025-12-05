@@ -1,6 +1,8 @@
+
 import pytest
-import json
+
 from datashard.data_structures import Schema
+
 
 def test_valid_schema_creation():
     valid_fields = [
@@ -13,7 +15,7 @@ def test_valid_schema_creation():
 
 def test_invalid_field_type():
     invalid_fields = [{"id": 1, "name": "test", "type": "super_int"}]
-    
+
     with pytest.raises(ValueError, match="Invalid schema: Unknown field type 'super_int'"):
         Schema(schema_id=2, fields=invalid_fields)
 

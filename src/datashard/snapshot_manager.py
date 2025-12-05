@@ -84,15 +84,15 @@ class SnapshotManager:
         # Check table properties for retention policy
         # Default to keeping last 100 snapshots if not specified
         retention_count = int(new_metadata.properties.get("write.metadata.previous-versions-max", 100))
-        
+
         if len(new_metadata.snapshots) > retention_count:
             # Sort by timestamp to ensure we keep the most recent ones
             # (Snapshots are usually appended, but sort ensures safety)
             sorted_snapshots = sorted(new_metadata.snapshots, key=lambda s: s.timestamp_ms)
-            
+
             # Keep the last N
             new_metadata.snapshots = sorted_snapshots[-retention_count:]
-            
+
             # Also prune the history log to match (approximately)
             # We keep a bit more history than snapshots usually, but for now sync them
             if len(new_metadata.snapshot_log) > retention_count:

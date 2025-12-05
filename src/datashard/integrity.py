@@ -5,6 +5,7 @@ Provides checksum computation and validation to detect corrupted data.
 """
 
 import hashlib
+from typing import BinaryIO
 
 from .logging_config import get_logger
 
@@ -39,6 +40,31 @@ class IntegrityChecker:
             raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
 
     @staticmethod
+    def compute_checksum_from_stream(stream: BinaryIO, algorithm: str = "sha256") -> str:
+        """Compute checksum for a stream.
+
+        Args:
+            stream: Binary stream to checksum
+            algorithm: Hash algorithm
+
+        Returns:
+            Hexadecimal checksum string
+        """
+        try:
+            hasher = hashlib.new(algorithm)
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            checksum = hasher.hexdigest()
+            logger.debug(f"Computed {algorithm} checksum from stream: {checksum[:16]}...")
+            return checksum
+        except ValueError as e:
+            logger.error(f"Unsupported hash algorithm: {algorithm}")
+            raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
+
+    @staticmethod
     def verify_checksum(
         data: bytes, expected_checksum: str, algorithm: str = "sha256"
     ) -> bool:
@@ -53,6 +79,33 @@ class IntegrityChecker:
             True if checksum matches, False otherwise
         """
         actual_checksum = IntegrityChecker.compute_checksum(data, algorithm)
+        matches = actual_checksum == expected_checksum
+
+        if not matches:
+            logger.error(
+                f"Checksum mismatch! Expected: {expected_checksum[:16]}..., "
+                f"Got: {actual_checksum[:16]}..."
+            )
+        else:
+            logger.debug("Checksum verification passed")
+
+        return matches
+
+    @staticmethod
+    def verify_stream_checksum(
+        stream: BinaryIO, expected_checksum: str, algorithm: str = "sha256"
+    ) -> bool:
+        """Verify stream data against expected checksum.
+
+        Args:
+            stream: Data stream to verify
+            expected_checksum: Expected checksum
+            algorithm: Hash algorithm
+
+        Returns:
+            True if checksum matches, False otherwise
+        """
+        actual_checksum = IntegrityChecker.compute_checksum_from_stream(stream, algorithm)
         matches = actual_checksum == expected_checksum
 
         if not matches:

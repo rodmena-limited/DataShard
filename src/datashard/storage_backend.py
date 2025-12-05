@@ -21,7 +21,7 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .disk_utils import check_disk_space, estimate_write_size
 from .integrity import IntegrityChecker
@@ -47,6 +47,11 @@ class StorageBackend(ABC):
     @abstractmethod
     def read_file(self, path: str) -> bytes:
         """Read file contents as bytes"""
+        pass
+
+    @abstractmethod
+    def open_file(self, path: str) -> Any:
+        """Open file as a binary stream context manager"""
         pass
 
     @abstractmethod
@@ -88,7 +93,7 @@ class StorageBackend(ABC):
     def get_size(self, path: str) -> int:
         """Get file size in bytes"""
         pass
-        
+
     @abstractmethod
     def get_modified_time(self, path: str) -> float:
         """Get file modification time as unix timestamp"""
@@ -118,21 +123,26 @@ class LocalStorageBackend(StorageBackend):
         else:
             # Relative path
             joined_path = os.path.join(self.base_path, path)
-            
+
         # Canonicalize paths to resolve '..'
         full_path = os.path.abspath(joined_path)
         base_path = os.path.abspath(self.base_path)
-        
+
         # Ensure the resolved path is within the base directory
         if not full_path.startswith(base_path):
             raise ValueError(f"Security Error: Path traversal attempt detected. Resolved path '{full_path}' is outside base directory '{base_path}'")
-            
+
         return full_path
 
     def read_file(self, path: str) -> bytes:
         full_path = self._resolve_path(path)
         with open(full_path, "rb") as f:
             return f.read()
+
+    def open_file(self, path: str) -> Any:
+        """Open local file for reading as a stream."""
+        full_path = self._resolve_path(path)
+        return open(full_path, "rb")
 
     def write_file(self, path: str, content: bytes) -> None:
         """Atomically write file with fsync for durability.
@@ -255,7 +265,7 @@ class LocalStorageBackend(StorageBackend):
     def get_size(self, path: str) -> int:
         full_path = self._resolve_path(path)
         return os.path.getsize(full_path)
-        
+
     def get_modified_time(self, path: str) -> float:
         full_path = self._resolve_path(path)
         return os.path.getmtime(full_path)
@@ -265,6 +275,24 @@ class LocalStorageBackend(StorageBackend):
         full_path = self._resolve_path(path)
         return LocalLockProvider(full_path, timeout)
 
+
+class S3FileStream:
+    """Wrapper for S3 StreamingBody to support context manager protocol."""
+
+    def __init__(self, body: Any):
+        self.body = body
+
+    def read(self, n: Optional[int] = None) -> bytes:
+        return self.body.read(n)
+
+    def close(self) -> None:
+        self.body.close()
+
+    def __enter__(self) -> "S3FileStream":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
 class S3StorageBackend(StorageBackend):
     """S3-compatible storage backend (AWS S3, MinIO, etc.)"""
@@ -341,6 +369,28 @@ class S3StorageBackend(StorageBackend):
         data = with_s3_retry(read_op, f"S3 read: {key}")
         logger.debug(f"Read {len(data)} bytes from s3://{self.bucket}/{key}")
         return data
+
+    def open_file(self, path: str) -> Any:
+        """Open S3 object as a read-only binary stream."""
+
+        from .s3_consistency import with_s3_retry
+
+        key = self._get_s3_key(path)
+
+        def open_op() -> Any:
+            try:
+                response = self.s3.get_object(Bucket=self.bucket, Key=key)
+                # Cast to BinaryIO because S3FileStream implements the necessary protocol
+                # but is not explicitly inheriting from io.BytesIO/BinaryIO
+                return S3FileStream(response["Body"])
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "NoSuchKey":
+                    raise FileNotFoundError(
+                        f"S3 object not found: s3://{self.bucket}/{key}"
+                    ) from e
+                raise
+
+        return with_s3_retry(open_op, f"S3 open: {key}")
 
     def write_file(self, path: str, content: bytes) -> None:
         """Write file to S3 (inherently atomic).
@@ -436,7 +486,7 @@ class S3StorageBackend(StorageBackend):
             if e.response["Error"]["Code"] == "404":
                 raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
             raise
-            
+
     def get_modified_time(self, path: str) -> float:
         key = self._get_s3_key(path)
         try:

@@ -88,7 +88,7 @@ class FileManager:
         timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
         manifest_filename = f"manifest_{timestamp}.avro"
         manifest_path = f"{self.manifests_path}/{manifest_filename}"
-        
+
         snapshot_id_val = snapshot_id or int(datetime.now().timestamp() * 1000)
 
         # Prepare records for Avro
@@ -96,7 +96,7 @@ class FileManager:
         for df in data_files:
             # Flatten structure to match schema
             # content is passed as argument manifest_content, which is Enum
-            
+
             record = {
                 "status": 1, # 1 = ADDED
                 "snapshot_id": snapshot_id_val,
@@ -166,70 +166,74 @@ class FileManager:
         if not self.storage.exists(manifest_path):
             raise FileNotFoundError(f"Manifest file does not exist: {manifest_path}")
 
-        # Read raw bytes
-        content = self.storage.read_file(manifest_path)
-        
         try:
-            # Try reading as Avro
-            bytes_io = BytesIO(content)
-            reader = fastavro.reader(bytes_io)
-            
-            data_files = []
-            for record in reader:
-                # Extract data_file field
-                df_record = record["data_file"]
-                
-                # Parse bounds: convert keys to int, infer value types
-                lower_bounds = df_record.get("lower_bounds")
-                if lower_bounds:
-                    lower_bounds = {int(k): self._infer_value(v) for k, v in lower_bounds.items()}
-                    
-                upper_bounds = df_record.get("upper_bounds")
-                if upper_bounds:
-                    upper_bounds = {int(k): self._infer_value(v) for k, v in upper_bounds.items()}
+            # Try reading as Avro using streaming I/O
+            with self.storage.open_file(manifest_path) as stream:
+                reader = fastavro.reader(stream)
 
-                data_file = DataFile(
-                    file_path=df_record["file_path"],
-                    file_format=FileFormat(df_record["file_format"]),
-                    partition_values=df_record["partition"]["values"],
-                    record_count=df_record["record_count"],
-                    file_size_in_bytes=df_record["file_size_in_bytes"],
-                    column_sizes=df_record.get("column_sizes"),
-                    value_counts=df_record.get("value_counts"),
-                    null_value_counts=df_record.get("null_value_counts"),
-                    lower_bounds=lower_bounds,
-                    upper_bounds=upper_bounds,
-                    checksum=df_record.get("checksum"),
-                )
-                data_files.append(data_file)
-            return data_files
-            
-        except (ValueError, IndexError, StopIteration):
-            # Fallback: Try reading as JSON (backward compatibility for older files)
-            # If Avro read failed, it might be the old JSON format
-            import json
-            try:
-                manifest_data = json.loads(content.decode("utf-8"))
-                
                 data_files = []
-                for file_entry in manifest_data.get("files", []):
+                for record_raw in reader:
+                    # Cast record to Dict[str, Any] to satisfy mypy
+                    # fastavro reader yields dicts
+                    record: Dict[str, Any] = record_raw  # type: ignore
+
+                    # Extract data_file field
+                    df_record: Dict[str, Any] = record["data_file"]
+
+                    # Parse bounds: convert keys to int, infer value types
+                    lower_bounds = df_record.get("lower_bounds")
+                    if lower_bounds:
+                        lower_bounds = {int(k): self._infer_value(v) for k, v in lower_bounds.items()}
+
+                    upper_bounds = df_record.get("upper_bounds")
+                    if upper_bounds:
+                        upper_bounds = {int(k): self._infer_value(v) for k, v in upper_bounds.items()}
+
                     data_file = DataFile(
-                        file_path=file_entry["file_path"],
-                        file_format=FileFormat(file_entry["file_format"]),
-                        partition_values=file_entry["partition_values"],
-                        record_count=file_entry["record_count"],
-                        file_size_in_bytes=file_entry["file_size_in_bytes"],
-                        column_sizes=file_entry.get("column_sizes"),
-                        value_counts=file_entry.get("value_counts"),
-                        null_value_counts=file_entry.get("null_value_counts"),
-                        lower_bounds=file_entry.get("lower_bounds"),
-                        upper_bounds=file_entry.get("upper_bounds"),
+                        file_path=df_record["file_path"],
+                        file_format=FileFormat(df_record["file_format"]),
+                        partition_values=df_record["partition"]["values"],
+                        record_count=df_record["record_count"],
+                        file_size_in_bytes=df_record["file_size_in_bytes"],
+                        column_sizes=df_record.get("column_sizes"),
+                        value_counts=df_record.get("value_counts"),
+                        null_value_counts=df_record.get("null_value_counts"),
+                        lower_bounds=lower_bounds,
+                        upper_bounds=upper_bounds,
+                        checksum=df_record.get("checksum"),
                     )
                     data_files.append(data_file)
                 return data_files
-            except Exception:
-                # If JSON also fails, raise original error or generic error
-                raise ValueError(f"Could not parse manifest file {manifest_path} (tried Avro and JSON)")
+
+        except (ValueError, IndexError, StopIteration, OSError):
+            # Fallback: JSON
+            # If Avro parsing fails, we try reading as JSON (backward compatibility)
+            pass
+
+        content = self.storage.read_file(manifest_path)
+        import json
+        try:
+            manifest_data = json.loads(content.decode("utf-8"))
+
+            data_files = []
+            for file_entry in manifest_data.get("files", []):
+                data_file = DataFile(
+                    file_path=file_entry["file_path"],
+                    file_format=FileFormat(file_entry["file_format"]),
+                    partition_values=file_entry["partition_values"],
+                    record_count=file_entry["record_count"],
+                    file_size_in_bytes=file_entry["file_size_in_bytes"],
+                    column_sizes=file_entry.get("column_sizes"),
+                    value_counts=file_entry.get("value_counts"),
+                    null_value_counts=file_entry.get("null_value_counts"),
+                    lower_bounds=file_entry.get("lower_bounds"),
+                    upper_bounds=file_entry.get("upper_bounds"),
+                )
+                data_files.append(data_file)
+            return data_files
+        except Exception as e:
+            # If JSON also fails, raise original error or generic error
+            raise ValueError(f"Could not parse manifest file {manifest_path} (tried Avro and JSON)") from e
 
     def create_manifest_list_file(
         self, manifest_files: List[ManifestFile], snapshot_id: int
@@ -240,12 +244,12 @@ class FileManager:
         list_path = f"{self.manifests_path}/{list_filename}"
 
         # Prepare records for Avro
-        records = []
+        records: List[Dict[str, Any]] = []
         for mf in manifest_files:
             # Ensure content is an integer (handle Enum)
-            content_val = mf.content.value if hasattr(mf.content, 'value') else int(mf.content)
-            
-            record = {
+            content_val = int(mf.content.value) if hasattr(mf.content, 'value') else int(mf.content)  # type: ignore
+
+            record: Dict[str, Any] = {
                 "manifest_path": mf.manifest_path,
                 "manifest_length": mf.manifest_length,
                 "partition_spec_id": mf.partition_spec_id,
@@ -275,55 +279,59 @@ class FileManager:
         if not self.storage.exists(list_path):
             raise FileNotFoundError(f"Manifest list file does not exist: {list_path}")
 
-        # Read raw bytes
-        content = self.storage.read_file(list_path)
-        
+        # Try reading as Avro using streaming I/O
         try:
-            # Try reading as Avro
-            bytes_io = BytesIO(content)
-            reader = fastavro.reader(bytes_io)
-            
-            manifest_files = []
-            for record in reader:
-                manifest_file = ManifestFile(
-                    manifest_path=record["manifest_path"],
-                    manifest_length=record["manifest_length"],
-                    partition_spec_id=record["partition_spec_id"],
-                    added_snapshot_id=record["added_snapshot_id"],
-                    added_data_files_count=record["added_data_files_count"],
-                    existing_data_files_count=record["existing_data_files_count"],
-                    deleted_data_files_count=record["deleted_data_files_count"],
-                    partitions=[], 
-                    content=ManifestContent(record["content"]),
-                    sequence_number=record.get("sequence_number"),
-                    min_sequence_number=record.get("min_sequence_number")
-                )
-                manifest_files.append(manifest_file)
-            return manifest_files
-            
-        except (ValueError, IndexError, StopIteration):
-            # Fallback: JSON
-            import json
-            try:
-                list_data = json.loads(content.decode("utf-8"))
-                
+            with self.storage.open_file(list_path) as stream:
+                reader = fastavro.reader(stream)
+
                 manifest_files = []
-                for manifest_entry in list_data.get("manifests", []):
+                for record_raw in reader:
+                    # Cast to Dict[str, Any] to satisfy mypy
+                    record: Dict[str, Any] = record_raw  # type: ignore
+
                     manifest_file = ManifestFile(
-                        manifest_path=manifest_entry["manifest_path"],
-                        manifest_length=manifest_entry["manifest_length"],
-                        partition_spec_id=manifest_entry["partition_spec_id"],
-                        added_snapshot_id=manifest_entry["added_snapshot_id"],
-                        added_data_files_count=manifest_entry["added_data_files_count"],
-                        existing_data_files_count=manifest_entry["existing_data_files_count"],
-                        deleted_data_files_count=manifest_entry["deleted_data_files_count"],
-                        partitions=[],  # Would be populated from the manifest file itself
-                        content=ManifestContent(manifest_entry["content"]),
+                        manifest_path=record["manifest_path"],
+                        manifest_length=record["manifest_length"],
+                        partition_spec_id=record["partition_spec_id"],
+                        added_snapshot_id=record["added_snapshot_id"],
+                        added_data_files_count=record["added_data_files_count"],
+                        existing_data_files_count=record["existing_data_files_count"],
+                        deleted_data_files_count=record["deleted_data_files_count"],
+                        partitions=[],
+                        content=ManifestContent(record["content"]),
+                        sequence_number=record.get("sequence_number"),
+                        min_sequence_number=record.get("min_sequence_number")
                     )
                     manifest_files.append(manifest_file)
                 return manifest_files
-            except Exception:
-                raise ValueError(f"Could not parse manifest list file {list_path}")
+
+        except (ValueError, IndexError, StopIteration, OSError):
+            # Fallback: JSON
+            pass
+
+        content = self.storage.read_file(list_path)
+
+        import json
+        try:
+            list_data = json.loads(content.decode("utf-8"))
+
+            manifest_files = []
+            for manifest_entry in list_data.get("manifests", []):
+                manifest_file = ManifestFile(
+                    manifest_path=manifest_entry["manifest_path"],
+                    manifest_length=manifest_entry["manifest_length"],
+                    partition_spec_id=manifest_entry["partition_spec_id"],
+                    added_snapshot_id=manifest_entry["added_snapshot_id"],
+                    added_data_files_count=manifest_entry["added_data_files_count"],
+                    existing_data_files_count=manifest_entry["existing_data_files_count"],
+                    deleted_data_files_count=manifest_entry["deleted_data_files_count"],
+                    partitions=[],  # Would be populated from the manifest file itself
+                    content=ManifestContent(manifest_entry["content"]),
+                )
+                manifest_files.append(manifest_file)
+            return manifest_files
+        except Exception as e:
+            raise ValueError(f"Could not parse manifest list file {list_path}") from e
 
     def cleanup_orphaned_files(self, valid_file_paths: List[str]) -> int:
         """Clean up data files that are no longer referenced by any manifest"""
@@ -378,16 +386,16 @@ class FileManager:
                     report["total_files"] += 1
                     if self.validate_file_exists(data_file.file_path):
                         report["existing_files"] += 1
-                        
+
                         # Verify checksum if available
                         if data_file.checksum:
                             try:
-                                # Read file content
+                                # Read file content using streaming to avoid memory issues
                                 clean_path = data_file.file_path.lstrip("/") if data_file.file_path.startswith("/") else data_file.file_path
-                                content = self.storage.read_file(clean_path)
-                                
-                                if not IntegrityChecker.verify_checksum(content, data_file.checksum):
-                                    report["checksum_mismatches"].append(data_file.file_path)
+
+                                with self.storage.open_file(clean_path) as stream:
+                                    if not IntegrityChecker.verify_stream_checksum(stream, data_file.checksum):
+                                        report["checksum_mismatches"].append(data_file.file_path)
                             except Exception as e:
                                 report["checksum_mismatches"].append(f"{data_file.file_path} (read error: {e})")
                     else:

@@ -430,10 +430,10 @@ class DataFileManager:
         if isinstance(self.storage, S3StorageBackend):
             clean_path = file_path.lstrip("/")
             file_size = self.storage.get_size(clean_path)
-            # Compute checksum by reading file content (S3)
-            # Note: Reading back large files for checksum is expensive but required for verification
-            file_content = self.storage.read_file(clean_path)
-            checksum = IntegrityChecker.compute_checksum(file_content)
+            # Compute checksum by reading file content (S3) using streaming
+            # This avoids loading the entire file into memory
+            with self.storage.open_file(clean_path) as stream:
+                checksum = IntegrityChecker.compute_checksum_from_stream(stream)
         else:
             # For local filesystem, use the absolute arrow_path
             file_size = os.path.getsize(arrow_path)

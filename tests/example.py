@@ -9,7 +9,7 @@ import tempfile
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import time
 
-from iceberg import DataFile, FileFormat, create_table
+from datashard import DataFile, FileFormat, create_table
 
 
 def main():

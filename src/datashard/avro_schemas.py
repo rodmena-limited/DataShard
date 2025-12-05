@@ -50,7 +50,7 @@ MANIFEST_FILE_SCHEMA = {
         {"name": "manifest_length", "type": "long"},
         {"name": "partition_spec_id", "type": "int"},
         # content is an integer in the schema
-        {"name": "content", "type": "int"}, 
+        {"name": "content", "type": "int"},
         {"name": "sequence_number", "type": ["null", "long"], "default": None},
         {"name": "min_sequence_number", "type": ["null", "long"], "default": None},
         {"name": "added_snapshot_id", "type": ["null", "long"], "default": None},

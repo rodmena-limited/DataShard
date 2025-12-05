@@ -4,7 +4,7 @@ Garbage collection for orphaned data and metadata files.
 
 import logging
 import time
-from typing import Dict, Set, List
+from typing import Dict, Set
 
 from .file_manager import FileManager
 from .metadata_manager import MetadataManager
@@ -15,9 +15,9 @@ class GarbageCollector:
     """Identifies and removes orphaned files."""
 
     def __init__(
-        self, 
-        table_path: str, 
-        metadata_manager: MetadataManager, 
+        self,
+        table_path: str,
+        metadata_manager: MetadataManager,
         file_manager: FileManager
     ):
         self.table_path = table_path
@@ -37,14 +37,13 @@ class GarbageCollector:
             Dict with counts of deleted files by type.
         """
         stats = {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
-        
+
         # 1. Refresh metadata to get latest view
         metadata = self.metadata_manager.refresh()
         if not metadata:
             return stats
 
         logger.info(f"Starting garbage collection for {self.table_path}")
-        start_time = time.time()
 
         # 2. Identify all reachable files
         reachable_data_files: Set[str] = set()
@@ -62,7 +61,7 @@ class GarbageCollector:
             try:
                 if not self.storage.exists(m_list_path):
                     continue
-                    
+
                 manifests = self.file_manager.read_manifest_list_file(m_list_path)
                 for m in manifests:
                     m_path = m.manifest_path
@@ -76,7 +75,7 @@ class GarbageCollector:
             try:
                 if not self.storage.exists(m_path):
                     continue
-                    
+
                 data_files = self.file_manager.read_manifest_file(m_path)
                 for df in data_files:
                     reachable_data_files.add(self._normalize_path(df.file_path))
@@ -87,10 +86,10 @@ class GarbageCollector:
                     f"{len(reachable_manifests)} manifests, {len(reachable_data_files)} data files")
 
         # 3. List all files in storage and delete orphans
-        
+
         # GC Data Files
         stats["data_files"] = self._gc_prefix("data", reachable_data_files, grace_period_ms)
-        
+
         # GC Manifests (files in 'manifests/' that are NOT in reachable lists)
         all_reachable_manifests = reachable_manifests.union(reachable_manifest_lists)
         stats["manifest_files"] = self._gc_prefix("manifests", all_reachable_manifests, grace_period_ms)
@@ -107,7 +106,7 @@ class GarbageCollector:
             all_files = self.storage.list_files(prefix)
             for file_rel_path in all_files:
                 norm_path = self._normalize_path(file_rel_path)
-                
+
                 if norm_path not in reachable_set:
                     # Potential orphan. Check age.
                     try:
@@ -117,7 +116,7 @@ class GarbageCollector:
                             deleted_count += 1
                     except Exception as e:
                         logger.warning(f"Failed to process potential orphan {file_rel_path}: {e}")
-                        
+
         except Exception as e:
             logger.error(f"Error listing files in {prefix}: {e}")
 

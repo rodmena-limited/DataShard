@@ -2,21 +2,24 @@
 Main test suite for pytest
 """
 
+import os
 import sys
-from pathlib import Path
 
 import pytest
 
-# Add tests directory to path for imports
-tests_dir = Path(__file__).parent
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Get current directory
+tests_dir = os.path.dirname(os.path.abspath(__file__))
 if str(tests_dir) not in sys.path:
     sys.path.insert(0, str(tests_dir))
 
-import clear_demo
-import test_data_operations as data_ops_module
-import test_file_management as file_mgmt_module
-import test_iceberg
-import test_occ
+import clear_demo  # noqa: E402
+import test_data_operations as data_ops_module  # noqa: E402
+import test_file_management as file_mgmt_module  # noqa: E402
+import test_iceberg  # noqa: E402
+import test_occ  # noqa: E402
 
 
 def test_iceberg_functionality():

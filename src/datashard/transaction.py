@@ -87,22 +87,22 @@ class Transaction:
         schema: Optional["Schema"] = None,
     ) -> "Transaction":
         """Append a pandas DataFrame to the table.
-        
+
         Args:
             df: pandas DataFrame to append
             schema: Optional Schema. If None, uses the table's current schema.
-            
+
         Returns:
             Self for chaining
         """
         try:
             import pandas as pd
         except ImportError:
-            raise ImportError("pandas is required for append_pandas")
-            
+            raise ImportError("pandas is required for append_pandas") from None
+
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Expected a pandas DataFrame")
-            
+
         if schema is None:
             # Try to get current schema from metadata
             metadata = self.metadata_manager.refresh()
@@ -113,10 +113,10 @@ class Transaction:
                     if s.schema_id == current_schema_id:
                         schema = s
                         break
-        
+
         if schema is None:
             raise ValueError("Schema must be provided or table must have an existing schema")
-            
+
         records = df.to_dict("records")
         return self.append_data(records, schema)
 
@@ -143,7 +143,7 @@ class Transaction:
                     if s.schema_id == current_schema_id:
                         schema = s
                         break
-        
+
         if schema is None:
             raise ValueError("Schema must be provided or table must have an existing schema")
 
@@ -252,11 +252,11 @@ class Transaction:
                     snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
 
                     # --- START OF MANIFEST PROCESSING ---
-                    
+
                     # 1. Collect files to append and delete
                     append_files = []
                     deleted_paths = set()
-                    
+
                     for operation in self._operations:
                         if operation["type"] == "append_files":
                             append_files.extend(operation["files"])
@@ -272,7 +272,7 @@ class Transaction:
                             if s.snapshot_id == base_metadata.current_snapshot_id:
                                 base_snapshot = s
                                 break
-                        
+
                         if base_snapshot:
                              # Read the manifest list
                              try:
@@ -287,7 +287,7 @@ class Transaction:
 
                     # 3. Process Deletes (Rewrite manifests if needed)
                     final_manifests: List[ManifestFile] = []
-                    
+
                     if deleted_paths:
                         for manifest in existing_manifests:
                             # Read data files in this manifest
@@ -295,23 +295,23 @@ class Transaction:
                                 manifest_path = manifest.manifest_path
                                 if manifest_path.startswith("/"):
                                     manifest_path = manifest_path.lstrip("/")
-                                    
+
                                 data_files = self.file_manager.read_manifest_file(manifest_path)
-                                
+
                                 # Filter out deleted files
                                 surviving_files = [
-                                    f for f in data_files 
+                                    f for f in data_files
                                     if f.file_path not in deleted_paths and f.file_path.lstrip("/") not in deleted_paths
                                 ]
-                                
+
                                 if len(surviving_files) == len(data_files):
                                     # No changes, keep manifest
                                     final_manifests.append(manifest)
                                 elif len(surviving_files) > 0:
                                     # Partial delete: create new manifest
                                     new_manifest = self.file_manager.create_manifest_file(
-                                        surviving_files, 
-                                        ManifestContent.DATA, 
+                                        surviving_files,
+                                        ManifestContent.DATA,
                                         snapshot_id
                                     )
                                     # Preserve partition spec ID if possible, else default 0
@@ -320,11 +320,11 @@ class Transaction:
                                 else:
                                     # All files deleted: drop this manifest
                                     pass
-                            except Exception:
+                            except Exception as e:
                                 # If we can't read a manifest, we can't safely filter it.
                                 # For safety, keep it (fail safe) or fail transaction?
                                 # Failing is safer for consistency.
-                                raise RuntimeError(f"Failed to read manifest {manifest.manifest_path} during delete operation")
+                                raise RuntimeError(f"Failed to read manifest {manifest.manifest_path} during delete operation") from e
                     else:
                         final_manifests = list(existing_manifests)
 
@@ -332,7 +332,7 @@ class Transaction:
                     if append_files:
                         # Validate existence
                         self.file_manager.validate_data_files(append_files)
-                        
+
                         new_append_manifest = self.file_manager.create_manifest_file(
                             append_files,
                             ManifestContent.DATA,
@@ -684,11 +684,11 @@ class Table:
 
     def garbage_collect(self, grace_period_ms: int = 3600000) -> Dict[str, int]:
         """Delete orphaned files not referenced by any snapshot.
-        
+
         Args:
             grace_period_ms: Only delete orphaned files older than this age (default 1 hour).
                              This protects against deleting files currently being written.
-        
+
         Returns:
             Dict with counts of deleted files by type.
         """
@@ -1046,7 +1046,7 @@ class Table:
 
     def _get_all_data_files(self) -> List[DataFile]:
         """Get ALL data files from current snapshot.
-        
+
         Correctly uses the Iceberg model where the current snapshot's manifest list
         contains references to ALL valid data in the table.
         """
@@ -1064,7 +1064,7 @@ class Table:
 
             # Use FileManager to read manifest list
             manifest_files = self.file_manager.read_manifest_list_file(manifest_list_path)
-            
+
             all_data_files = []
             seen_paths = set()
 
@@ -1087,7 +1087,7 @@ class Table:
                         continue
                     seen_paths.add(file_path)
                     all_data_files.append(data_file)
-            
+
             return all_data_files
 
         except Exception:

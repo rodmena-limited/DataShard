@@ -6,14 +6,12 @@ and that queries return the written data.
 """
 
 import os
-import time
-import json
 import tempfile
-from typing import Any, Dict
 
 import fastavro
 import pytest
-from datashard import Schema, create_table, load_table
+
+from datashard import Schema, create_table
 
 
 def test_append_records_creates_non_empty_manifests():
