@@ -773,19 +773,21 @@ class Table:
             if schema:
                 data_files = prune_files_by_bounds(data_files, expressions, schema)
 
-        # Get file paths
-        parquet_files = self._get_parquet_files(data_files)
+        # Get file paths - use PyArrow-compatible paths for S3
+        data_file_manager = self.file_manager.data_file_manager
+        pyarrow_fs = data_file_manager._pyarrow_fs
+        parquet_files = self._get_parquet_files_arrow(data_files, data_file_manager)
 
         if not parquet_files:
             return []
 
-        # Define file reader function
+        # Define file reader function with filesystem support for S3
         def read_file(file_path: str) -> Optional[pa.Table]:
             try:
                 if pa_filters:
-                    return pq.read_table(file_path, columns=columns, filters=pa_filters)
+                    return pq.read_table(file_path, columns=columns, filters=pa_filters, filesystem=pyarrow_fs)
                 else:
-                    return pq.read_table(file_path, columns=columns)
+                    return pq.read_table(file_path, columns=columns, filesystem=pyarrow_fs)
             except Exception:
                 return None
 
@@ -813,6 +815,21 @@ class Table:
         if data_files:
             return [self._resolve_file_path(df.file_path) for df in data_files]
         return []
+
+    def _get_parquet_files_arrow(self, data_files: List[DataFile], data_file_manager: Any) -> List[str]:
+        """Get list of parquet file paths converted for PyArrow (S3-compatible).
+
+        For S3 storage, paths are converted to bucket/key format.
+        For local storage, paths are resolved to absolute paths.
+        """
+        if not data_files:
+            return []
+        result = []
+        for df in data_files:
+            # Use DataFileManager's path conversion for PyArrow compatibility
+            arrow_path = data_file_manager._get_arrow_path(df.file_path)
+            result.append(arrow_path)
+        return result
 
     def to_pandas(
         self,
@@ -874,19 +891,21 @@ class Table:
             if schema:
                 data_files = prune_files_by_bounds(data_files, expressions, schema)
 
-        # Get file paths
-        parquet_files = self._get_parquet_files(data_files)
+        # Get file paths - use PyArrow-compatible paths for S3
+        data_file_manager = self.file_manager.data_file_manager
+        pyarrow_fs = data_file_manager._pyarrow_fs
+        parquet_files = self._get_parquet_files_arrow(data_files, data_file_manager)
 
         if not parquet_files:
             return pd.DataFrame()
 
-        # Define file reader function
+        # Define file reader function with filesystem support for S3
         def read_file(file_path: str) -> Optional[pa.Table]:
             try:
                 if pa_filters:
-                    return pq.read_table(file_path, columns=columns, filters=pa_filters)
+                    return pq.read_table(file_path, columns=columns, filters=pa_filters, filesystem=pyarrow_fs)
                 else:
-                    return pq.read_table(file_path, columns=columns)
+                    return pq.read_table(file_path, columns=columns, filesystem=pyarrow_fs)
             except Exception:
                 return None
 
@@ -950,8 +969,10 @@ class Table:
                 if schema:
                     data_files = prune_files_by_bounds(data_files, expressions, schema)
 
-        # Get file paths
-        parquet_files = self._get_parquet_files(data_files)
+        # Get file paths - use PyArrow-compatible paths for S3
+        data_file_manager = self.file_manager.data_file_manager
+        pyarrow_fs = data_file_manager._pyarrow_fs
+        parquet_files = self._get_parquet_files_arrow(data_files, data_file_manager)
 
         if not parquet_files:
             return
@@ -961,7 +982,7 @@ class Table:
 
         # Process files one at a time
         yield from self._iter_file_batches(
-            parquet_files, batch_size, columns, compute_expr, pa, pq
+            parquet_files, batch_size, columns, compute_expr, pa, pq, pyarrow_fs
         )
 
     def _iter_file_batches(
@@ -972,11 +993,12 @@ class Table:
         compute_expr: Any,
         pa: Any,
         pq: Any,
+        filesystem: Any = None,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Iterate over batches from parquet files."""
         for file_path in parquet_files:
             try:
-                pf = pq.ParquetFile(file_path)
+                pf = pq.ParquetFile(file_path, filesystem=filesystem)
 
                 for batch in pf.iter_batches(batch_size=batch_size, columns=columns):
                     # Convert batch to table for filtering

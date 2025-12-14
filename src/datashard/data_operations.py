@@ -323,15 +323,30 @@ class DataFileManager:
         return None  # Local filesystem
 
     def _get_arrow_path(self, path: str) -> str:
-        """Convert path to PyArrow format (bucket/key for S3)"""
+        """Convert path to PyArrow format (bucket/key for S3, absolute for local)"""
         if isinstance(self.storage, S3StorageBackend):
             # For PyArrow S3FileSystem, path should be bucket/key
             key = self.storage._get_s3_key(path)
             return f"{self.storage.bucket}/{key}"
-        # For local filesystem, convert relative path to absolute path
-        # by joining with the storage base path
-        if not os.path.isabs(path) and hasattr(self.storage, "base_path"):
-            path = os.path.join(self.storage.base_path, path)
+        # For local filesystem, convert to absolute path
+        # Distinguish between:
+        # - Iceberg-style paths: /data/xxx.parquet, /metadata/xxx (relative to table)
+        # - True absolute paths: /tmp/xxx, /home/xxx (actual filesystem paths)
+        # - Relative paths: data/xxx.parquet (no leading /)
+        if path.startswith("/"):
+            # Check if it's an Iceberg-style path (starts with /data/ or /metadata/)
+            first_component = path.split("/")[1] if len(path.split("/")) > 1 else ""
+            if first_component in ("data", "metadata"):
+                # Iceberg-style path - join with table path
+                table_path = self.file_manager.table_path
+                return os.path.join(table_path, path.lstrip("/"))
+            else:
+                # True absolute path - return as-is
+                return path
+        elif not os.path.isabs(path):
+            # Relative path - join with table path
+            table_path = self.file_manager.table_path
+            return os.path.join(table_path, path)
         return path
 
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
