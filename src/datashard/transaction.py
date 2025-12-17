@@ -696,6 +696,19 @@ class Table:
         gc = GarbageCollector(self.table_path, self.metadata_manager, self.file_manager)
         return gc.collect(grace_period_ms)
 
+    def row_count(self) -> int:
+        """Get total row count from parquet metadata without scanning data.
+
+        This is a fast O(manifest_files) operation that reads only metadata,
+        not the actual parquet data files. Use this for count-only queries
+        instead of len(table.scan()).
+
+        Returns:
+            Total number of rows across all data files in current snapshot.
+        """
+        data_files = self._get_all_data_files()
+        return sum(df.record_count for df in data_files)
+
     def scan(
         self,
         columns: Optional[List[str]] = None,
