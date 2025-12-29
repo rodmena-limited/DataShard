@@ -305,6 +305,7 @@ class S3StorageBackend(StorageBackend):
         secret_key: Optional[str] = None,
         region: str = "us-east-1",
         prefix: str = "",
+        use_conditional_writes: bool = True,
     ):
         if not BOTO3_AVAILABLE:
             raise ImportError(
@@ -318,6 +319,7 @@ class S3StorageBackend(StorageBackend):
         self.access_key = access_key
         self.secret_key = secret_key
         self.region = region
+        self.use_conditional_writes = use_conditional_writes
 
         # Create S3 client
         session = boto3.session.Session()
@@ -334,6 +336,9 @@ class S3StorageBackend(StorageBackend):
             s3_config["aws_secret_access_key"] = secret_key
 
         self.s3 = session.client("s3", **s3_config)
+
+        if not use_conditional_writes:
+            logger.info("S3 conditional writes disabled. Using polling-based locking (less robust).")
 
     def _get_s3_key(self, path: str) -> str:
         """Convert path to S3 key"""
@@ -498,9 +503,13 @@ class S3StorageBackend(StorageBackend):
             raise
 
     def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
-        from .lock_provider import S3LockProvider
         key = self._get_s3_key(path)
-        return S3LockProvider(self.s3, self.bucket, key, timeout)
+        if self.use_conditional_writes:
+            from .lock_provider import S3LockProvider
+            return S3LockProvider(self.s3, self.bucket, key, timeout)
+        else:
+            from .lock_provider import S3PollingLockProvider
+            return S3PollingLockProvider(self.s3, self.bucket, key, timeout)
 
 
 def create_storage_backend(table_path: str) -> StorageBackend:
@@ -517,6 +526,9 @@ def create_storage_backend(table_path: str) -> StorageBackend:
             DATASHARD_S3_BUCKET: S3 bucket name
             DATASHARD_S3_REGION: AWS region (default: us-east-1)
             DATASHARD_S3_PREFIX: Optional prefix for all objects (default: "")
+            DATASHARD_S3_USE_CONDITIONAL_WRITES: "true" (default) or "false"
+                Set to "false" for S3 providers that don't support If-None-Match
+                headers (e.g., OVH Object Storage). Uses polling-based locking instead.
 
     Args:
         table_path: Table location (local path or S3-style identifier)
@@ -537,6 +549,7 @@ def create_storage_backend(table_path: str) -> StorageBackend:
         secret_key = os.getenv("DATASHARD_S3_SECRET_KEY")
         region = os.getenv("DATASHARD_S3_REGION", "us-east-1")
         env_prefix = os.getenv("DATASHARD_S3_PREFIX", "")
+        use_conditional_writes = os.getenv("DATASHARD_S3_USE_CONDITIONAL_WRITES", "true").lower() in ("true", "1", "yes")
 
         # Combine environment prefix with table path for full S3 prefix
         # table_path is the logical location of the table (e.g., "logs/workflow_logs")
@@ -561,6 +574,7 @@ def create_storage_backend(table_path: str) -> StorageBackend:
             secret_key=secret_key,
             region=region,
             prefix=full_prefix,
+            use_conditional_writes=use_conditional_writes,
         )
     else:
         # Local filesystem (default)

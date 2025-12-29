@@ -39,8 +39,8 @@ class LocalLockProvider(LockProvider):
     def release(self) -> None:
         self.lock.release()
 
-class S3LockProvider(LockProvider):
-    """S3-based distributed lock using conditional writes (If-None-Match)."""
+class S3LockProviderBase(LockProvider):
+    """Base class for S3-based distributed locks."""
 
     def __init__(
         self,
@@ -80,23 +80,8 @@ class S3LockProvider(LockProvider):
             time.sleep(0.5 + (time.time() % 0.5))
 
     def _try_acquire(self) -> bool:
-        import botocore.exceptions
-        try:
-            # Conditional Write: Only succeed if object does NOT exist
-            # We use If-None-Match: * to ensure we don't overwrite an existing lock
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=self.key,
-                Body=self.lock_id.encode('utf-8'),
-                IfNoneMatch='*'
-            )
-            return True
-        except botocore.exceptions.ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', '')
-            if error_code in ('PreconditionFailed', '412'):
-                # Lock already exists
-                return False
-            raise e
+        """Subclasses must implement the actual lock acquisition logic."""
+        raise NotImplementedError
 
     def _start_heartbeat(self) -> None:
         """Start the heartbeat thread to renew lock lease."""
@@ -237,3 +222,84 @@ class S3LockProvider(LockProvider):
             logger.warning(f"Error releasing S3 lock: {e}")
 
         self.is_locked = False
+
+
+class S3LockProvider(S3LockProviderBase):
+    """S3-based distributed lock using conditional writes (If-None-Match).
+
+    Requires S3 provider support for conditional PUT operations.
+    For providers without this support (e.g., OVH), use S3PollingLockProvider.
+    """
+
+    def _try_acquire(self) -> bool:
+        import botocore.exceptions
+        try:
+            # Conditional Write: Only succeed if object does NOT exist
+            # We use If-None-Match: * to ensure we don't overwrite an existing lock
+            self.s3.put_object(
+                Bucket=self.bucket,
+                Key=self.key,
+                Body=self.lock_id.encode('utf-8'),
+                IfNoneMatch='*'
+            )
+            return True
+        except botocore.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code in ('PreconditionFailed', '412'):
+                # Lock already exists
+                return False
+            raise e
+
+
+class S3PollingLockProvider(S3LockProviderBase):
+    """S3-based distributed lock using polling (for S3 providers without conditional writes).
+
+    This is a fallback for S3 providers like OVH that don't support If-None-Match headers.
+    Uses a check-then-write approach with verification, which is less robust than
+    conditional writes but provides best-effort locking.
+
+    Set DATASHARD_S3_USE_CONDITIONAL_WRITES=false to use this provider.
+    """
+
+    def _try_acquire(self) -> bool:
+        import botocore.exceptions
+
+        # Step 1: Check if lock file exists
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=self.key)
+            # Lock exists, can't acquire
+            return False
+        except botocore.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code != '404':
+                # Unexpected error
+                raise e
+            # Lock doesn't exist, proceed to acquire
+
+        # Step 2: Write our lock ID
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=self.key,
+            Body=self.lock_id.encode('utf-8')
+        )
+
+        # Step 3: Wait briefly to allow for race condition detection
+        time.sleep(random.uniform(0.1, 0.3))
+
+        # Step 4: Read back and verify we own it
+        try:
+            resp = self.s3.get_object(Bucket=self.bucket, Key=self.key)
+            content = resp['Body'].read().decode('utf-8')
+
+            if content == self.lock_id:
+                return True
+            else:
+                # Someone else won the race
+                logger.debug(f"Lost lock race at {self.key}: expected {self.lock_id}, got {content}")
+                return False
+        except botocore.exceptions.ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == '404':
+                # Lock disappeared (someone deleted it), retry
+                return False
+            raise e

@@ -1,30 +1,58 @@
 """
-Integration tests for S3-compatible storage backend (MinIO, AWS S3)
+Integration tests for S3-compatible storage backend (MinIO, AWS S3, OVH)
 
 These tests require S3 credentials to be set via environment variables:
 - DATASHARD_STORAGE_TYPE=s3
-- DATASHARD_S3_ENDPOINT=https://s3.rodmena.co.uk
-- DATASHARD_S3_ACCESS_KEY=rodmena
-- DATASHARD_S3_SECRET_KEY=pleasebeready
-- DATASHARD_S3_BUCKET=datashard
-- DATASHARD_S3_REGION=us-east-1
+- DATASHARD_S3_ENDPOINT=<your S3 endpoint>
+- DATASHARD_S3_ACCESS_KEY=<your access key>
+- DATASHARD_S3_SECRET_KEY=<your secret key>
+- DATASHARD_S3_BUCKET=<your bucket>
+- DATASHARD_S3_REGION=<your region>
+- DATASHARD_S3_USE_CONDITIONAL_WRITES=false (for OVH and other non-AWS providers)
 """
 
 import os
 import uuid
 
+import pytest
+
 from datashard import Schema, create_table, load_table
+
+# Store original env vars at module load time
+_ORIGINAL_S3_ENV = {
+    "DATASHARD_STORAGE_TYPE": os.getenv("DATASHARD_STORAGE_TYPE"),
+    "DATASHARD_S3_ENDPOINT": os.getenv("DATASHARD_S3_ENDPOINT"),
+    "DATASHARD_S3_ACCESS_KEY": os.getenv("DATASHARD_S3_ACCESS_KEY"),
+    "DATASHARD_S3_SECRET_KEY": os.getenv("DATASHARD_S3_SECRET_KEY"),
+    "DATASHARD_S3_BUCKET": os.getenv("DATASHARD_S3_BUCKET"),
+    "DATASHARD_S3_REGION": os.getenv("DATASHARD_S3_REGION"),
+    "DATASHARD_S3_USE_CONDITIONAL_WRITES": os.getenv("DATASHARD_S3_USE_CONDITIONAL_WRITES"),
+}
+
+
+def _setup_s3_env():
+    """Setup S3 env vars from saved original values."""
+    for key, value in _ORIGINAL_S3_ENV.items():
+        if value is not None:
+            os.environ[key] = value
+    # Ensure storage type is s3
+    os.environ["DATASHARD_STORAGE_TYPE"] = "s3"
+
+
+# Skip all tests if S3 credentials are not configured
+def _s3_configured():
+    return bool(_ORIGINAL_S3_ENV.get("DATASHARD_S3_BUCKET"))
+
+
+pytestmark = pytest.mark.skipif(
+    not _s3_configured(),
+    reason="S3 credentials not configured (set DATASHARD_S3_* env vars)"
+)
 
 
 def test_s3_storage_create_table():
     """Test creating a table with S3 storage backend"""
-    # Setup S3 env vars
-    os.environ["DATASHARD_STORAGE_TYPE"] = "s3"
-    os.environ["DATASHARD_S3_ENDPOINT"] = "https://s3.rodmena.co.uk"
-    os.environ["DATASHARD_S3_ACCESS_KEY"] = "rodmena"
-    os.environ["DATASHARD_S3_SECRET_KEY"] = "pleasebeready"
-    os.environ["DATASHARD_S3_BUCKET"] = "datashard"
-    os.environ["DATASHARD_S3_REGION"] = "us-east-1"
+    _setup_s3_env()
 
     # Create unique table name
     table_name = f"test_table_{uuid.uuid4().hex[:8]}"
@@ -59,6 +87,7 @@ def test_s3_storage_create_table():
             "DATASHARD_S3_SECRET_KEY",
             "DATASHARD_S3_BUCKET",
             "DATASHARD_S3_REGION",
+            "DATASHARD_S3_USE_CONDITIONAL_WRITES",
         ]:
             if key in os.environ:
                 del os.environ[key]
@@ -66,13 +95,7 @@ def test_s3_storage_create_table():
 
 def test_s3_storage_write_and_read():
     """Test writing and reading data with S3 storage"""
-    # Setup S3 env vars
-    os.environ["DATASHARD_STORAGE_TYPE"] = "s3"
-    os.environ["DATASHARD_S3_ENDPOINT"] = "https://s3.rodmena.co.uk"
-    os.environ["DATASHARD_S3_ACCESS_KEY"] = "rodmena"
-    os.environ["DATASHARD_S3_SECRET_KEY"] = "pleasebeready"
-    os.environ["DATASHARD_S3_BUCKET"] = "datashard"
-    os.environ["DATASHARD_S3_REGION"] = "us-east-1"
+    _setup_s3_env()
 
     # Create unique table name
     table_name = f"test_table_{uuid.uuid4().hex[:8]}"
@@ -131,6 +154,7 @@ def test_s3_storage_write_and_read():
             "DATASHARD_S3_SECRET_KEY",
             "DATASHARD_S3_BUCKET",
             "DATASHARD_S3_REGION",
+            "DATASHARD_S3_USE_CONDITIONAL_WRITES",
         ]:
             if key in os.environ:
                 del os.environ[key]
@@ -138,13 +162,7 @@ def test_s3_storage_write_and_read():
 
 def test_s3_multiple_transactions():
     """Test multiple concurrent transactions with S3"""
-    # Setup S3 env vars
-    os.environ["DATASHARD_STORAGE_TYPE"] = "s3"
-    os.environ["DATASHARD_S3_ENDPOINT"] = "https://s3.rodmena.co.uk"
-    os.environ["DATASHARD_S3_ACCESS_KEY"] = "rodmena"
-    os.environ["DATASHARD_S3_SECRET_KEY"] = "pleasebeready"
-    os.environ["DATASHARD_S3_BUCKET"] = "datashard"
-    os.environ["DATASHARD_S3_REGION"] = "us-east-1"
+    _setup_s3_env()
 
     # Create unique table name
     table_name = f"test_table_{uuid.uuid4().hex[:8]}"
@@ -195,6 +213,7 @@ def test_s3_multiple_transactions():
             "DATASHARD_S3_SECRET_KEY",
             "DATASHARD_S3_BUCKET",
             "DATASHARD_S3_REGION",
+            "DATASHARD_S3_USE_CONDITIONAL_WRITES",
         ]:
             if key in os.environ:
                 del os.environ[key]
