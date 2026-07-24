@@ -2,14 +2,22 @@
 Metadata management for the Python Iceberg implementation
 """
 
+import re
 import threading
+import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
+from .logging_config import get_logger
 
 if TYPE_CHECKING:
     from .storage_backend import StorageBackend
+
+logger = get_logger(__name__)
+
+# Matches both legacy (v3.metadata.json) and current (v3-1a2b3c4d.metadata.json) names
+_METADATA_FILE_RE = re.compile(r"^v(\d+)(?:-[0-9a-f]{8})?\.metadata\.json$")
 
 
 class ConcurrentModificationException(Exception):
@@ -18,8 +26,29 @@ class ConcurrentModificationException(Exception):
     pass
 
 
+class TableExistsError(Exception):
+    """Raised when initializing a table over an already-initialized table."""
+
+    pass
+
+
+class AmbiguousCommitError(Exception):
+    """Raised when the commit-point write failed in a way that may still have
+    become visible (e.g. an S3 PUT that errored client-side after possibly
+    succeeding server-side).
+
+    Callers MUST NOT delete files written for this transaction: the commit may
+    be durable and referencing them. Orphan cleanup is the garbage collector's
+    job once the true outcome is observable.
+    """
+
+    pass
+
+
 class MetadataManager:
     """Manages table metadata persistence and updates"""
+
+    HINT_PATH = "metadata.version-hint.text"
 
     def __init__(self, table_path: str, storage: "StorageBackend"):
         self.table_path = table_path
@@ -36,49 +65,93 @@ class MetadataManager:
         self.storage.makedirs(self.metadata_path, exist_ok=True)
 
     def initialize_table(self, metadata: TableMetadata) -> TableMetadata:
-        """Initialize a new table with the given metadata"""
+        """Initialize a new table with the given metadata.
+
+        Guarded: refuses to run against an already-initialized table (any
+        readable version hint or existing v*.metadata.json), and takes the
+        metadata lock so two concurrent creators cannot both initialize.
+
+        Raises:
+            TableExistsError: If the table already has metadata.
+        """
         with self._lock:
-            # Set initial values
-            if metadata.current_snapshot_id is None:
-                metadata.current_snapshot_id = -1  # No snapshot initially
-            metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
+            self.lock_provider.acquire()
+            try:
+                # Refuse to clobber an existing table. This covers both a valid
+                # hint AND hint-less tables recovered by scanning metadata files,
+                # so a lost/corrupt hint can never lead to destructive re-init.
+                if self._current_version_info() is not None:
+                    raise TableExistsError(
+                        f"Table at {self.table_path} is already initialized; "
+                        f"refusing to overwrite its metadata"
+                    )
 
-            # Write the metadata file
-            metadata_file = f"v{self.current_version}.metadata.json"
-            metadata_path = f"{self.metadata_path}/{metadata_file}"
+                # Set initial values
+                if metadata.current_snapshot_id is None:
+                    metadata.current_snapshot_id = -1  # No snapshot initially
+                metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
 
-            self._write_metadata_file(metadata_path, metadata)
+                # Write the metadata file
+                metadata_file = self._new_metadata_filename(0)
+                metadata_path = f"{self.metadata_path}/{metadata_file}"
+                self._write_metadata_file(metadata_path, metadata)
 
-            # Create version hint file
-            self._write_version_hint(self.current_version)
+                # Create version hint file. Where the backend supports CAS,
+                # create-if-absent so a racing initializer loses loudly.
+                if self.storage.supports_cas:
+                    from .storage_backend import CASConflictError
 
-            return metadata
+                    try:
+                        self.storage.write_file_cas(
+                            self.HINT_PATH, metadata_file.encode("utf-8"), etag=None
+                        )
+                    except CASConflictError as e:
+                        raise TableExistsError(
+                            f"Table at {self.table_path} was concurrently initialized"
+                        ) from e
+                else:
+                    self.storage.write_file(self.HINT_PATH, metadata_file.encode("utf-8"))
+
+                self.current_version = 0
+                return metadata
+            finally:
+                self._release_lock_safely()
 
     def refresh(self) -> Optional[TableMetadata]:
-        """Refresh metadata from the latest version"""
+        """Refresh metadata from the latest version.
+
+        The version hint is treated as a HINT, not the source of truth: if it
+        is missing, unreadable, or points at a missing file, the latest
+        version is recovered by scanning v*.metadata.json files.
+        """
         with self._lock:
-            version = self._read_version_hint()
-            if version is None:
+            info = self._current_version_info()
+            if info is None:
                 return None
 
-            metadata_file = f"v{version}.metadata.json"
+            _version, metadata_file = info
             metadata_path = f"{self.metadata_path}/{metadata_file}"
-
-            if not self.storage.exists(metadata_path):
-                return None
-
             return self._read_metadata_file(metadata_path)
 
     def commit(self, base_metadata: TableMetadata, new_metadata: TableMetadata) -> TableMetadata:
         """Commit new metadata with Optimistic Concurrency Control following Iceberg pattern.
 
-        CRITICAL RACE CONDITION FIX:
-        - Hold lock for entire operation (check + increment + write)
-        - PHASE 2: Use file-based locking for multi-process safety
-        - Write metadata file BEFORE updating version hint (two-phase commit)
+        Protocol:
+        1. Acquire thread lock + distributed lock.
+        2. Validate base against current state (OCC check).
+        3. Write the new metadata to a UNIQUE filename (version + random suffix)
+           so concurrent committers can never overwrite each other's content.
+        4. Fencing check: re-validate we still hold the distributed lock.
+        5. Flip the version hint - the commit point. On CAS-capable backends
+           this is a conditional PUT keyed to the hint's ETag, so even a fully
+           broken lock cannot produce a silent lost update.
+
+        Raises:
+            ConcurrentModificationException: Clean conflict - safe to retry.
+            AmbiguousCommitError: The commit-point write failed but may have
+                succeeded server-side. Callers must NOT delete data files.
         """
         # Acquire thread lock for thread safety within same process
-        # This also protects the non-thread-safe FileLock instance from concurrent access
         with self._lock:
             # PHASE 2: Acquire distributed lock for multi-process safety
             self.lock_provider.acquire()
@@ -109,30 +182,104 @@ class MetadataManager:
                 # PHASE 2: Prepare new version
                 new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
 
-                # Read current version from filesystem for multi-process safety
-                # CRITICAL: This must be inside the lock to prevent race on version increment
-                filesystem_version = self._read_version_hint()
+                # Read current version (and, on CAS backends, the hint's ETag so
+                # the commit point below can be a true compare-and-swap).
+                hint_etag: Optional[str] = None
+                filesystem_version: Optional[int] = None
+                if self.storage.supports_cas:
+                    try:
+                        hint_bytes, hint_etag = self.storage.read_file_with_etag(self.HINT_PATH)
+                        parsed = self._parse_hint_content(hint_bytes)
+                        if parsed is not None:
+                            filesystem_version = parsed[0]
+                    except FileNotFoundError:
+                        hint_etag = None
+                if filesystem_version is None:
+                    info = self._current_version_info()
+                    filesystem_version = info[0] if info is not None else None
                 if filesystem_version is None:
                     filesystem_version = 0
                 next_version = filesystem_version + 1
 
-                # PHASE 3: Write new metadata file (but don't make it visible yet)
-                metadata_file = f"v{next_version}.metadata.json"
+                # PHASE 3: Write new metadata file (but don't make it visible yet).
+                # The filename embeds a random suffix: two racing committers can
+                # never write the same object, so the winner's hint always
+                # references the winner's content.
+                metadata_file = self._new_metadata_filename(next_version)
                 metadata_path = f"{self.metadata_path}/{metadata_file}"
                 self._write_metadata_file(metadata_path, new_metadata)
 
-                # PHASE 4: Atomically make new version visible
-                # This is the commit point - after this, the new metadata is visible
-                # If we crash before this, the new metadata file is orphaned but table is consistent
-                self._write_version_hint(next_version)
+                # PHASE 3.5: Fencing - re-validate lock ownership immediately
+                # before the commit point. A holder whose lease was broken (e.g.
+                # after a long pause) must not flip the hint.
+                if not self.lock_provider.is_held():
+                    raise ConcurrentModificationException(
+                        "Lost distributed lock before commit point; retrying"
+                    )
+
+                # PHASE 4: Atomically make new version visible.
+                # This is the commit point - after this, the new metadata is visible.
+                # If we crash before this, the new metadata file is orphaned but table is consistent.
+                self._write_hint_at_commit_point(metadata_file, hint_etag)
 
                 # Success - update in-memory version
                 self.current_version = next_version
 
                 return new_metadata
             finally:
-                # PHASE 2: Always release lock
-                self.lock_provider.release()
+                # PHASE 2: Always release lock - and never let a release failure
+                # mask/poison the commit outcome (a durable commit must not be
+                # reported as failed because unlock hiccuped).
+                self._release_lock_safely()
+
+    def _write_hint_at_commit_point(self, metadata_file: str, hint_etag: Optional[str]) -> None:
+        """Flip the version hint (the commit point), classifying failures.
+
+        - CAS backends: conditional PUT. Precondition failure = clean conflict
+          (ConcurrentModificationException, retryable). Any other error is
+          AMBIGUOUS (the PUT may have landed) -> AmbiguousCommitError.
+        - Backends with atomic_write_failures (local temp+rename): an exception
+          means the flip did not happen -> propagate as a clean failure.
+        - Other backends: an exception is ambiguous -> AmbiguousCommitError.
+        """
+        from .storage_backend import CASConflictError
+
+        content = metadata_file.encode("utf-8")
+
+        if self.storage.supports_cas:
+            try:
+                self.storage.write_file_cas(self.HINT_PATH, content, hint_etag)
+                return
+            except CASConflictError as e:
+                raise ConcurrentModificationException(
+                    "Version hint changed under us (CAS conflict); retrying"
+                ) from e
+            except Exception as e:
+                raise AmbiguousCommitError(
+                    f"Version hint write failed ambiguously: {e}"
+                ) from e
+
+        try:
+            self.storage.write_file(self.HINT_PATH, content)
+        except Exception as e:
+            if self.storage.atomic_write_failures:
+                # Guaranteed not visible - clean failure, caller may roll back.
+                raise
+            raise AmbiguousCommitError(
+                f"Version hint write failed ambiguously: {e}"
+            ) from e
+
+    def _release_lock_safely(self) -> None:
+        """Release the distributed lock without ever raising."""
+        try:
+            self.lock_provider.release()
+        except Exception as e:
+            logger.warning(f"Failed to release metadata lock (will self-heal by lease expiry): {e}")
+
+    @staticmethod
+    def _new_metadata_filename(version: int) -> str:
+        """Unique metadata filename: version + random suffix (Iceberg-style)."""
+        return f"v{version}-{uuid.uuid4().hex[:8]}.metadata.json"
 
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """Get a specific snapshot by ID"""
@@ -342,17 +489,93 @@ class MetadataManager:
             metadata_log=metadata_dict["metadata_log"],
         )
 
-    def _write_version_hint(self, version: int) -> None:
-        """Write the current version number to a hint file"""
-        hint_path = "metadata.version-hint.text"
-        content = str(version).encode("utf-8")
-        self.storage.write_file(hint_path, content)
+    # ------------------------------------------------------------------
+    # Version-hint handling (hint = pointer, metadata files = truth)
+    # ------------------------------------------------------------------
 
-    def _read_version_hint(self) -> Optional[int]:
-        """Read the current version number from the hint file"""
-        hint_path = "metadata.version-hint.text"
-        if not self.storage.exists(hint_path):
+    @staticmethod
+    def _parse_hint_content(content: bytes) -> Optional[Tuple[int, str]]:
+        """Parse hint file content into (version, metadata_filename).
+
+        Supports the legacy format (bare version number) and the current
+        format (full metadata filename). Returns None if unparseable.
+        """
+        try:
+            text = content.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+        if not text:
+            return None
+        if text.isdigit():
+            # Legacy format: plain version number -> legacy filename
+            return int(text), f"v{text}.metadata.json"
+        m = _METADATA_FILE_RE.match(text)
+        if m:
+            return int(m.group(1)), text
+        return None
+
+    def _read_version_hint(self) -> Optional[Tuple[int, str]]:
+        """Read (version, metadata_filename) from the hint file, or None."""
+        if not self.storage.exists(self.HINT_PATH):
+            return None
+        content = self.storage.read_file(self.HINT_PATH)
+        return self._parse_hint_content(content)
+
+    def _recover_version_from_files(self) -> Optional[Tuple[int, str]]:
+        """Recover the latest (version, filename) by scanning metadata files.
+
+        Used when the hint is missing/corrupt/stale. Picks the highest version;
+        among same-version files (possible after historical races) prefers the
+        most recently modified.
+        """
+        try:
+            all_files = self.storage.list_files(self.metadata_path)
+        except Exception:
             return None
 
-        content = self.storage.read_file(hint_path).decode("utf-8").strip()
-        return int(content) if content.isdigit() else None
+        best: Optional[Tuple[int, str]] = None
+        best_mtime = -1.0
+        for rel_path in all_files:
+            basename = rel_path.replace("\\", "/").rsplit("/", 1)[-1]
+            # Only consider files directly in metadata/ (not metadata/manifests/...)
+            parent = rel_path.replace("\\", "/").rsplit("/", 1)[0] if "/" in rel_path.replace("\\", "/") else ""
+            if parent not in ("", self.metadata_path):
+                continue
+            m = _METADATA_FILE_RE.match(basename)
+            if not m:
+                continue
+            version = int(m.group(1))
+            if best is None or version > best[0]:
+                best = (version, basename)
+                try:
+                    best_mtime = self.storage.get_modified_time(f"{self.metadata_path}/{basename}")
+                except Exception:
+                    best_mtime = -1.0
+            elif version == best[0]:
+                try:
+                    mtime = self.storage.get_modified_time(f"{self.metadata_path}/{basename}")
+                except Exception:
+                    mtime = -1.0
+                if mtime > best_mtime:
+                    best = (version, basename)
+                    best_mtime = mtime
+
+        if best is not None:
+            logger.warning(
+                f"Version hint missing or invalid for {self.table_path}; "
+                f"recovered latest metadata {best[1]} by scanning"
+            )
+        return best
+
+    def _current_version_info(self) -> Optional[Tuple[int, str]]:
+        """Resolve the current (version, metadata_filename).
+
+        Prefers a valid hint that points at an existing file; otherwise falls
+        back to scanning metadata files (#22: the hint is only a hint).
+        """
+        hinted = self._read_version_hint()
+        if hinted is not None:
+            _version, filename = hinted
+            if self.storage.exists(f"{self.metadata_path}/{filename}"):
+                return hinted
+        return self._recover_version_from_files()

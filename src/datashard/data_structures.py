@@ -44,6 +44,8 @@ class Schema:
             "uuid", "fixed", "binary"
         }
 
+        seen_ids: set = set()
+        seen_names: set = set()
         for field_def in self.fields:
             if "id" not in field_def:
                  raise ValueError(f"Invalid schema: Field missing required property 'id': {field_def}")
@@ -51,6 +53,18 @@ class Schema:
                  raise ValueError(f"Invalid schema: Field missing required property 'name': {field_def}")
             if "type" not in field_def:
                  raise ValueError(f"Invalid schema: Field missing required property 'type': {field_def}")
+
+            f_id = field_def["id"]
+            f_name = field_def["name"]
+            if f_id in seen_ids:
+                raise ValueError(
+                    f"Invalid schema: duplicate field id {f_id} (field '{f_name}'). "
+                    f"Field ids must be unique - duplicate ids corrupt column statistics and file pruning."
+                )
+            if f_name in seen_names:
+                raise ValueError(f"Invalid schema: duplicate field name '{f_name}'")
+            seen_ids.add(f_id)
+            seen_names.add(f_name)
 
             f_type = field_def["type"]
             if isinstance(f_type, str):
@@ -115,6 +129,8 @@ class DataFile:
     split_compressed_offsets: Optional[List[int]] = None
     equality_ids: Optional[List[int]] = None
     sort_order_id: Optional[int] = None
+    # Snapshot that originally added this file (preserved across manifest rewrites)
+    added_snapshot_id: Optional[int] = None
 
 
 @dataclass

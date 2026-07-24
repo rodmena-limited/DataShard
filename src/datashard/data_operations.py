@@ -257,8 +257,16 @@ class DataFileWriter:
             if self._temp_file:
                 temp_name = self._temp_file.name
                 try:
-                    # Ensure file is flushed to disk before rename
-                    # Note: ParquetWriter.close() already flushes
+                    # Durability: ParquetWriter.close() only flushes to the page
+                    # cache; fsync the file contents before the rename so a
+                    # committed snapshot can never reference data lost in a
+                    # power failure (metadata writes are already fsync'd).
+                    fsync_fd = os.open(temp_name, os.O_RDONLY)
+                    try:
+                        os.fsync(fsync_fd)
+                    finally:
+                        os.close(fsync_fd)
+
                     # Atomic rename on both POSIX and Windows
                     os.replace(temp_name, self.file_path)
 
@@ -410,6 +418,36 @@ class DataFileManager:
 
         return type_mapping.get(str(iceberg_type), pa.string())  # Default to string
 
+    def validate_records_strict(
+        self, records: List[Dict[str, Any]], iceberg_schema: Schema
+    ) -> None:
+        """Validate records against the schema, raising on silent-loss hazards.
+
+        - Unknown/misnamed fields raise instead of being silently dropped by
+          pyarrow's schema projection.
+        - Required (non-nullable) fields must be present and non-None; pyarrow's
+          from_pylist does not enforce nullability, so we must.
+        Type mismatches are left to pyarrow, which raises on incompatible values.
+        """
+        # Schema.__post_init__ guarantees every field has a "name".
+        allowed = {str(f["name"]) for f in iceberg_schema.fields}
+        required = {
+            str(f["name"]) for f in iceberg_schema.fields if f.get("required", False)
+        }
+
+        for i, record in enumerate(records):
+            unknown = {str(k) for k in record.keys()} - allowed
+            if unknown:
+                raise ValueError(
+                    f"Record {i} has fields not in the table schema: {sorted(unknown)}. "
+                    f"Schema fields: {sorted(allowed)}. Refusing to silently drop data."
+                )
+            for name in required:
+                if record.get(name) is None:
+                    raise ValueError(
+                        f"Record {i} is missing required field '{name}' (or it is None)"
+                    )
+
     def write_data_file(
         self,
         file_path: str,
@@ -419,6 +457,9 @@ class DataFileManager:
         partition_values: Optional[Dict[str, Any]] = None,
     ) -> DataFile:
         """Write data records to a file and return DataFile metadata"""
+
+        if records:
+            self.validate_records_strict(records, iceberg_schema)
 
         arrow_schema = self.create_arrow_schema(iceberg_schema)
 
@@ -545,16 +586,24 @@ class DataFileManager:
         # Convert path for PyArrow (adds bucket prefix for S3)
         arrow_path = self._get_arrow_path(file_path)
 
-        with DataFileWriter(arrow_path, file_format, arrow_schema, {}, self._pyarrow_fs) as writer:
-            writer.write_pandas(df)
+        # Compute column bounds before writing (parity with write_data_file so
+        # pandas-written files participate in pruning)
+        arrow_table = pa.Table.from_pandas(df, schema=arrow_schema)
+        lower_bounds, upper_bounds = self._compute_column_bounds(arrow_table, iceberg_schema)
 
-        # Create and return the DataFile object with statistics
-        # For S3, use storage backend to get size
-        file_size = (
-            self.storage.get_size(file_path.lstrip("/"))
-            if isinstance(self.storage, S3StorageBackend)
-            else os.path.getsize(file_path)
-        )
+        with DataFileWriter(arrow_path, file_format, arrow_schema, {}, self._pyarrow_fs) as writer:
+            writer.write_batch(arrow_table)
+
+        # Size + checksum via the RESOLVED path (file_path is table-relative and
+        # only resolves from the table root; arrow_path is the real location)
+        if isinstance(self.storage, S3StorageBackend):
+            clean_path = file_path.lstrip("/")
+            file_size = self.storage.get_size(clean_path)
+            with self.storage.open_file(clean_path) as stream:
+                checksum = IntegrityChecker.compute_checksum_from_stream(stream)
+        else:
+            file_size = os.path.getsize(arrow_path)
+            checksum = IntegrityChecker.compute_file_checksum(arrow_path)
 
         return DataFile(
             file_path=file_path,
@@ -562,6 +611,9 @@ class DataFileManager:
             partition_values=partition_values or {},
             record_count=writer.row_count,
             file_size_in_bytes=file_size,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            checksum=checksum,
         )
 
     def read_data_file(

@@ -80,7 +80,14 @@ def parse_filter_dict(filter_dict: Dict[str, Any]) -> List[FilterExpression]:
 
 
 def _parse_op(op_str: str) -> FilterOp:
-    """Parse operator string to FilterOp enum"""
+    """Parse operator string to FilterOp enum.
+
+    Raises:
+        ValueError: If the operator is not recognized. Unknown operators must
+            never be silently coerced to equality - a typo like "gte" or an
+            unsupported operator like "startswith" would otherwise return
+            plausible-looking wrong results.
+    """
     mapping = {
         "==": FilterOp.EQ,
         "=": FilterOp.EQ,
@@ -101,7 +108,15 @@ def _parse_op(op_str: str) -> FilterOp:
         "not in": FilterOp.NOT_IN,
         "notin": FilterOp.NOT_IN,
     }
-    return mapping.get(op_str.lower() if isinstance(op_str, str) else op_str, FilterOp.EQ)
+    key = op_str.lower() if isinstance(op_str, str) else op_str
+    op = mapping.get(key)
+    if op is None:
+        raise ValueError(
+            f"Unknown filter operator: {op_str!r}. Supported operators: "
+            f"{sorted(k for k in mapping if isinstance(k, str))}, "
+            f"'between', 'is_null', 'is_not_null'"
+        )
+    return op
 
 
 def to_pyarrow_filter(
@@ -150,6 +165,21 @@ def _build_condition(
     field: pc.Expression,
 ) -> pc.Expression:
     """Build a PyArrow compute condition for a single filter expression."""
+
+    def _in_condition() -> pc.Expression:
+        values = list(expr.value)
+        if not values:
+            # IN () matches nothing (SQL semantics)
+            return pc.scalar(False)
+        return pc.is_in(field, value_set=pa.array(values))
+
+    def _not_in_condition() -> pc.Expression:
+        values = list(expr.value)
+        if not values:
+            # NOT IN () matches every row
+            return pc.scalar(True)
+        return ~pc.is_in(field, value_set=pa.array(values))
+
     op_handlers: Dict[FilterOp, Any] = {
         FilterOp.EQ: lambda: field == expr.value,
         FilterOp.NE: lambda: field != expr.value,
@@ -157,15 +187,14 @@ def _build_condition(
         FilterOp.LE: lambda: field <= expr.value,
         FilterOp.GT: lambda: field > expr.value,
         FilterOp.GE: lambda: field >= expr.value,
-        FilterOp.IN: lambda: pc.is_in(field, value_set=pa.array(expr.value)),
-        FilterOp.NOT_IN: lambda: ~pc.is_in(field, value_set=pa.array(expr.value)),
+        FilterOp.IN: _in_condition,
+        FilterOp.NOT_IN: _not_in_condition,
         FilterOp.IS_NULL: lambda: field.is_null(),
         FilterOp.IS_NOT_NULL: lambda: field.is_valid(),
     }
     handler = op_handlers.get(expr.op)
     if handler is None:
-        # Default to equality for unknown ops
-        return field == expr.value
+        raise ValueError(f"Unsupported filter operator: {expr.op}")
     return handler()
 
 

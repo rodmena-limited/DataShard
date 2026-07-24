@@ -6,7 +6,10 @@ Provides the primary API for working with Iceberg tables
 from typing import Optional
 
 from .data_structures import DataFile, FileFormat, PartitionSpec, Schema
+from .logging_config import get_logger
 from .transaction import Table, Transaction
+
+logger = get_logger(__name__)
 
 
 def create_table(
@@ -15,35 +18,39 @@ def create_table(
     partition_spec: Optional[PartitionSpec] = None,
 ) -> "Table":
     """
-    Create a new Iceberg table
+    Create a new Iceberg table (or open the existing one at table_path).
+
+    The provided schema and partition spec are PERSISTED into the table
+    metadata, so subsequent appends without an explicit schema use them.
+    Initialization is guarded and race-safe: an already-initialized table is
+    never overwritten, and two concurrent creators cannot clobber each other.
 
     Args:
         table_path: Path where the table should be stored
-        schema: Optional schema for the table
-        partition_spec: Optional partition spec for the table
+        schema: Optional schema for the table (persisted as the current schema)
+        partition_spec: Optional partition spec for the table (persisted)
 
     Returns:
         Table instance
     """
-    from .storage_backend import create_storage_backend
+    table = Table(
+        table_path,
+        create_if_not_exists=True,
+        schema=schema,
+        partition_spec=partition_spec,
+    )
 
-    # Create storage backend and ensure table directory exists
-    storage = create_storage_backend(table_path)
-    storage.makedirs(".", exist_ok=True)
+    # If the table already existed, a provided schema is NOT applied - warn
+    # loudly rather than silently ignoring correctness-relevant input.
+    if schema is not None:
+        current = table._get_current_schema()
+        if current is None or not current.fields:
+            logger.warning(
+                f"create_table({table_path!r}): table already existed without a persisted "
+                f"schema; the provided schema was NOT applied. Appends must pass schema= "
+                f"explicitly."
+            )
 
-    # Create the table instance (will create storage internally)
-    table = Table(table_path, create_if_not_exists=True)
-
-    # Initialize the table with default metadata if it doesn't exist
-    current_metadata = table.metadata_manager.refresh()
-    if current_metadata is None:
-        from .data_structures import TableMetadata
-
-        initial_metadata = TableMetadata(location=table_path)
-        table.metadata_manager.initialize_table(initial_metadata)
-
-    # If schema is provided, we'd update the table metadata
-    # For now, we'll just return the table with default schema
     return table
 
 
@@ -56,15 +63,18 @@ def load_table(table_path: str) -> Table:
 
     Returns:
         Table instance
-    """
-    from .storage_backend import create_storage_backend
 
-    # Check if table exists using storage backend
-    storage = create_storage_backend(table_path)
-    if not storage.exists("metadata"):
+    Raises:
+        ValueError: If no initialized table exists at table_path.
+    """
+    table = Table(table_path, create_if_not_exists=False)
+
+    # Verify actual metadata exists (a bare directory is not a table). Uses the
+    # recovery-aware refresh, so a table with a lost version hint still loads.
+    if table.metadata_manager.refresh() is None:
         raise ValueError(f"No Iceberg table found at {table_path}")
 
-    return Table(table_path, create_if_not_exists=False)
+    return table
 
 
 __all__ = ["Table", "Transaction", "create_table", "load_table", "DataFile", "FileFormat"]

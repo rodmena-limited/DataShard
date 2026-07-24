@@ -2,12 +2,23 @@
 datashard - Safe concurrent data operations for ML/AI workloads
 
 A Python implementation of Apache Iceberg providing ACID transactions,
-time travel, and safe concurrent access.
+snapshotting, and safe concurrent access.
 
 Supports both local filesystem and S3-compatible storage (AWS S3, MinIO, etc.)
 """
 
-__version__ = "0.3.2"
+# Single source of truth for the version is pyproject.toml; resolve it from
+# package metadata so __version__ can never drift from the released version.
+try:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        __version__ = version("datashard")
+    except PackageNotFoundError:
+        __version__ = "0.6.0"
+except ImportError:  # pragma: no cover - Python < 3.8
+    __version__ = "0.6.0"
+
 __author__ = "RODMENA LIMITED"
 
 
@@ -22,8 +33,14 @@ from .data_structures import (
     TableMetadata,
 )
 from .filters import FilterExpression, FilterOp, parse_filter_dict
+from .garbage_collector import GarbageCollectionAborted
 from .iceberg import DataFile, FileFormat, create_table, load_table
-from .metadata_manager import ConcurrentModificationException
+from .integrity import CorruptDataError
+from .metadata_manager import (
+    AmbiguousCommitError,
+    ConcurrentModificationException,
+    TableExistsError,
+)
 from .transaction import Table, Transaction
 
 __all__ = [
@@ -44,6 +61,10 @@ __all__ = [
     "FilterExpression",
     "parse_filter_dict",
     "ConcurrentModificationException",
+    "AmbiguousCommitError",
+    "TableExistsError",
+    "CorruptDataError",
+    "GarbageCollectionAborted",
     "__version__",
     "__author__",
 ]

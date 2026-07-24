@@ -4,7 +4,9 @@ File system operations and manifest management for the Python Iceberg implementa
 Supports both local filesystem and S3-compatible storage via StorageBackend abstraction
 """
 
-from datetime import datetime
+import json
+import uuid
+from datetime import date, datetime, time as dt_time
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +17,10 @@ from .data_operations import DataFileManager
 from .data_structures import DataFile, FileFormat, ManifestContent, ManifestFile
 from .metadata_manager import MetadataManager
 from .storage_backend import StorageBackend
+
+# Iceberg manifest-entry statuses
+ENTRY_STATUS_EXISTING = 0
+ENTRY_STATUS_ADDED = 1
 
 
 class FileManager:
@@ -77,29 +83,130 @@ class FileManager:
             return int(value)
         return default
 
+    # ------------------------------------------------------------------
+    # Bound value encoding: type-faithful round-trip through Avro strings
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _encode_bound(value: Any) -> str:
+        """Encode a bound value with an explicit type tag.
+
+        Bounds travel through an Avro map<string>; encoding the type prevents
+        the lossy stringify-then-guess round trip that could invert min/max or
+        change comparison semantics (and thus wrongly prune files).
+        """
+        # NOTE: bool before int (bool subclasses int); datetime before date.
+        if isinstance(value, bool):
+            payload: Dict[str, Any] = {"t": "bool", "v": value}
+        elif isinstance(value, int):
+            payload = {"t": "int", "v": value}
+        elif isinstance(value, float):
+            payload = {"t": "float", "v": value}
+        elif isinstance(value, datetime):
+            payload = {"t": "ts", "v": value.isoformat()}
+        elif isinstance(value, date):
+            payload = {"t": "date", "v": value.isoformat()}
+        elif isinstance(value, dt_time):
+            payload = {"t": "time", "v": value.isoformat()}
+        elif isinstance(value, str):
+            payload = {"t": "str", "v": value}
+        else:
+            payload = {"t": "str", "v": str(value)}
+        return json.dumps(payload)
+
+    @classmethod
+    def _decode_bound(cls, raw: Any) -> Any:
+        """Decode a bound value, supporting both tagged and legacy formats."""
+        if not isinstance(raw, str):
+            return raw
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return cls._infer_value_legacy(raw)
+        if not isinstance(payload, dict) or "t" not in payload or "v" not in payload:
+            return cls._infer_value_legacy(raw)
+
+        tag, v = payload["t"], payload["v"]
+        try:
+            if tag == "bool":
+                return bool(v)
+            if tag == "int":
+                return int(v)
+            if tag == "float":
+                return float(v)
+            if tag == "ts":
+                return datetime.fromisoformat(v)
+            if tag == "date":
+                return date.fromisoformat(v)
+            if tag == "time":
+                return dt_time.fromisoformat(v)
+            if tag == "str":
+                return str(v)
+        except (ValueError, TypeError):
+            return v
+        return v
+
+    @staticmethod
+    def _infer_value_legacy(value: str) -> Any:
+        """Best-effort type inference for bounds written by older versions."""
+        if value.isdigit():
+            return int(value)
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        if value.lower() == 'true':
+            return True
+        if value.lower() == 'false':
+            return False
+        return value
+
+    def _infer_value(self, value: Any) -> Any:
+        """Backward-compatible entry point for bound decoding."""
+        return self._decode_bound(value)
+
     def create_manifest_file(
         self,
         data_files: List[DataFile],
         manifest_content: ManifestContent = ManifestContent.DATA,
         snapshot_id: Optional[int] = None,
+        existing_files: Optional[List[DataFile]] = None,
     ) -> ManifestFile:
-        """Create a manifest file containing the specified data files"""
-        # Generate a unique manifest file name
+        """Create a manifest file for the given data files.
+
+        Args:
+            data_files: Files newly added by this snapshot (status ADDED).
+            manifest_content: DATA or DELETES.
+            snapshot_id: The committing snapshot's id, stamped on ADDED entries.
+            existing_files: Files carried over from earlier snapshots (e.g.
+                survivors of a delete-rewrite). Written with status EXISTING and
+                their ORIGINAL added_snapshot_id, so history is not falsified.
+        """
+        existing_files = existing_files or []
+
+        # Unique manifest file name: timestamp + random suffix. Two concurrent
+        # committers in the same microsecond must never collide - a shared name
+        # would make one snapshot silently list the other's files.
         timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
-        manifest_filename = f"manifest_{timestamp}.avro"
+        manifest_filename = f"manifest_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
         manifest_path = f"{self.manifests_path}/{manifest_filename}"
 
         snapshot_id_val = snapshot_id or int(datetime.now().timestamp() * 1000)
 
         # Prepare records for Avro
         records = []
-        for df in data_files:
-            # Flatten structure to match schema
-            # content is passed as argument manifest_content, which is Enum
+        for df, status in [(f, ENTRY_STATUS_ADDED) for f in data_files] + [
+            (f, ENTRY_STATUS_EXISTING) for f in existing_files
+        ]:
+            if status == ENTRY_STATUS_ADDED:
+                entry_snapshot_id: Optional[int] = snapshot_id_val
+            else:
+                # Preserve the original adding snapshot for carried-over files
+                entry_snapshot_id = df.added_snapshot_id
 
             record = {
-                "status": 1, # 1 = ADDED
-                "snapshot_id": snapshot_id_val,
+                "status": status,
+                "snapshot_id": entry_snapshot_id,
                 "sequence_number": None,
                 "file_sequence_number": None,
                 "data_file": {
@@ -108,12 +215,13 @@ class FileManager:
                     "partition": {"values": {k: str(v) for k, v in df.partition_values.items()}},
                     "record_count": df.record_count,
                     "file_size_in_bytes": df.file_size_in_bytes,
-                    "column_sizes": df.column_sizes,
-                    "value_counts": df.value_counts,
-                    "null_value_counts": df.null_value_counts,
-                    # Convert bounds to simple map if present, complex handling skipped for now
-                    "lower_bounds": {str(k): str(v) for k, v in df.lower_bounds.items()} if df.lower_bounds else None,
-                    "upper_bounds": {str(k): str(v) for k, v in df.upper_bounds.items()} if df.upper_bounds else None,
+                    # Avro map keys are strings; convert int field-ids explicitly
+                    # (raw int-keyed dicts make fastavro raise, failing the commit)
+                    "column_sizes": {str(k): self._safe_int(v) for k, v in df.column_sizes.items()} if df.column_sizes else None,
+                    "value_counts": {str(k): self._safe_int(v) for k, v in df.value_counts.items()} if df.value_counts else None,
+                    "null_value_counts": {str(k): self._safe_int(v) for k, v in df.null_value_counts.items()} if df.null_value_counts else None,
+                    "lower_bounds": {str(k): self._encode_bound(v) for k, v in df.lower_bounds.items()} if df.lower_bounds else None,
+                    "upper_bounds": {str(k): self._encode_bound(v) for k, v in df.upper_bounds.items()} if df.upper_bounds else None,
                     "checksum": df.checksum,
                 }
             }
@@ -137,29 +245,13 @@ class FileManager:
             partition_spec_id=0,
             added_snapshot_id=snapshot_id_val,
             added_data_files_count=len(data_files),
-            existing_data_files_count=0,
+            existing_data_files_count=len(existing_files),
             deleted_data_files_count=0,
             partitions=[],
             content=manifest_content,
             sequence_number=None,
             min_sequence_number=None,
         )
-
-    def _infer_value(self, value: Any) -> Any:
-        """Best-effort type inference for bound values stored as strings"""
-        if not isinstance(value, str):
-            return value
-        if value.isdigit():
-            return int(value)
-        try:
-            return float(value)
-        except ValueError:
-            pass
-        if value.lower() == 'true':
-            return True
-        if value.lower() == 'false':
-            return False
-        return value
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
         """Read and parse a manifest file to get data files"""
@@ -180,14 +272,25 @@ class FileManager:
                     # Extract data_file field
                     df_record: Dict[str, Any] = record["data_file"]
 
-                    # Parse bounds: convert keys to int, infer value types
+                    # Parse bounds: convert keys to int, decode typed values
                     lower_bounds = df_record.get("lower_bounds")
                     if lower_bounds:
-                        lower_bounds = {int(k): self._infer_value(v) for k, v in lower_bounds.items()}
+                        lower_bounds = {int(k): self._decode_bound(v) for k, v in lower_bounds.items()}
 
                     upper_bounds = df_record.get("upper_bounds")
                     if upper_bounds:
-                        upper_bounds = {int(k): self._infer_value(v) for k, v in upper_bounds.items()}
+                        upper_bounds = {int(k): self._decode_bound(v) for k, v in upper_bounds.items()}
+
+                    # Stats maps: Avro string keys -> int field ids
+                    column_sizes = df_record.get("column_sizes")
+                    if column_sizes:
+                        column_sizes = {int(k): v for k, v in column_sizes.items()}
+                    value_counts = df_record.get("value_counts")
+                    if value_counts:
+                        value_counts = {int(k): v for k, v in value_counts.items()}
+                    null_value_counts = df_record.get("null_value_counts")
+                    if null_value_counts:
+                        null_value_counts = {int(k): v for k, v in null_value_counts.items()}
 
                     data_file = DataFile(
                         file_path=df_record["file_path"],
@@ -195,12 +298,13 @@ class FileManager:
                         partition_values=df_record["partition"]["values"],
                         record_count=df_record["record_count"],
                         file_size_in_bytes=df_record["file_size_in_bytes"],
-                        column_sizes=df_record.get("column_sizes"),
-                        value_counts=df_record.get("value_counts"),
-                        null_value_counts=df_record.get("null_value_counts"),
+                        column_sizes=column_sizes,
+                        value_counts=value_counts,
+                        null_value_counts=null_value_counts,
                         lower_bounds=lower_bounds,
                         upper_bounds=upper_bounds,
                         checksum=df_record.get("checksum"),
+                        added_snapshot_id=record.get("snapshot_id"),
                     )
                     data_files.append(data_file)
                 return data_files
@@ -211,7 +315,6 @@ class FileManager:
             pass
 
         content = self.storage.read_file(manifest_path)
-        import json
         try:
             manifest_data = json.loads(content.decode("utf-8"))
 
@@ -228,6 +331,8 @@ class FileManager:
                     null_value_counts=file_entry.get("null_value_counts"),
                     lower_bounds=file_entry.get("lower_bounds"),
                     upper_bounds=file_entry.get("upper_bounds"),
+                    checksum=file_entry.get("checksum"),
+                    added_snapshot_id=file_entry.get("added_snapshot_id"),
                 )
                 data_files.append(data_file)
             return data_files
@@ -240,7 +345,7 @@ class FileManager:
     ) -> str:
         """Create a manifest list file for a snapshot"""
         timestamp = int(datetime.now().timestamp() * 1000)
-        list_filename = f"manifest_list_{snapshot_id}_{timestamp}.avro"
+        list_filename = f"manifest_list_{snapshot_id}_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
         list_path = f"{self.manifests_path}/{list_filename}"
 
         # Prepare records for Avro
@@ -311,7 +416,6 @@ class FileManager:
 
         content = self.storage.read_file(list_path)
 
-        import json
         try:
             list_data = json.loads(content.decode("utf-8"))
 

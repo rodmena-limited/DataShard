@@ -1,16 +1,28 @@
 """
-Create S3 bucket on MinIO for testing
+Create S3 bucket on MinIO for testing.
+
+Credentials are read from the environment (DATASHARD_S3_*) - never hardcode
+credentials in this file; this repository is public.
 """
 
+import os
+import sys
 
 import boto3
 
-# S3 configuration
-endpoint_url = "https://s3.london.cloudsci.uk"
-access_key = "rodmena-limited"
-secret_key = "pX1r4t3dS3cr3tK3y!"
-bucket_name = "datashard"
-region = "us-east-1"
+# S3 configuration from environment
+endpoint_url = os.environ.get("DATASHARD_S3_ENDPOINT")
+access_key = os.environ.get("DATASHARD_S3_ACCESS_KEY")
+secret_key = os.environ.get("DATASHARD_S3_SECRET_KEY")
+bucket_name = os.environ.get("DATASHARD_S3_BUCKET", "datashard")
+region = os.environ.get("DATASHARD_S3_REGION", "us-east-1")
+
+if not (endpoint_url and access_key and secret_key):
+    print(
+        "Missing S3 configuration. Set DATASHARD_S3_ENDPOINT, "
+        "DATASHARD_S3_ACCESS_KEY and DATASHARD_S3_SECRET_KEY."
+    )
+    sys.exit(1)
 
 # Create S3 client
 s3 = boto3.client(

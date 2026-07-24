@@ -11,6 +11,10 @@ import time
 from contextlib import contextmanager
 from typing import Any, Generator, Optional
 
+from .logging_config import get_logger
+
+logger = get_logger(__name__)
+
 try:
     import fcntl
 
@@ -29,9 +33,20 @@ except ImportError:
 class FileLock:
     """File-based lock for multi-process synchronization.
 
-    Uses fcntl on Unix-like systems and msvcrt on Windows.
-    Falls back to file existence-based locking if neither is available.
+    Uses fcntl on Unix-like systems and msvcrt on Windows. On platforms with
+    neither primitive, falls back to O_CREAT|O_EXCL existence locking with
+    stale-lock breaking (weaker, but still provides mutual exclusion).
+
+    The configured timeout is enforced on ALL paths, including blocking
+    acquisition: acquisition is implemented as a non-blocking attempt loop
+    with a deadline, so a wedged lock holder cannot block callers forever
+    beyond the timeout.
     """
+
+    # Poll interval between non-blocking acquisition attempts
+    _POLL_INTERVAL = 0.01
+    # Fallback (O_EXCL) locks older than timeout * this factor are considered stale
+    _STALE_FACTOR = 10.0
 
     def __init__(self, lock_file: str, timeout: float = 30.0):
         """Initialize file lock.
@@ -44,116 +59,129 @@ class FileLock:
         self.timeout = timeout
         self._lock_fd: Optional[int] = None
         self._locked = False
+        self._used_excl_fallback = False
 
-    def acquire(self, blocking: bool = True) -> bool:  # noqa: C901
+    def is_held(self) -> bool:
+        """Whether this instance currently holds the lock."""
+        return self._locked
+
+    def acquire(self, blocking: bool = True) -> bool:
         """Acquire the lock.
 
         Args:
-            blocking: If True, wait for lock. If False, return immediately.
+            blocking: If True, wait for lock up to the configured timeout.
+                If False, return immediately.
 
         Returns:
-            True if lock acquired, False otherwise.
+            True if lock acquired, False if non-blocking and lock unavailable.
 
         Raises:
-            TimeoutError: If timeout expires while waiting for lock
+            TimeoutError: If the timeout expires while waiting for the lock.
         """
         # Ensure lock file directory exists
         lock_dir = os.path.dirname(self.lock_file)
         if lock_dir:
             os.makedirs(lock_dir, exist_ok=True)
 
-        start_time = time.time()
+        deadline = time.monotonic() + self.timeout
 
         while True:
-            try:
-                # Open/create lock file
-                # O_CREAT | O_EXCL | O_WRONLY would be ideal but doesn't work with fcntl
-                fd = os.open(
-                    self.lock_file,
-                    os.O_CREAT | os.O_RDWR,
-                )
+            acquired = self._try_acquire_once()
+            if acquired:
+                return True
 
-                # Try to acquire exclusive lock
-                if FCNTL_AVAILABLE:
-                    # Unix/Linux - use fcntl for robust locking
-                    try:
-                        if blocking:
-                            fcntl.flock(fd, fcntl.LOCK_EX)
-                        else:
-                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        self._lock_fd = fd
-                        self._locked = True
-                        return True
-                    except (IOError, OSError) as e:
-                        os.close(fd)
-                        if e.errno == errno.EWOULDBLOCK and not blocking:
-                            return False
-                        # For blocking mode, fall through to retry logic
-                elif MSVCRT_AVAILABLE:
-                    # Windows - use msvcrt
-                    try:
-                        if blocking:
-                            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # type: ignore[attr-defined]
-                        else:
-                            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
-                        self._lock_fd = fd
-                        self._locked = True
-                        return True
-                    except (IOError, OSError):
-                        os.close(fd)
-                        if not blocking:
-                            return False
-                        # For blocking mode, fall through to retry logic
-                else:
-                    # Fallback: file existence-based locking (less robust)
-                    # This is a best-effort approach
-                    self._lock_fd = fd
-                    self._locked = True
-                    return True
-
-            except (IOError, OSError) as e:
-                if e.errno == errno.EEXIST and not blocking:
-                    return False
-                # Continue to retry logic
-
-            # Check timeout
             if not blocking:
                 return False
 
-            if time.time() - start_time >= self.timeout:
+            if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Failed to acquire lock on {self.lock_file} within {self.timeout}s"
                 )
 
-            # Wait a bit before retrying
-            time.sleep(0.01)
+            time.sleep(self._POLL_INTERVAL)
+
+    def _try_acquire_once(self) -> bool:
+        """Single non-blocking acquisition attempt."""
+        if FCNTL_AVAILABLE or MSVCRT_AVAILABLE:
+            try:
+                fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR)
+            except (IOError, OSError):
+                return False
+
+            try:
+                if FCNTL_AVAILABLE:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                self._lock_fd = fd
+                self._locked = True
+                self._used_excl_fallback = False
+                return True
+            except (IOError, OSError):
+                os.close(fd)
+                return False
+
+        # Fallback: O_CREAT|O_EXCL existence locking with stale-lock breaking.
+        # Weaker than kernel locks (no automatic release on crash), but still
+        # provides real mutual exclusion instead of silently degrading to none.
+        return self._try_acquire_excl_fallback()
+
+    def _try_acquire_excl_fallback(self) -> bool:
+        """Existence-based locking for platforms without fcntl/msvcrt."""
+        try:
+            fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            self._lock_fd = fd
+            self._locked = True
+            self._used_excl_fallback = True
+            return True
+        except (IOError, OSError) as e:
+            if e.errno != errno.EEXIST:
+                return False
+            # Lock file exists - break it only if it looks abandoned
+            try:
+                age = time.time() - os.path.getmtime(self.lock_file)
+                if age > self.timeout * self._STALE_FACTOR:
+                    logger.warning(
+                        f"Breaking stale fallback lock {self.lock_file} (age {age:.0f}s)"
+                    )
+                    os.unlink(self.lock_file)
+            except (IOError, OSError):
+                pass
+            return False
 
     def release(self) -> None:
         """Release the lock.
 
-        IMPORTANT: We intentionally do NOT delete the lock file after releasing.
-        fcntl.flock() operates on file inodes, not paths. If we delete the file,
-        a new process creating the same path gets a different inode, so they won't
-        actually synchronize. By keeping the lock file, all processes lock the
-        same inode and proper synchronization is maintained.
+        IMPORTANT (fcntl/msvcrt mode): We intentionally do NOT delete the lock
+        file after releasing. fcntl.flock() operates on file inodes, not paths.
+        If we delete the file, a new process creating the same path gets a
+        different inode, so they won't actually synchronize. By keeping the
+        lock file, all processes lock the same inode and proper
+        synchronization is maintained.
+
+        In O_EXCL fallback mode the file's existence IS the lock, so there we
+        do delete it.
         """
         if not self._locked or self._lock_fd is None:
             return
 
         try:
-            if FCNTL_AVAILABLE:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            elif MSVCRT_AVAILABLE:
-                msvcrt.locking(self._lock_fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+            if self._used_excl_fallback:
+                os.close(self._lock_fd)
+                try:
+                    os.unlink(self.lock_file)
+                except (IOError, OSError):
+                    pass
+            else:
+                if FCNTL_AVAILABLE:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                elif MSVCRT_AVAILABLE:
+                    msvcrt.locking(self._lock_fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+                os.close(self._lock_fd)
 
-            os.close(self._lock_fd)
             self._lock_fd = None
             self._locked = False
-
-            # NOTE: Do NOT delete the lock file here!
-            # Deleting causes race conditions because fcntl.flock operates on inodes.
-            # If we delete the file, concurrent processes may create new files with
-            # different inodes and fail to synchronize properly.
         except Exception:
             # Best effort cleanup
             pass

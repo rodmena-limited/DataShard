@@ -5,6 +5,62 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-24
+
+Full audit and bank-grade remediation. See `AUDIT_REPORT.md`. Fixes tickets #14–#43.
+
+> **Upgrade note — breaking behavior changes.** Several APIs now fail loudly
+> where they previously failed silently: `overwrite_by_filter` raises
+> `NotImplementedError`; unknown filter operators raise `ValueError`; appends
+> with fields outside the schema raise; `scan()`/`to_pandas()` verify data-file
+> checksums by default (disable via `verify_checksums=False` or
+> `DATASHARD_VERIFY_CHECKSUMS=false`) and raise on unreadable files instead of
+> returning partial results.
+
+### Fixed — data loss / correctness (was silent) ⚠️
+
+- **Post-commit failures no longer delete committed data.** A failure after the
+  durable commit point can never trigger a rollback that removes committed
+  files; ambiguous commit-point writes keep their data (`AmbiguousCommitError`).
+- **Commit and GC now fail closed.** An unreadable base manifest aborts the
+  commit instead of silently dropping all prior data; the garbage collector
+  aborts (`GarbageCollectionAborted`) if any reachable manifest can't be read
+  instead of deleting live files. GC now scans the correct manifest directory.
+- **`create_table(schema=...)` persists the schema.** Schema-less appends use it
+  or raise, instead of silently writing zero-column files.
+- **Scans propagate read errors** instead of returning partial/empty results,
+  and verify data-file checksums by default (`DATASHARD_VERIFY_CHECKSUMS`).
+- **`is_null`/`is_not_null` filters are applied** in every scan API; unknown
+  filter operators now raise instead of silently becoming equality.
+- **`overwrite_by_filter` raises `NotImplementedError`** and `expire_snapshots`
+  actually expires (never the current snapshot) instead of being silent no-ops.
+- Version-hint is now a recoverable hint (rebuilt from metadata files); a lost
+  hint no longer causes destructive re-initialization; `initialize_table`
+  refuses to overwrite an existing table.
+
+### Fixed — concurrency / integrity
+
+- Manifest and manifest-list filenames include a per-writer UUID (no collisions).
+- One snapshot id is shared by manifests, manifest list, and the snapshot
+  (lineage joins resolve). Delete-rewrites preserve `EXISTING` status.
+- S3 locks use conditional writes (CAS) for create/takeover/renew with commit
+  fencing; `FileLock` enforces its timeout; local data files are fsync'd.
+- Schema field-id/name uniqueness validated; append schema validated; type-
+  faithful column bounds; path resolution hardened (realpath + boundary check).
+- Snapshot retention is opt-in (`datashard.snapshot.retention-count`), never
+  silent.
+
+### Security
+
+- Removed hardcoded S3 credentials from test scripts (now read from env).
+  **Action required:** rotate the previously-exposed keys and purge them from
+  git history (ticket #13).
+
+### Tests
+
+- Added `tests/test_audit_fixes.py` (28 failure-path/concurrency tests). Suite:
+  107 passed / 3 skipped; mypy --strict and ruff clean.
+
 ## [0.4.0] - 2025-11-30
 
 ### Breaking Changes ⚠️

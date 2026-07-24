@@ -12,6 +12,12 @@ from .logging_config import get_logger
 logger = get_logger(__name__)
 
 
+class CorruptDataError(Exception):
+    """Raised when stored data fails checksum verification on read."""
+
+    pass
+
+
 class IntegrityChecker:
     """Handles data integrity checking with checksums."""
 

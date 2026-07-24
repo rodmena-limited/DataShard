@@ -2,14 +2,20 @@
 Snapshotting and time travel functionality for the Python Iceberg implementation
 """
 
-import os
-import uuid
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .data_structures import HistoryEntry, Snapshot, TableMetadata
+from .logging_config import get_logger
 from .metadata_manager import MetadataManager
+
+logger = get_logger(__name__)
+
+# Table property enabling opt-in snapshot retention. Iceberg's
+# write.metadata.previous-versions-max governs METADATA FILES, not snapshots,
+# so datashard uses its own explicit property and never prunes by default.
+SNAPSHOT_RETENTION_PROPERTY = "datashard.snapshot.retention-count"
 
 
 class SnapshotManager:
@@ -17,10 +23,6 @@ class SnapshotManager:
 
     def __init__(self, metadata_manager: MetadataManager):
         self.metadata_manager = metadata_manager
-        self.snapshots_path = os.path.join(self.metadata_manager.table_path, "snapshots")
-
-        # Ensure snapshots directory exists
-        os.makedirs(self.snapshots_path, exist_ok=True)
 
     def create_snapshot(
         self,
@@ -29,11 +31,10 @@ class SnapshotManager:
         parent_snapshot_id: Optional[int] = None,
         summary: Optional[Dict[str, str]] = None,
         base_metadata: Optional[TableMetadata] = None,
+        snapshot_id: Optional[int] = None,
+        metadata_mutator: Optional[Callable[[TableMetadata], None]] = None,
     ) -> Snapshot:
         """Create a new snapshot with proper OCC handling.
-
-        CRITICAL FIX: Use UUID-based IDs to prevent collisions when multiple
-        snapshots are created in rapid succession or concurrently.
 
         Args:
             manifest_list_path: Path to the manifest list file
@@ -44,20 +45,27 @@ class SnapshotManager:
                 used instead of refreshing. This is critical for proper retry handling
                 in Transaction.commit() - passing the base ensures retries use fresh
                 metadata read by the caller rather than an independent stale read.
+            snapshot_id: Snapshot id to use. Callers that already stamped an id
+                into manifests/manifest lists MUST pass it here so the committed
+                Snapshot carries the same id (lineage integrity). If omitted, a
+                new UUID-derived id is generated.
+            metadata_mutator: Optional callback applied to the new metadata
+                (after the snapshot is appended, before commit). Used e.g. by
+                expire_snapshots to fold metadata changes into the same commit.
         """
+        import uuid
+
         # Use provided base_metadata or refresh if not provided
-        # CRITICAL: When called from Transaction.commit(), base_metadata should be passed
-        # to avoid a race condition where this refresh() returns stale data compared to
-        # what the Transaction already read.
         if base_metadata is None:
             base_metadata = self.metadata_manager.refresh()
         if base_metadata is None:
             raise ValueError("Cannot create snapshot: no current metadata")
 
-        # Generate a new snapshot ID using UUID to prevent collisions
-        # Ensure it fits in signed 64-bit integer (Java/Avro long compatibility)
-        # Use 63 bits to guarantee positive signed long
-        snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
+        # Use the caller's snapshot id when given (it is already embedded in the
+        # manifest list filename and manifest entries); generate otherwise.
+        # UUID-derived, masked to 63 bits for signed-long (Java/Avro) compatibility.
+        if snapshot_id is None:
+            snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
 
         # Create new snapshot
         snapshot = Snapshot(
@@ -80,24 +88,17 @@ class SnapshotManager:
         )
         new_metadata.snapshot_log.append(history_entry)
 
-        # PHASE 2: Snapshot Pruning / Compaction
-        # Check table properties for retention policy
-        # Default to keeping last 100 snapshots if not specified
-        retention_count = int(new_metadata.properties.get("write.metadata.previous-versions-max", 100))
+        # Apply caller-supplied metadata changes (e.g. snapshot expiry) so they
+        # land in the same atomic commit.
+        if metadata_mutator is not None:
+            metadata_mutator(new_metadata)
+            # The mutator must never remove the snapshot being committed.
+            if all(s.snapshot_id != snapshot_id for s in new_metadata.snapshots):
+                raise ValueError("metadata_mutator removed the snapshot being committed")
 
-        if len(new_metadata.snapshots) > retention_count:
-            # Sort by timestamp to ensure we keep the most recent ones
-            # (Snapshots are usually appended, but sort ensures safety)
-            sorted_snapshots = sorted(new_metadata.snapshots, key=lambda s: s.timestamp_ms)
-
-            # Keep the last N
-            new_metadata.snapshots = sorted_snapshots[-retention_count:]
-
-            # Also prune the history log to match (approximately)
-            # We keep a bit more history than snapshots usually, but for now sync them
-            if len(new_metadata.snapshot_log) > retention_count:
-                 sorted_log = sorted(new_metadata.snapshot_log, key=lambda e: e.timestamp_ms)
-                 new_metadata.snapshot_log = sorted_log[-retention_count:]
+        # OPT-IN snapshot retention. Never prunes unless the table property is
+        # explicitly set, and never prunes the current snapshot.
+        self._apply_retention(new_metadata)
 
         # Commit the updated metadata using OCC (base and new metadata)
         # This will fail if the base doesn't match the current state
@@ -105,6 +106,39 @@ class SnapshotManager:
 
         # Return the snapshot that was created
         return snapshot
+
+    def _apply_retention(self, metadata: TableMetadata) -> None:
+        """Apply opt-in snapshot retention (SNAPSHOT_RETENTION_PROPERTY)."""
+        raw = metadata.properties.get(SNAPSHOT_RETENTION_PROPERTY)
+        if raw is None:
+            return
+        try:
+            retention_count = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Ignoring invalid {SNAPSHOT_RETENTION_PROPERTY}={raw!r} (not an integer)"
+            )
+            return
+        if retention_count < 1 or len(metadata.snapshots) <= retention_count:
+            return
+
+        current_id = metadata.current_snapshot_id
+        sorted_snapshots = sorted(metadata.snapshots, key=lambda s: s.timestamp_ms)
+        kept = sorted_snapshots[-retention_count:]
+        kept_ids = {s.snapshot_id for s in kept}
+        # Never drop the current snapshot, whatever its age.
+        if current_id is not None and current_id not in kept_ids:
+            current = next(
+                (s for s in metadata.snapshots if s.snapshot_id == current_id), None
+            )
+            if current is not None:
+                kept.append(current)
+                kept_ids.add(current_id)
+
+        metadata.snapshots = [s for s in sorted_snapshots if s.snapshot_id in kept_ids]
+        metadata.snapshot_log = [
+            e for e in metadata.snapshot_log if e.snapshot_id in kept_ids
+        ]
 
     def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Snapshot]:
         """Get a snapshot by its ID"""
@@ -173,10 +207,12 @@ class SnapshotManager:
         return None
 
     def delete_snapshot(self, snapshot_id: int) -> bool:
-        """Delete a specific snapshot (soft delete for now).
+        """Delete a specific snapshot (metadata-level removal).
 
-        CRITICAL FIX: Create deep copy for new_metadata to ensure OCC works correctly.
-        Using the same object for base and new breaks the comparison logic.
+        When the CURRENT snapshot is deleted, the table is repointed to the
+        most recent remaining snapshot by commit recency (snapshot_log order,
+        falling back to timestamp) - snapshot ids are random UUIDs, so max(id)
+        would pick an arbitrary snapshot.
         """
         base_metadata = self.metadata_manager.refresh()
         if base_metadata is None:
@@ -195,21 +231,35 @@ class SnapshotManager:
             new_metadata = deepcopy(base_metadata)
             del new_metadata.snapshots[snapshot_to_remove]
 
+            # Drop the deleted snapshot's history entries (no dangling log rows)
+            new_metadata.snapshot_log = [
+                e for e in new_metadata.snapshot_log if e.snapshot_id != snapshot_id
+            ]
+
             # Update current snapshot if needed
             if new_metadata.current_snapshot_id == snapshot_id:
-                # Set to the most recent snapshot
-                valid_snapshots = [
-                    s for s in new_metadata.snapshots if s.snapshot_id != snapshot_id
-                ]
-                if valid_snapshots:
-                    new_metadata.current_snapshot_id = max(
-                        s.snapshot_id for s in valid_snapshots
-                    )
-                else:
-                    new_metadata.current_snapshot_id = None
+                new_metadata.current_snapshot_id = self._most_recent_snapshot_id(
+                    new_metadata
+                )
 
             # Commit the changes with proper OCC (base vs new)
             self.metadata_manager.commit(base_metadata, new_metadata)
             return True
 
         return False
+
+    @staticmethod
+    def _most_recent_snapshot_id(metadata: TableMetadata) -> Optional[int]:
+        """Most recently committed remaining snapshot: latest snapshot_log entry
+        that still exists, falling back to max timestamp_ms."""
+        remaining_ids = {s.snapshot_id for s in metadata.snapshots}
+        if not remaining_ids:
+            return None
+
+        for entry in reversed(metadata.snapshot_log):
+            if entry.snapshot_id in remaining_ids:
+                return entry.snapshot_id
+
+        # No usable log - fall back to newest by timestamp (stable enough)
+        newest = max(metadata.snapshots, key=lambda s: s.timestamp_ms)
+        return newest.snapshot_id

@@ -21,7 +21,7 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .disk_utils import check_disk_space, estimate_write_size
 from .integrity import IntegrityChecker
@@ -104,6 +104,40 @@ class StorageBackend(ABC):
         """Create a distributed lock for the given path"""
         pass
 
+    @property
+    def supports_cas(self) -> bool:
+        """Whether this backend supports compare-and-swap writes (conditional PUT)."""
+        return False
+
+    @property
+    def atomic_write_failures(self) -> bool:
+        """Whether a write_file() exception guarantees the write did NOT become visible.
+
+        True for local storage (temp file + atomic rename: an exception means the
+        rename never happened). False for S3 (a PUT that raises client-side may
+        still have succeeded server-side), where a failed critical write must be
+        treated as ambiguous.
+        """
+        return False
+
+    def read_file_with_etag(self, path: str) -> "Tuple[bytes, Optional[str]]":
+        """Read file contents plus an entity tag usable for CAS (None if unsupported)."""
+        return self.read_file(path), None
+
+    def write_file_cas(self, path: str, content: bytes, etag: Optional[str]) -> None:
+        """Conditionally write: succeed only if the object's current etag matches.
+
+        etag=None means "create only if absent". Raises CASConflictError on
+        precondition failure. Only valid when supports_cas is True.
+        """
+        raise NotImplementedError("This backend does not support CAS writes")
+
+
+class CASConflictError(Exception):
+    """Raised when a compare-and-swap write loses the race (precondition failed)."""
+
+    pass
+
 
 class LocalStorageBackend(StorageBackend):
     """Local filesystem storage backend"""
@@ -112,7 +146,13 @@ class LocalStorageBackend(StorageBackend):
         self.base_path = base_path
 
     def _resolve_path(self, path: str) -> str:
-        """Resolve path relative to base_path"""
+        """Resolve path relative to base_path, rejecting escapes from the table root.
+
+        Uses realpath (resolving symlinks) plus a true path-boundary check, so
+        neither '..' components, sibling directories sharing the base as a
+        string prefix (/data/wh vs /data/wh2), nor symlinks pointing outside
+        the table can escape the base directory.
+        """
         if path.startswith("/"):
             # Iceberg-style absolute path relative to table
             joined_path = os.path.join(self.base_path, path.lstrip("/"))
@@ -124,12 +164,18 @@ class LocalStorageBackend(StorageBackend):
             # Relative path
             joined_path = os.path.join(self.base_path, path)
 
-        # Canonicalize paths to resolve '..'
-        full_path = os.path.abspath(joined_path)
-        base_path = os.path.abspath(self.base_path)
+        # Canonicalize: resolve '..' AND symlinks
+        full_path = os.path.realpath(joined_path)
+        base_path = os.path.realpath(self.base_path)
 
-        # Ensure the resolved path is within the base directory
-        if not full_path.startswith(base_path):
+        # Ensure the resolved path is within the base directory (true boundary
+        # check, not a string prefix check)
+        try:
+            inside = os.path.commonpath([base_path, full_path]) == base_path
+        except ValueError:
+            # Different drives (Windows) or mixed abs/rel - definitely outside
+            inside = False
+        if not inside:
             raise ValueError(f"Security Error: Path traversal attempt detected. Resolved path '{full_path}' is outside base directory '{base_path}'")
 
         return full_path
@@ -157,7 +203,7 @@ class LocalStorageBackend(StorageBackend):
         - Comprehensive logging
         - Checksum computation for integrity
         """
-        logger.info(f"Writing file: {path} ({len(content)} bytes)")
+        logger.debug(f"Writing file: {path} ({len(content)} bytes)")
 
         full_path = self._resolve_path(path)
         dir_path = os.path.dirname(full_path)
@@ -220,7 +266,13 @@ class LocalStorageBackend(StorageBackend):
                 pass
             raise
 
-        logger.info(f"Successfully wrote file: {path}")
+        logger.debug(f"Successfully wrote file: {path}")
+
+    @property
+    def atomic_write_failures(self) -> bool:
+        """Local writes go through temp file + os.replace: an exception means the
+        rename never happened, so a failed write is guaranteed not visible."""
+        return True
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
@@ -337,8 +389,19 @@ class S3StorageBackend(StorageBackend):
 
         self.s3 = session.client("s3", **s3_config)
 
+        if endpoint_url and endpoint_url.lower().startswith("http://"):
+            logger.warning(
+                f"S3 endpoint {endpoint_url} uses plain HTTP - credentials and data "
+                f"travel unencrypted. Use https:// except for isolated test setups."
+            )
+
         if not use_conditional_writes:
-            logger.info("S3 conditional writes disabled. Using polling-based locking (less robust).")
+            logger.warning(
+                "S3 conditional writes disabled. Using polling-based locking, which is "
+                "BEST-EFFORT ONLY: under contention two writers can both acquire the lock "
+                "and a commit can be silently lost. Enable conditional writes "
+                "(DATASHARD_S3_USE_CONDITIONAL_WRITES=true) if the provider supports them."
+            )
 
     def _get_s3_key(self, path: str) -> str:
         """Convert path to S3 key"""
@@ -410,7 +473,7 @@ class S3StorageBackend(StorageBackend):
         """
         from .s3_consistency import with_s3_retry
 
-        logger.info(f"Writing S3 file: {path} ({len(content)} bytes)")
+        logger.debug(f"Writing S3 file: {path} ({len(content)} bytes)")
 
         key = self._get_s3_key(path)
 
@@ -423,7 +486,54 @@ class S3StorageBackend(StorageBackend):
             self.s3.put_object(Bucket=self.bucket, Key=key, Body=content)
 
         with_s3_retry(write_op, f"S3 write: {key}")
-        logger.info(f"Successfully wrote S3 file: {path}")
+        logger.debug(f"Successfully wrote S3 file: {path}")
+
+    @property
+    def supports_cas(self) -> bool:
+        """CAS via conditional PUT (If-Match / If-None-Match) when the provider supports it."""
+        return self.use_conditional_writes
+
+    def read_file_with_etag(self, path: str) -> Tuple[bytes, Optional[str]]:
+        """Read file contents plus the object's ETag (for CAS writes)."""
+        from .s3_consistency import with_s3_retry
+
+        key = self._get_s3_key(path)
+
+        def read_op() -> Tuple[bytes, Optional[str]]:
+            try:
+                response = self.s3.get_object(Bucket=self.bucket, Key=key)
+                return response["Body"].read(), response.get("ETag")
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "NoSuchKey":
+                    raise FileNotFoundError(
+                        f"S3 object not found: s3://{self.bucket}/{key}"
+                    ) from e
+                raise
+
+        return with_s3_retry(read_op, f"S3 read+etag: {key}")
+
+    def write_file_cas(self, path: str, content: bytes, etag: Optional[str]) -> None:
+        """Conditional PUT: create-if-absent (etag=None) or replace-if-unchanged.
+
+        Raises CASConflictError when the precondition fails (concurrent writer won).
+        NOT retried: a retried conditional PUT after an ambiguous failure could
+        conflict with our own first attempt; callers decide how to handle it.
+        """
+        key = self._get_s3_key(path)
+        kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Key": key, "Body": content}
+        if etag is None:
+            kwargs["IfNoneMatch"] = "*"
+        else:
+            kwargs["IfMatch"] = etag
+        try:
+            self.s3.put_object(**kwargs)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("PreconditionFailed", "412", "ConditionalRequestConflict"):
+                raise CASConflictError(
+                    f"CAS write lost race for s3://{self.bucket}/{key}"
+                ) from e
+            raise
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
@@ -434,24 +544,33 @@ class S3StorageBackend(StorageBackend):
         self.write_file(path, content)
 
     def exists(self, path: str) -> bool:
+        """Existence check with transient-error retry.
+
+        404s resolve to False without retrying; transient (non-404) errors are
+        retried like every other S3 operation - exists() sits on hot paths
+        (version-hint reads, manifest reachability) where a first-try failure
+        must not surface as a hard error.
+        """
+        from .s3_consistency import with_s3_retry
+
         key = self._get_s3_key(path)
 
-        # First try exact object match
-        try:
-            self.s3.head_object(Bucket=self.bucket, Key=key)
-            return True
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "404":
-                raise
+        def exists_op() -> bool:
+            # First try exact object match
+            try:
+                self.s3.head_object(Bucket=self.bucket, Key=key)
+                return True
+            except ClientError as e:
+                if e.response["Error"]["Code"] != "404":
+                    raise
 
-        # If exact match fails, check if it's a prefix (directory-like)
-        # by checking if any objects exist with this prefix
-        prefix = key if key.endswith("/") else key + "/"
-        try:
+            # If exact match fails, check if it's a prefix (directory-like)
+            # by checking if any objects exist with this prefix
+            prefix = key if key.endswith("/") else key + "/"
             response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=1)
             return "Contents" in response and len(response["Contents"]) > 0
-        except ClientError:
-            return False
+
+        return with_s3_retry(exists_op, f"S3 exists: {key}")
 
     def list_files(self, prefix: str) -> List[str]:
         s3_prefix = self._get_s3_key(prefix)

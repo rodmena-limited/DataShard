@@ -130,12 +130,11 @@ def verify_file(file_path):
                 del os.environ["DATASHARD_STORAGE_TYPE"]
 
 if __name__ == "__main__":
-    # Set S3 env vars for S3 examples
-    os.environ["DATASHARD_S3_ENDPOINT"] = "https://s3.rodmena.co.uk"
-    os.environ["DATASHARD_S3_ACCESS_KEY"] = "rodmena"
-    os.environ["DATASHARD_S3_SECRET_KEY"] = "pleasebeready"
-    os.environ["DATASHARD_S3_BUCKET"] = "datashard"
-    os.environ["DATASHARD_S3_REGION"] = "us-east-1"
+    # S3 examples require S3 credentials in the environment - NEVER hardcode
+    # secrets in the repo. Set DATASHARD_S3_ENDPOINT / _ACCESS_KEY / _SECRET_KEY
+    # / _BUCKET / _REGION before running to exercise the S3 doc blocks.
+    os.environ.setdefault("DATASHARD_S3_BUCKET", "datashard")
+    os.environ.setdefault("DATASHARD_S3_REGION", "us-east-1")
 
     files = [
         "docs/README.md",
