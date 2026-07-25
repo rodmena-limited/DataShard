@@ -15,8 +15,22 @@ project = "datashard"
 copyright = "2025, RODMENA LIMITED"
 author = "Farshid Ashouri"
 
-# The full version, including alpha/beta/rc tags
-release = "0.1.5"
+# The full version, including alpha/beta/rc tags. Read from pyproject.toml (the
+# single source of truth for the version being documented) so the docs can never
+# claim a version the source does not have; falls back to installed metadata.
+try:
+    import re as _re
+
+    _pyproject = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
+    with open(_pyproject) as _f:
+        _match = _re.search(r'^version\s*=\s*"([^"]+)"', _f.read(), _re.MULTILINE)
+    if _match is None:
+        raise ValueError("no version in pyproject.toml")
+    release = _match.group(1)
+except Exception:  # building from an installed package, without the source tree
+    from importlib.metadata import version as _pkg_version
+
+    release = _pkg_version("datashard")
 
 # -- General configuration ---------------------------------------------------
 # Add any Sphinx extension module names here, as strings. They can be

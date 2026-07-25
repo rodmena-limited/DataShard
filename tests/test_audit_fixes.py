@@ -167,7 +167,7 @@ def test_scan_fails_closed_on_missing_manifest(tmp_path):
     # Delete a manifest referenced by the current snapshot
     for m in glob.glob(str(tmp_path / "t" / "metadata" / "manifests" / "manifest_*.avro")):
         os.remove(m)
-    with pytest.raises(Exception):
+    with pytest.raises((RuntimeError, OSError)):
         t.scan(verify_checksums=False)
 
 
@@ -265,7 +265,7 @@ def test_empty_commit_creates_no_snapshot(tmp_path):
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "x"}])
     n = len(t.snapshots())
-    with t.new_transaction() as tx:
+    with t.new_transaction():
         pass  # no operations
     assert len(t.snapshots()) == n
 

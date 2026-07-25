@@ -186,20 +186,29 @@ class MetadataManager:
                 # the commit point below can be a true compare-and-swap).
                 hint_etag: Optional[str] = None
                 filesystem_version: Optional[int] = None
+                previous_metadata_file: Optional[str] = None
                 if self.storage.supports_cas:
                     try:
                         hint_bytes, hint_etag = self.storage.read_file_with_etag(self.HINT_PATH)
                         parsed = self._parse_hint_content(hint_bytes)
                         if parsed is not None:
-                            filesystem_version = parsed[0]
+                            filesystem_version, previous_metadata_file = parsed
                     except FileNotFoundError:
                         hint_etag = None
                 if filesystem_version is None:
                     info = self._current_version_info()
-                    filesystem_version = info[0] if info is not None else None
+                    if info is not None:
+                        filesystem_version, previous_metadata_file = info
                 if filesystem_version is None:
                     filesystem_version = 0
                 next_version = filesystem_version + 1
+
+                # Record the version this commit supersedes, so the metadata
+                # file chain is auditable (Iceberg's metadata-log).
+                if previous_metadata_file is not None:
+                    self._append_metadata_log(
+                        new_metadata, base_metadata, previous_metadata_file
+                    )
 
                 # PHASE 3: Write new metadata file (but don't make it visible yet).
                 # The filename embeds a random suffix: two racing committers can
@@ -231,6 +240,47 @@ class MetadataManager:
                 # mask/poison the commit outcome (a durable commit must not be
                 # reported as failed because unlock hiccuped).
                 self._release_lock_safely()
+
+    # Iceberg's cap on retained metadata-log entries.
+    PREVIOUS_VERSIONS_MAX_PROPERTY = "write.metadata.previous-versions-max"
+    DEFAULT_PREVIOUS_VERSIONS_MAX = 100
+
+    def _append_metadata_log(
+        self,
+        new_metadata: TableMetadata,
+        base_metadata: TableMetadata,
+        previous_metadata_file: str,
+    ) -> None:
+        """Append the superseded metadata file to the metadata log.
+
+        The log is what makes the metadata chain auditable: every committed
+        version names the version it replaced, with the timestamp that version
+        carried. Trimmed to write.metadata.previous-versions-max (oldest first)
+        so it cannot grow without bound.
+        """
+        entry_path = f"{self.metadata_path}/{previous_metadata_file}"
+        log = list(new_metadata.metadata_log)
+        if log and log[-1].get("metadata-file") == entry_path:
+            return  # already recorded (e.g. a retried commit)
+
+        log.append({
+            "timestamp-ms": base_metadata.last_updated_ms,
+            "metadata-file": entry_path,
+        })
+
+        raw_max = new_metadata.properties.get(self.PREVIOUS_VERSIONS_MAX_PROPERTY)
+        try:
+            max_entries = int(raw_max) if raw_max is not None else self.DEFAULT_PREVIOUS_VERSIONS_MAX
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Ignoring invalid {self.PREVIOUS_VERSIONS_MAX_PROPERTY}={raw_max!r} "
+                f"(not an integer)"
+            )
+            max_entries = self.DEFAULT_PREVIOUS_VERSIONS_MAX
+        if max_entries >= 1 and len(log) > max_entries:
+            log = log[-max_entries:]
+
+        new_metadata.metadata_log = log
 
     def _write_hint_at_commit_point(self, metadata_file: str, hint_etag: Optional[str]) -> None:
         """Flip the version hint (the commit point), classifying failures.
@@ -388,6 +438,7 @@ class MetadataManager:
                     "operation": snapshot.operation,
                     "summary": snapshot.summary,
                     "schema_id": snapshot.schema_id,
+                    "sequence_number": snapshot.sequence_number,
                 }
                 for snapshot in metadata.snapshots
             ],
@@ -457,6 +508,7 @@ class MetadataManager:
                 operation=snapshot_dict.get("operation"),
                 summary=snapshot_dict.get("summary", {}),
                 schema_id=snapshot_dict.get("schema_id"),
+                sequence_number=snapshot_dict.get("sequence_number"),
             )
             for snapshot_dict in metadata_dict["snapshots"]
         ]

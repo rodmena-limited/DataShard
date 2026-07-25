@@ -20,7 +20,6 @@ from datashard.filters import (
     parse_filter_dict,
     prune_files_by_bounds,
     to_pyarrow_compute_expression,
-    to_pyarrow_filter,
 )
 
 # ============================================================================
@@ -161,29 +160,29 @@ class TestFilterParsing:
             assert filters[0].op == expected_op, f"Failed for {filter_dict}"
 
 
-class TestPyArrowFilterConversion:
-    """Test conversion to PyArrow filter format"""
+class TestPyArrowComputeConversion:
+    """Test conversion to the PyArrow compute expression used by every scan API"""
 
-    def test_to_pyarrow_filter_equality(self):
-        """Test conversion of equality filter"""
-        expressions = [FilterExpression("status", FilterOp.EQ, "active")]
-        pa_filters = to_pyarrow_filter(expressions)
-        assert pa_filters == [("status", "==", "active")]
-
-    def test_to_pyarrow_filter_comparison(self):
-        """Test conversion of comparison filters"""
+    def test_equality_and_comparisons_convert(self):
         expressions = [
+            FilterExpression("status", FilterOp.EQ, "active"),
             FilterExpression("age", FilterOp.GT, 30),
             FilterExpression("score", FilterOp.LE, 90.0),
         ]
-        pa_filters = to_pyarrow_filter(expressions)
-        assert ("age", ">", 30) in pa_filters
-        assert ("score", "<=", 90.0) in pa_filters
+        assert to_pyarrow_compute_expression(expressions) is not None
 
-    def test_to_pyarrow_filter_empty(self):
-        """Test empty filter list"""
-        pa_filters = to_pyarrow_filter([])
-        assert pa_filters is None
+    def test_null_ops_convert(self):
+        """IS_NULL / IS_NOT_NULL must survive conversion (the removed
+        to_pyarrow_filter silently dropped them)."""
+        assert to_pyarrow_compute_expression(
+            [FilterExpression("name", FilterOp.IS_NULL, None)]
+        ) is not None
+        assert to_pyarrow_compute_expression(
+            [FilterExpression("name", FilterOp.IS_NOT_NULL, None)]
+        ) is not None
+
+    def test_empty_expression_list(self):
+        assert to_pyarrow_compute_expression([]) is None
 
 
 class TestPredicatePushdown:

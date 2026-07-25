@@ -12,6 +12,7 @@ Safety model (bank-grade, fail closed):
   whose files exist before the commit that makes them reachable.
 """
 
+import json
 import logging
 import time
 from typing import Dict, Set
@@ -132,7 +133,7 @@ class GarbageCollector:
         # 3. Load in-flight protection markers (and sweep abandoned ones)
         protected_files = self._load_inflight_protection(inflight_timeout_ms)
         if protected_files:
-            logger.info(f"Protecting {len(protected_files)} in-flight data files from GC")
+            logger.info(f"Protecting {len(protected_files)} in-flight files from GC")
 
         # 4. List all files in storage and delete orphans
 
@@ -141,20 +142,27 @@ class GarbageCollector:
             "data", reachable_data_files | protected_files, grace_period_ms
         )
 
-        # GC Manifests (files in the real manifests directory that are NOT reachable)
+        # GC Manifests (files in the real manifests directory that are NOT
+        # reachable). In-flight protection applies here too: a commit in
+        # progress has written its manifests before the metadata that makes
+        # them reachable.
         all_reachable_manifests = reachable_manifests.union(reachable_manifest_lists)
         stats["manifest_files"] = self._gc_prefix(
-            self.file_manager.manifests_path, all_reachable_manifests, grace_period_ms
+            self.file_manager.manifests_path,
+            all_reachable_manifests | protected_files,
+            grace_period_ms,
         )
 
         logger.info(f"Garbage collection complete. Deleted: {stats}")
         return stats
 
     def _load_inflight_protection(self, inflight_timeout_ms: int) -> Set[str]:
-        """Collect data-file paths protected by fresh in-flight markers.
+        """Collect paths protected by fresh in-flight markers.
 
-        Markers older than the abandonment timeout are deleted; their files fall
-        back to normal orphan handling.
+        Protection covers every file a transaction has written but not yet made
+        reachable - data files AND the manifests / manifest lists of a commit in
+        progress. Markers older than the abandonment timeout are deleted; their
+        files fall back to normal orphan handling.
         """
         protected: Set[str] = set()
         cutoff = (time.time() * 1000) - inflight_timeout_ms
@@ -172,11 +180,10 @@ class GarbageCollector:
                 # Can't stat the marker: keep protection (fail closed)
                 age_ok = True
 
-            # Marker name is "<data file basename>.inflight"; the file lives in data/
             basename = norm_marker.rsplit("/", 1)[-1]
             if not basename.endswith(".inflight"):
                 continue
-            data_rel = f"data/{basename[: -len('.inflight')]}"
+            data_rel = self._marker_target(norm_marker, basename)
 
             if age_ok:
                 protected.add(data_rel)
@@ -194,6 +201,24 @@ class GarbageCollector:
 
         return protected
 
+    def _marker_target(self, marker_path: str, basename: str) -> str:
+        """Resolve which file a marker protects.
+
+        The marker's payload names the protected path explicitly (it may be a
+        data file, a manifest, or a manifest list). Markers written by older
+        versions carry no payload; for those the historical convention -
+        "<data file basename>.inflight" under data/ - is assumed.
+        """
+        fallback = f"data/{basename[: -len('.inflight')]}"
+        try:
+            payload = json.loads(self.storage.read_file(marker_path).decode("utf-8"))
+            target = payload.get("file_path")
+        except Exception:
+            return fallback
+        if not isinstance(target, str) or not target:
+            return fallback
+        return self._normalize_path(target)
+
     def _gc_prefix(self, prefix: str, reachable_set: Set[str], grace_period_ms: int) -> int:
         """Garbage collect files in a specific prefix."""
         deleted_count = 0
@@ -209,11 +234,24 @@ class GarbageCollector:
         for file_rel_path in all_files:
             norm_path = self._normalize_path(file_rel_path)
 
+            # Independent guard against the #45 class of bug: a listed path that
+            # escapes the table root can never be matched against the reachable
+            # set, so every live file would look like an orphan. Abort rather
+            # than delete on a path we cannot classify (fail closed).
+            if norm_path == ".." or norm_path.startswith("../"):
+                raise GarbageCollectionAborted(
+                    f"Aborting GC: storage listing under '{prefix}' returned a path outside "
+                    f"the table root ({file_rel_path!r}). Reachability cannot be determined."
+                )
+
             if norm_path not in reachable_set:
                 # Potential orphan. Check age.
                 try:
                     if self.storage.get_modified_time(file_rel_path) * 1000 < cutoff_time:
-                        logger.info(f"Deleting orphan file: {file_rel_path}")
+                        # Per-file detail at DEBUG: a sweep over a large table
+                        # would otherwise emit one INFO line per object. The
+                        # summary below stays at INFO.
+                        logger.debug(f"Deleting orphan file: {file_rel_path}")
                         self.storage.delete_file(file_rel_path)
                         deleted_count += 1
                 except Exception as e:
@@ -221,6 +259,8 @@ class GarbageCollector:
                     # live is at risk); log and continue.
                     logger.warning(f"Failed to process potential orphan {file_rel_path}: {e}")
 
+        if deleted_count:
+            logger.info(f"Deleted {deleted_count} orphan file(s) under {prefix}")
         return deleted_count
 
     def _normalize_path(self, path: str) -> str:

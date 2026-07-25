@@ -20,10 +20,24 @@ except ImportError:
 
 from .data_structures import DataFile, FileFormat, Schema
 from .integrity import IntegrityChecker
-from .storage_backend import S3StorageBackend, StorageBackend
+from .logging_config import get_logger
+from .storage_backend import LocalStorageBackend, S3StorageBackend, StorageBackend
 
 if TYPE_CHECKING:
     from .file_manager import FileManager
+
+logger = get_logger(__name__)
+
+# Exceptions PyArrow raises when data genuinely does not fit a schema. Anything
+# else is a bug in our conversion code and must not be reported as "incompatible".
+_SCHEMA_MISMATCH_ERRORS = (
+    pa.ArrowInvalid,
+    pa.ArrowTypeError,
+    pa.ArrowNotImplementedError,
+    TypeError,
+    ValueError,
+    KeyError,
+)
 
 
 class DataFileReader:
@@ -197,9 +211,21 @@ class DataFileWriter:
                 self._temp_file = tempfile.NamedTemporaryFile(
                     delete=False, dir=temp_dir, suffix=".parquet"
                 )
-                self._writer = pq.ParquetWriter(
-                    self._temp_file.name, modified_schema, compression="lz4"
-                )
+                try:
+                    self._writer = pq.ParquetWriter(
+                        self._temp_file.name, modified_schema, compression="lz4"
+                    )
+                except BaseException:
+                    # Never leave the temp file behind when the writer could not
+                    # be constructed: nothing will ever close or rename it.
+                    temp_name = self._temp_file.name
+                    self._temp_file.close()
+                    self._temp_file = None
+                    try:
+                        os.remove(temp_name)
+                    except OSError:
+                        logger.warning(f"Could not remove temp file {temp_name}")
+                    raise
         else:
             raise ValueError(f"Unsupported file format: {self.file_format}")
 
@@ -331,31 +357,49 @@ class DataFileManager:
         return None  # Local filesystem
 
     def _get_arrow_path(self, path: str) -> str:
-        """Convert path to PyArrow format (bucket/key for S3, absolute for local)"""
+        """Convert a manifest path to a PyArrow path (bucket/key for S3, absolute for local).
+
+        Every path handed to PyArrow - for reads as well as writes - is treated
+        as relative to the table root and routed through the storage backend's
+        boundary check. Returning true absolute paths unchanged (as this used
+        to) let a tampered or corrupt manifest entry such as '/etc/passwd' make
+        the reader open any file on the host, bypassing the traversal guard the
+        write/GC path enforces (#47).
+        """
         if isinstance(self.storage, S3StorageBackend):
             # For PyArrow S3FileSystem, path should be bucket/key
             key = self.storage._get_s3_key(path)
             return f"{self.storage.bucket}/{key}"
-        # For local filesystem, convert to absolute path
-        # Distinguish between:
-        # - Iceberg-style paths: /data/xxx.parquet, /metadata/xxx (relative to table)
-        # - True absolute paths: /tmp/xxx, /home/xxx (actual filesystem paths)
-        # - Relative paths: data/xxx.parquet (no leading /)
-        if path.startswith("/"):
-            # Check if it's an Iceberg-style path (starts with /data/ or /metadata/)
-            first_component = path.split("/")[1] if len(path.split("/")) > 1 else ""
-            if first_component in ("data", "metadata"):
-                # Iceberg-style path - join with table path
-                table_path = self.file_manager.table_path
-                return os.path.join(table_path, path.lstrip("/"))
-            else:
-                # True absolute path - return as-is
-                return path
-        elif not os.path.isabs(path):
-            # Relative path - join with table path
-            table_path = self.file_manager.table_path
-            return os.path.join(table_path, path)
-        return path
+        if isinstance(self.storage, LocalStorageBackend):
+            base_path = self.storage._real_base_path()
+            components = path.split("/")
+            first_component = components[1] if path.startswith("/") and len(components) > 1 else ""
+
+            if not os.path.isabs(path) or first_component in ("data", "metadata"):
+                # Iceberg-style ('/data/x.parquet') or plain relative
+                # ('data/x.parquet'): table-relative, resolved and
+                # boundary-checked by the storage backend.
+                return self.storage._resolve_path(path)
+
+            # A true absolute path (e.g. from a caller holding the real
+            # location of a file it just wrote) is honoured ONLY if it lies
+            # inside the table root; anything else is a traversal attempt or a
+            # tampered manifest entry and must not be opened.
+            resolved = os.path.realpath(path)
+            try:
+                inside = os.path.commonpath([base_path, resolved]) == base_path
+            except ValueError:
+                inside = False
+            if not inside:
+                raise ValueError(
+                    f"Security Error: Path traversal attempt detected. Resolved path "
+                    f"'{resolved}' is outside table root '{base_path}'"
+                )
+            return resolved
+
+        # Unknown backend: fall back to a table-root join (no escape either).
+        table_path = self.file_manager.table_path
+        return os.path.join(table_path, path.lstrip("/"))
 
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
         """Convert Iceberg schema to PyArrow schema"""
@@ -557,8 +601,13 @@ class DataFileManager:
                     lower_bounds[field_id] = min_val
                 if max_val is not None:
                     upper_bounds[field_id] = max_val
-            except Exception:
-                # Skip columns that can't compute bounds (e.g., all nulls)
+            except pa.ArrowNotImplementedError:
+                # min/max is not defined for this column type: no bounds, hence
+                # no pruning for it (correct, just less selective).
+                logger.debug(
+                    f"No min/max support for column '{field_name}' "
+                    f"({column.type}); skipping bounds"
+                )
                 continue
 
         return lower_bounds if lower_bounds else None, upper_bounds if upper_bounds else None
@@ -670,7 +719,8 @@ class DataFileManager:
             arrow_schema = self.create_arrow_schema(iceberg_schema)
             pa.Table.from_pandas(df, schema=arrow_schema)
             return True
-        except Exception:
+        except _SCHEMA_MISMATCH_ERRORS as e:
+            logger.debug(f"DataFrame is not compatible with the schema: {e}")
             return False
 
     def validate_data_compatibility(
@@ -683,5 +733,6 @@ class DataFileManager:
             # Try to create a table with the records and schema
             pa.Table.from_pylist(records, schema=arrow_schema)
             return True
-        except Exception:
+        except _SCHEMA_MISMATCH_ERRORS as e:
+            logger.debug(f"Records are not compatible with the schema: {e}")
             return False

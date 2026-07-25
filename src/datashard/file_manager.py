@@ -8,7 +8,7 @@ import json
 import uuid
 from datetime import date, datetime, time as dt_time
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import fastavro
 
@@ -171,6 +171,8 @@ class FileManager:
         manifest_content: ManifestContent = ManifestContent.DATA,
         snapshot_id: Optional[int] = None,
         existing_files: Optional[List[DataFile]] = None,
+        sequence_number: Optional[int] = None,
+        pre_write_hook: Optional[Callable[[str], None]] = None,
     ) -> ManifestFile:
         """Create a manifest file for the given data files.
 
@@ -181,6 +183,13 @@ class FileManager:
             existing_files: Files carried over from earlier snapshots (e.g.
                 survivors of a delete-rewrite). Written with status EXISTING and
                 their ORIGINAL added_snapshot_id, so history is not falsified.
+            sequence_number: The committing snapshot's Iceberg v2 sequence
+                number, stamped on ADDED entries. Carried-over files keep the
+                sequence number they were added with (inheritance), so a
+                manifest rewrite never re-dates existing data.
+            pre_write_hook: Called with the manifest's table-relative path
+                immediately BEFORE the file is written. Used to register GC
+                protection for a file that is not yet reachable.
         """
         existing_files = existing_files or []
 
@@ -195,20 +204,26 @@ class FileManager:
 
         # Prepare records for Avro
         records = []
+        entry_sequence_numbers: List[int] = []
         for df, status in [(f, ENTRY_STATUS_ADDED) for f in data_files] + [
             (f, ENTRY_STATUS_EXISTING) for f in existing_files
         ]:
             if status == ENTRY_STATUS_ADDED:
                 entry_snapshot_id: Optional[int] = snapshot_id_val
+                entry_sequence_number: Optional[int] = sequence_number
             else:
                 # Preserve the original adding snapshot for carried-over files
                 entry_snapshot_id = df.added_snapshot_id
+                entry_sequence_number = df.sequence_number
+
+            if entry_sequence_number is not None:
+                entry_sequence_numbers.append(entry_sequence_number)
 
             record = {
                 "status": status,
                 "snapshot_id": entry_snapshot_id,
-                "sequence_number": None,
-                "file_sequence_number": None,
+                "sequence_number": entry_sequence_number,
+                "file_sequence_number": entry_sequence_number,
                 "data_file": {
                     "file_path": df.file_path,
                     "file_format": df.file_format.value if hasattr(df.file_format, 'value') else str(df.file_format),
@@ -232,7 +247,9 @@ class FileManager:
         fastavro.writer(bytes_io, MANIFEST_ENTRY_SCHEMA, records)
         content = bytes_io.getvalue()
 
-        # Write using storage backend
+        # Write using storage backend (protect it from GC first, if asked)
+        if pre_write_hook is not None:
+            pre_write_hook(manifest_path)
         self.storage.write_file(manifest_path, content)
 
         # Get actual size
@@ -249,8 +266,10 @@ class FileManager:
             deleted_data_files_count=0,
             partitions=[],
             content=manifest_content,
-            sequence_number=None,
-            min_sequence_number=None,
+            sequence_number=sequence_number,
+            min_sequence_number=(
+                min(entry_sequence_numbers) if entry_sequence_numbers else sequence_number
+            ),
         )
 
     def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
@@ -305,6 +324,11 @@ class FileManager:
                         upper_bounds=upper_bounds,
                         checksum=df_record.get("checksum"),
                         added_snapshot_id=record.get("snapshot_id"),
+                        sequence_number=(
+                            record.get("file_sequence_number")
+                            if record.get("file_sequence_number") is not None
+                            else record.get("sequence_number")
+                        ),
                     )
                     data_files.append(data_file)
                 return data_files
@@ -333,6 +357,7 @@ class FileManager:
                     upper_bounds=file_entry.get("upper_bounds"),
                     checksum=file_entry.get("checksum"),
                     added_snapshot_id=file_entry.get("added_snapshot_id"),
+                    sequence_number=file_entry.get("sequence_number"),
                 )
                 data_files.append(data_file)
             return data_files
@@ -341,9 +366,19 @@ class FileManager:
             raise ValueError(f"Could not parse manifest file {manifest_path} (tried Avro and JSON)") from e
 
     def create_manifest_list_file(
-        self, manifest_files: List[ManifestFile], snapshot_id: int
+        self,
+        manifest_files: List[ManifestFile],
+        snapshot_id: int,
+        pre_write_hook: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """Create a manifest list file for a snapshot"""
+        """Create a manifest list file for a snapshot.
+
+        Args:
+            manifest_files: All manifests active in the new snapshot.
+            snapshot_id: The committing snapshot's id.
+            pre_write_hook: Called with the list's table-relative path before it
+                is written (GC protection for a not-yet-reachable file).
+        """
         timestamp = int(datetime.now().timestamp() * 1000)
         list_filename = f"manifest_list_{snapshot_id}_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
         list_path = f"{self.manifests_path}/{list_filename}"
@@ -359,8 +394,8 @@ class FileManager:
                 "manifest_length": mf.manifest_length,
                 "partition_spec_id": mf.partition_spec_id,
                 "content": content_val,
-                "sequence_number": mf.sequence_number or 0,
-                "min_sequence_number": mf.min_sequence_number or 0,
+                "sequence_number": mf.sequence_number,
+                "min_sequence_number": mf.min_sequence_number,
                 "added_snapshot_id": mf.added_snapshot_id,
                 "added_data_files_count": mf.added_data_files_count,
                 "existing_data_files_count": mf.existing_data_files_count,
@@ -374,7 +409,9 @@ class FileManager:
         fastavro.writer(bytes_io, MANIFEST_FILE_SCHEMA, records)
         content = bytes_io.getvalue()
 
-        # Write using storage backend
+        # Write using storage backend (protect it from GC first, if asked)
+        if pre_write_hook is not None:
+            pre_write_hook(list_path)
         self.storage.write_file(list_path, content)
 
         return list_path
@@ -438,35 +475,21 @@ class FileManager:
             raise ValueError(f"Could not parse manifest list file {list_path}") from e
 
     def cleanup_orphaned_files(self, valid_file_paths: List[str]) -> int:
-        """Clean up data files that are no longer referenced by any manifest"""
-        # Get all data files currently in the data directory
-        all_data_files_raw = self.storage.list_files(self.data_path)
+        """Removed: unsafe legacy cleanup. Use Table.garbage_collect() instead.
 
-        # Filter to only data files
-        all_data_files = []
-        for file_path in all_data_files_raw:
-            if file_path.endswith((".parquet", ".avro", ".orc")):
-                # Ensure path starts with /
-                if not file_path.startswith("/"):
-                    file_path = "/" + file_path
-                all_data_files.append(file_path)
-
-        # Find files that are not in valid_file_paths
-        orphaned_files = [f for f in all_data_files if f not in valid_file_paths]
-
-        # Remove orphaned files
-        deleted_count = 0
-        for file_path in orphaned_files:
-            try:
-                # Remove leading slash for storage backend
-                path = file_path.lstrip("/")
-                if self.storage.exists(path):
-                    self.storage.delete_file(path)
-                    deleted_count += 1
-            except Exception as e:
-                print(f"Warning: Could not delete orphaned file {file_path}: {e}")
-
-        return deleted_count
+        The old implementation deleted every data file absent from a
+        caller-supplied list, with no grace period, no protection for files
+        written by in-flight transactions, and no abort when reachability could
+        not be computed - any of which silently destroys live data. It is kept
+        only as an explicit failure so existing callers get an actionable error
+        rather than data loss.
+        """
+        raise NotImplementedError(
+            "FileManager.cleanup_orphaned_files is unsafe and has been removed: it "
+            "deletes files without a grace period, without protecting in-flight "
+            "transactions, and without failing closed on unreadable metadata. Use "
+            "Table.garbage_collect(grace_period_ms=...) instead."
+        )
 
     def verify_integrity(self, manifest_files: List[ManifestFile]) -> Dict[str, Any]:
         """Verify the integrity of all files referenced in manifests"""

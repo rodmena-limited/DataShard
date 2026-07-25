@@ -131,6 +131,9 @@ class DataFile:
     sort_order_id: Optional[int] = None
     # Snapshot that originally added this file (preserved across manifest rewrites)
     added_snapshot_id: Optional[int] = None
+    # Sequence number of the snapshot that added this file (Iceberg v2 file
+    # sequence number). Inherited unchanged when a manifest is rewritten.
+    sequence_number: Optional[int] = None
 
 
 @dataclass
@@ -173,6 +176,8 @@ class Snapshot:
     operation: Optional[str] = None  # "append", "replace", "delete", etc.
     summary: Optional[Dict[str, str]] = None
     schema_id: Optional[int] = None
+    # Monotonic Iceberg v2 sequence number assigned at commit time
+    sequence_number: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.summary is None:

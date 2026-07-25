@@ -145,6 +145,18 @@ class LocalStorageBackend(StorageBackend):
     def __init__(self, base_path: str):
         self.base_path = base_path
 
+    def _real_base_path(self) -> str:
+        """Canonical (symlink-resolved) table root.
+
+        EVERY path computation - containment checks and the table-relative
+        paths returned by list_files - must agree on one canonical base.
+        Mixing the raw base with a realpath-resolved tree yields '../' paths
+        that no reachability set can match, which is how GC once classified
+        live files as orphans (#45). Resolved on each call so a base directory
+        created (or re-pointed) after construction is still handled correctly.
+        """
+        return os.path.realpath(self.base_path)
+
     def _resolve_path(self, path: str) -> str:
         """Resolve path relative to base_path, rejecting escapes from the table root.
 
@@ -166,7 +178,7 @@ class LocalStorageBackend(StorageBackend):
 
         # Canonicalize: resolve '..' AND symlinks
         full_path = os.path.realpath(joined_path)
-        base_path = os.path.realpath(self.base_path)
+        base_path = self._real_base_path()
 
         # Ensure the resolved path is within the base directory (true boundary
         # check, not a string prefix check)
@@ -292,16 +304,35 @@ class LocalStorageBackend(StorageBackend):
         return os.path.exists(full_path)
 
     def list_files(self, prefix: str) -> List[str]:
+        """List files under `prefix`, as paths relative to the table root.
+
+        The walk starts from the CANONICAL (symlink-resolved) prefix, so the
+        returned paths must be computed against the CANONICAL base as well.
+        Using the raw base here made every path under a symlinked table root
+        come back as '../real_table/...', which never matches the reachability
+        set the garbage collector compares against - so GC deleted the entire
+        live table (#45).
+        """
         full_prefix = self._resolve_path(prefix)
         if not os.path.exists(full_prefix):
             return []
 
+        base_path = self._real_base_path()
         result = []
         for root, _dirs, files in os.walk(full_prefix):
             for file in files:
                 full_path = os.path.join(root, file)
-                # Return path relative to base_path
-                rel_path = os.path.relpath(full_path, self.base_path)
+                # Return path relative to the canonical base_path
+                rel_path = os.path.relpath(full_path, base_path)
+                # Defence in depth: never hand out a path that escapes the
+                # table root. os.walk does not follow directory symlinks, so
+                # this is unreachable in practice - if it ever fires, listing
+                # is not trustworthy and callers (GC) must not act on it.
+                if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+                    raise ValueError(
+                        f"Security Error: listing under '{prefix}' produced a path outside "
+                        f"the table root: '{rel_path}' (resolved '{full_path}', base '{base_path}')"
+                    )
                 result.append(rel_path)
         return result
 
@@ -550,6 +581,10 @@ class S3StorageBackend(StorageBackend):
         retried like every other S3 operation - exists() sits on hot paths
         (version-hint reads, manifest reachability) where a first-try failure
         must not surface as a hard error.
+
+        Only paths written as directories (trailing '/') fall back to a prefix
+        listing. Answering True for 'data/x.parquet' merely because objects
+        exist UNDER that name would let a missing data file pass validation.
         """
         from .s3_consistency import with_s3_retry
 
@@ -564,62 +599,102 @@ class S3StorageBackend(StorageBackend):
                 if e.response["Error"]["Code"] != "404":
                     raise
 
-            # If exact match fails, check if it's a prefix (directory-like)
-            # by checking if any objects exist with this prefix
-            prefix = key if key.endswith("/") else key + "/"
-            response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix, MaxKeys=1)
+            if not key.endswith("/"):
+                return False
+
+            # Directory-like path: any object under the prefix counts.
+            response = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=key, MaxKeys=1)
             return "Contents" in response and len(response["Contents"]) > 0
 
         return with_s3_retry(exists_op, f"S3 exists: {key}")
 
     def list_files(self, prefix: str) -> List[str]:
+        """List objects under a prefix, retried like every other S3 read.
+
+        Garbage collection decides what to delete from this listing, so a
+        transient failure here must surface as an error (the caller aborts),
+        never as a short list.
+        """
+        from .s3_consistency import with_s3_retry
+
         s3_prefix = self._get_s3_key(prefix)
 
-        result = []
-        paginator = self.s3.get_paginator("list_objects_v2")
+        def list_op() -> List[str]:
+            result = []
+            paginator = self.s3.get_paginator("list_objects_v2")
 
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=s3_prefix):
-            if "Contents" not in page:
-                continue
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=s3_prefix):
+                if "Contents" not in page:
+                    continue
 
-            for obj in page["Contents"]:
-                key = obj["Key"]
-                # Remove prefix to get relative path
-                if self.prefix and key.startswith(self.prefix + "/"):
-                    rel_path = key[len(self.prefix) + 1 :]
-                else:
-                    rel_path = key
-                result.append(rel_path)
+                for obj in page["Contents"]:
+                    key = obj["Key"]
+                    # Remove prefix to get relative path
+                    if self.prefix and key.startswith(self.prefix + "/"):
+                        rel_path = key[len(self.prefix) + 1 :]
+                    else:
+                        rel_path = key
+                    result.append(rel_path)
 
-        return result
+            return result
+
+        return with_s3_retry(list_op, f"S3 list: {s3_prefix}")
 
     def delete_file(self, path: str) -> None:
+        """Delete an object, retrying transient errors.
+
+        Without a retry a blip leaves an orphan behind on every GC pass.
+        """
+        from .s3_consistency import with_s3_retry
+
         key = self._get_s3_key(path)
-        self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+        def delete_op() -> None:
+            self.s3.delete_object(Bucket=self.bucket, Key=key)
+
+        with_s3_retry(delete_op, f"S3 delete: {key}")
 
     def makedirs(self, path: str, exist_ok: bool = True) -> None:
         """No-op for S3 - directories don't need to be created"""
         pass
 
     def get_size(self, path: str) -> int:
+        from .s3_consistency import with_s3_retry
+
         key = self._get_s3_key(path)
-        try:
-            response = self.s3.head_object(Bucket=self.bucket, Key=key)
-            return response["ContentLength"]
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
-            raise
+
+        def size_op() -> int:
+            try:
+                response = self.s3.head_object(Bucket=self.bucket, Key=key)
+                return int(response["ContentLength"])
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    raise FileNotFoundError(
+                        f"S3 object not found: s3://{self.bucket}/{key}"
+                    ) from e
+                raise
+
+        return with_s3_retry(size_op, f"S3 size: {key}")
 
     def get_modified_time(self, path: str) -> float:
+        """Object mtime, retried: GC compares it against the grace period, and
+        a failure there is treated as 'cannot classify'."""
+        from .s3_consistency import with_s3_retry
+
         key = self._get_s3_key(path)
-        try:
-            response = self.s3.head_object(Bucket=self.bucket, Key=key)
-            return response["LastModified"].timestamp()
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                 raise FileNotFoundError(f"S3 object not found: s3://{self.bucket}/{key}") from e
-            raise
+
+        def mtime_op() -> float:
+            try:
+                response = self.s3.head_object(Bucket=self.bucket, Key=key)
+                return float(response["LastModified"].timestamp())
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    raise FileNotFoundError(
+                        f"S3 object not found: s3://{self.bucket}/{key}"
+                    ) from e
+                raise
+
+        return with_s3_retry(mtime_op, f"S3 mtime: {key}")
 
     def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
         key = self._get_s3_key(path)

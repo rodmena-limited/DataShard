@@ -5,7 +5,7 @@ Converts user-friendly filter syntax to PyArrow filter expressions.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -73,6 +73,15 @@ def parse_filter_dict(filter_dict: Dict[str, Any]) -> List[FilterExpression]:
             else:
                 op = _parse_op(op_str)
                 expressions.append(FilterExpression(column, op, value))
+        elif condition is None:
+            # {"column": None} reads as "column IS NULL", but SQL equality with
+            # NULL matches nothing - it would silently return zero rows. Refuse
+            # rather than answer a question the caller did not ask.
+            raise ValueError(
+                f"Filter {{'{column}': None}} is ambiguous: equality with NULL matches "
+                f"no rows in SQL semantics. Use {{'{column}': ('is_null', True)}} to "
+                f"select NULLs, or ('is_not_null', True) for the complement."
+            )
         else:
             # Simple equality: {"column": value}
             expressions.append(FilterExpression(column, FilterOp.EQ, condition))
@@ -119,66 +128,31 @@ def _parse_op(op_str: str) -> FilterOp:
     return op
 
 
-def to_pyarrow_filter(
-    expressions: List[FilterExpression],
-) -> Optional[List[Tuple[str, str, Any]]]:
-    """
-    Convert FilterExpressions to PyArrow filter format.
-
-    PyArrow filters use format: [("column", "op", value), ...]
-    Multiple filters are ANDed together.
-
-    Args:
-        expressions: List of FilterExpression objects
-
-    Returns:
-        List of tuples in PyArrow filter format, or None if empty
-    """
-    if not expressions:
-        return None
-
-    pa_filters = []
-    for expr in expressions:
-        # Skip null checks - handled separately
-        if expr.op in (FilterOp.IS_NULL, FilterOp.IS_NOT_NULL):
-            continue
-
-        pa_op = {
-            FilterOp.EQ: "==",
-            FilterOp.NE: "!=",
-            FilterOp.LT: "<",
-            FilterOp.LE: "<=",
-            FilterOp.GT: ">",
-            FilterOp.GE: ">=",
-            FilterOp.IN: "in",
-            FilterOp.NOT_IN: "not in",
-        }.get(expr.op)
-
-        if pa_op:
-            pa_filters.append((expr.column, pa_op, expr.value))
-
-    return pa_filters if pa_filters else None
-
-
 def _build_condition(
     expr: FilterExpression,
     field: pc.Expression,
 ) -> pc.Expression:
     """Build a PyArrow compute condition for a single filter expression."""
 
+    # Documented contract (see Table.scan): in/not_in NEVER match NULL - use
+    # is_null / is_not_null for that. A NULL in the value set therefore matches
+    # nothing and is dropped, and every result is explicitly restricted to
+    # non-null rows.
     def _in_condition() -> pc.Expression:
-        values = list(expr.value)
+        values = [v for v in expr.value if v is not None]
         if not values:
             # IN () matches nothing (SQL semantics)
             return pc.scalar(False)
-        return pc.is_in(field, value_set=pa.array(values))
+        return pc.is_in(field, value_set=pa.array(values)) & field.is_valid()
 
     def _not_in_condition() -> pc.Expression:
-        values = list(expr.value)
+        values = [v for v in expr.value if v is not None]
         if not values:
-            # NOT IN () matches every row
-            return pc.scalar(True)
-        return ~pc.is_in(field, value_set=pa.array(values))
+            # NOT IN () matches every non-null row
+            return field.is_valid()
+        # `~pc.is_in(...)` alone KEEPS null rows (is_in returns false for them),
+        # which contradicts the documented contract - hence the is_valid() guard.
+        return (~pc.is_in(field, value_set=pa.array(values))) & field.is_valid()
 
     op_handlers: Dict[FilterOp, Any] = {
         FilterOp.EQ: lambda: field == expr.value,

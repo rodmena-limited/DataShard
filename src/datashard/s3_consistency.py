@@ -23,6 +23,38 @@ except ImportError:
     RETRYABLE_EXCEPTIONS = (IOError, OSError)
 
 
+# S3 error codes that can never succeed on retry: retrying them only turns a
+# fast, clear failure into a slow one (and hammers a service that already said
+# no). 404/NoSuchKey are deliberately NOT here - under eventual consistency a
+# just-written object can briefly read as missing.
+PERMANENT_S3_ERROR_CODES = frozenset({
+    "AccessDenied",
+    "AllAccessDisabled",
+    "AccountProblem",
+    "AuthorizationHeaderMalformed",
+    "InvalidAccessKeyId",
+    "InvalidBucketName",
+    "InvalidObjectState",
+    "InvalidToken",
+    "NoSuchBucket",
+    "PermanentRedirect",
+    "SignatureDoesNotMatch",
+    "TokenRefreshRequired",
+    "UnauthorizedAccess",
+    "403",
+    "401",
+})
+
+
+def is_permanent_s3_error(exc: BaseException) -> bool:
+    """True when an exception is an S3 error that retrying cannot fix."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = response.get("Error", {}).get("Code", "")
+    return code in PERMANENT_S3_ERROR_CODES
+
+
 class S3ConsistencyHandler:
     """Handles S3 eventual consistency with retry logic."""
 
@@ -100,6 +132,11 @@ class S3ConsistencyHandler:
 
             except self.retryable_exceptions as e:
                 last_exception = e
+                if is_permanent_s3_error(e):
+                    # Credentials, permissions or a missing bucket: no number of
+                    # retries changes the answer.
+                    logger.error(f"{operation_name} failed permanently: {e}")
+                    raise
                 if attempt < self.max_retries:
                     # Check for ClientError 404/NoSuchKey - if we are reading, we might want to fail fast?
                     # But due to eventual consistency, a 404 might be temporary.

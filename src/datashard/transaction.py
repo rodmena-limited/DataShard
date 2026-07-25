@@ -86,19 +86,68 @@ class Transaction:
         return self._is_active and not self._is_committed and not self._is_rolled_back
 
     def append_files(self, files: List[DataFile]) -> "Transaction":
-        """Queue files to append to the table"""
+        """Queue pre-built data files to append to the table.
+
+        Each file must exist AND (for parquet, on a table that has a persisted
+        schema) carry a schema identical to the table's - see
+        _validate_file_schema for why divergence is rejected here rather than
+        discovered at scan time.
+        """
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
         # Validate that the files exist in the file system
         # This is a critical check in production systems
+        table_schema = self._resolve_table_schema()
         for data_file in files:
             if not self.file_manager.validate_file_exists(data_file.file_path):
                 raise FileNotFoundError(f"Data file does not exist: {data_file.file_path}")
+            if table_schema is not None:
+                self._validate_file_schema(data_file, table_schema)
 
         self._operations.append({"type": "append_files", "files": files})
 
         return self
+
+    def _validate_file_schema(self, data_file: DataFile, table_schema: Schema) -> None:
+        """Reject a pre-built data file whose stored schema diverges from the table's.
+
+        pa.concat_tables requires identical schemas (field names, order, types
+        AND nullability), so a divergent file commits happily and then makes
+        every subsequent full scan fail - the file is accepted, the table is
+        bricked. append_data(records) already enforces this via
+        _validate_schema_against_table; this closes the same hole on the
+        file-level API (#49).
+
+        Only parquet files can be checked (the schema lives in the footer);
+        other formats are queued unchecked, as before.
+        """
+        fmt = data_file.file_format
+        fmt_name = fmt.value if isinstance(fmt, FileFormat) else str(fmt)
+        if fmt_name.lower() != FileFormat.PARQUET.value:
+            return
+
+        import pyarrow.parquet as pq
+
+        dfm = self.file_manager.data_file_manager
+        expected = dfm.create_arrow_schema(table_schema)
+        arrow_path = dfm._get_arrow_path(data_file.file_path)
+
+        try:
+            actual = pq.ParquetFile(arrow_path, filesystem=dfm._pyarrow_fs).schema_arrow
+        except Exception as e:
+            raise ValueError(
+                f"Cannot read the parquet schema of '{data_file.file_path}': {e}. "
+                f"Refusing to append a file whose schema cannot be verified against the "
+                f"table schema - an unverifiable file can make every later scan fail."
+            ) from e
+
+        if not actual.equals(expected, check_metadata=False):
+            raise ValueError(
+                f"Data file '{data_file.file_path}' has a schema that does not match the "
+                f"table's persisted schema. Appending it would make table scans fail. "
+                f"Table schema: {expected}; file schema: {actual}"
+            )
 
     def append_pandas(
         self,
@@ -204,10 +253,7 @@ class Transaction:
         # transaction's files could exceed the GC grace period and be deleted
         # out from under the commit. Marker write failure aborts the append
         # (fail closed - never write unprotected files).
-        marker_path = f"{_INFLIGHT_PATH}/{file_name}.inflight"
-        marker_payload = json.dumps({"file_path": file_path}).encode("utf-8")
-        self.file_manager.storage.write_file(marker_path, marker_payload)
-        self._inflight_markers.append(marker_path)
+        self._register_inflight(file_path)
 
         # Use the data file manager to write the data
         data_file = self.file_manager.data_file_manager.write_data_file(
@@ -244,6 +290,22 @@ class Transaction:
         self.append_files([updated_data_file])
 
         return self
+
+    def _register_inflight(self, file_path: str) -> None:
+        """Write a GC-protection marker for a file this transaction is about to
+        write but that no snapshot references yet.
+
+        Used for data files AND for the manifests / manifest lists of a commit
+        in progress: without a marker, a concurrent garbage collection running
+        with a short grace period can delete a file between its write and the
+        metadata commit that makes it reachable. Marker write failures
+        propagate - a file is never written unprotected (fail closed).
+        """
+        marker_name = file_path.rsplit("/", 1)[-1]
+        marker_path = f"{_INFLIGHT_PATH}/{marker_name}.inflight"
+        marker_payload = json.dumps({"file_path": file_path.lstrip("/")}).encode("utf-8")
+        self.file_manager.storage.write_file(marker_path, marker_payload)
+        self._inflight_markers.append(marker_path)
 
     def delete_files(self, file_paths: List[str]) -> "Transaction":
         """Queue files to delete from the table"""
@@ -396,6 +458,10 @@ class Transaction:
         # manifest-list filename, and the Snapshot itself must agree, or
         # lineage joins dangle.
         snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
+        # Same for the Iceberg v2 sequence number: derived from the SAME base
+        # metadata the OCC commit will be validated against, so a lost race
+        # re-derives it from the fresh base on retry.
+        sequence_number = base_metadata.last_sequence_number + 1
 
         # 1. Read existing manifests from the base snapshot. Failure ABORTS the
         # commit: falling back to an empty manifest set would silently drop
@@ -412,18 +478,30 @@ class Transaction:
                     base_snapshot = s
                     break
 
-            if base_snapshot:
-                path = base_snapshot.manifest_list
-                if path.startswith("/"):
-                    path = path.lstrip("/")
-                try:
-                    existing_manifests = self.file_manager.read_manifest_list_file(path)
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Cannot read base snapshot manifest list "
-                        f"'{base_snapshot.manifest_list}'. Aborting commit: proceeding "
-                        f"would silently drop all prior table data from the new snapshot."
-                    ) from e
+            if base_snapshot is None:
+                # Dangling current_snapshot_id: the metadata is inconsistent, so
+                # the base file set is UNKNOWN. Continuing with an empty base
+                # would write a snapshot that silently omits every pre-existing
+                # file (and GC would then delete them). Fail closed.
+                raise RuntimeError(
+                    f"Table metadata is inconsistent: current_snapshot_id "
+                    f"{base_metadata.current_snapshot_id} does not match any snapshot in "
+                    f"metadata.snapshots ({[s.snapshot_id for s in base_metadata.snapshots]}). "
+                    f"Aborting commit: proceeding would silently drop all prior table data "
+                    f"from the new snapshot."
+                )
+
+            path = base_snapshot.manifest_list
+            if path.startswith("/"):
+                path = path.lstrip("/")
+            try:
+                existing_manifests = self.file_manager.read_manifest_list_file(path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cannot read base snapshot manifest list "
+                    f"'{base_snapshot.manifest_list}'. Aborting commit: proceeding "
+                    f"would silently drop all prior table data from the new snapshot."
+                ) from e
 
         # 2. Process deletes (rewrite affected manifests)
         final_manifests: List[ManifestFile] = []
@@ -458,6 +536,8 @@ class Transaction:
                         ManifestContent.DATA,
                         snapshot_id,
                         existing_files=surviving_files,
+                        sequence_number=sequence_number,
+                        pre_write_hook=self._register_inflight,
                     )
                     new_manifest.partition_spec_id = manifest.partition_spec_id
                     final_manifests.append(new_manifest)
@@ -469,13 +549,17 @@ class Transaction:
         if append_files:
             self.file_manager.validate_data_files(append_files)
             new_append_manifest = self.file_manager.create_manifest_file(
-                append_files, ManifestContent.DATA, snapshot_id
+                append_files,
+                ManifestContent.DATA,
+                snapshot_id,
+                sequence_number=sequence_number,
+                pre_write_hook=self._register_inflight,
             )
             final_manifests.append(new_append_manifest)
 
         # 4. Create the manifest list (ALL active manifests for the table)
         manifest_list_path = self.file_manager.create_manifest_list_file(
-            final_manifests, snapshot_id
+            final_manifests, snapshot_id, pre_write_hook=self._register_inflight
         )
 
         # 5. Commit the snapshot - with the SAME id stamped into the manifests.
@@ -490,6 +574,7 @@ class Transaction:
             base_metadata=base_metadata,  # Fresh base for OCC
             snapshot_id=snapshot_id,
             metadata_mutator=mutator,
+            sequence_number=sequence_number,
         )
 
     @staticmethod
@@ -497,12 +582,16 @@ class Transaction:
         """Mutator removing snapshots older than cutoff (never the current one)."""
 
         def mutator(metadata: TableMetadata) -> None:
+            from .snapshot_manager import repoint_parents_to_surviving_ancestors
+
             kept = [
                 s for s in metadata.snapshots
                 if s.timestamp_ms >= cutoff_ms
                 or s.snapshot_id == metadata.current_snapshot_id
             ]
             kept_ids = {s.snapshot_id for s in kept}
+            # Survivors must not keep parent links to expired snapshots.
+            repoint_parents_to_surviving_ancestors(metadata.snapshots, kept)
             metadata.snapshots = kept
             metadata.snapshot_log = [
                 e for e in metadata.snapshot_log if e.snapshot_id in kept_ids
@@ -1142,6 +1231,17 @@ class Table:
         """
         snapshot = self.current_snapshot()
         if not snapshot:
+            # An unset current_snapshot_id means "empty table". A SET id that
+            # resolves to nothing means the metadata is inconsistent - returning
+            # [] there would report a broken table as an empty one (#48).
+            metadata = self.metadata_manager.refresh()
+            current_id = metadata.current_snapshot_id if metadata else None
+            if current_id is not None and current_id != -1:
+                raise RuntimeError(
+                    f"Table metadata is inconsistent: current_snapshot_id {current_id} "
+                    f"does not match any snapshot in metadata.snapshots - refusing to "
+                    f"report a broken table as an empty one"
+                )
             return []
 
         manifest_list_path = snapshot.manifest_list
@@ -1175,7 +1275,10 @@ class Table:
             manifest_data_files = self.file_manager.read_manifest_file(manifest_path)
 
             for data_file in manifest_data_files:
-                file_path = data_file.file_path
+                # Normalize before de-duplicating: the same file can appear as
+                # '/data/x.parquet' in one manifest and 'data/x.parquet' in
+                # another, and reading it twice would double every row.
+                file_path = data_file.file_path.lstrip("/")
                 if file_path in seen_paths:
                     continue
                 seen_paths.add(file_path)
@@ -1209,21 +1312,19 @@ class Table:
         return None
 
     def _resolve_file_path(self, file_path: str) -> str:
-        """Resolve a file path to absolute path.
+        """Resolve a manifest file path to an absolute path inside the table root.
 
-        Handles Iceberg-style paths that start with '/' (relative to table).
+        Delegates to the storage backend's boundary-checked resolver: every
+        path in a manifest is table-relative, and an absolute one must never be
+        opened as-is (#47).
 
         Args:
             file_path: File path (possibly Iceberg-style starting with '/')
 
         Returns:
-            Absolute file path
+            Absolute file path within the table root
+
+        Raises:
+            ValueError: If the path resolves outside the table root.
         """
-        if file_path.startswith("/"):
-            # Iceberg-style path relative to table location
-            return os.path.join(self.table_path, file_path.lstrip("/"))
-        else:
-            # Already relative or absolute
-            if os.path.isabs(file_path):
-                return file_path
-            return os.path.join(self.table_path, file_path)
+        return str(self.file_manager.data_file_manager._get_arrow_path(file_path))

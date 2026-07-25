@@ -89,6 +89,8 @@ class S3LockProviderBase(LockProvider):
         self.lease_seconds = lease_seconds
         self.lock_id = str(uuid.uuid4())
         self.is_locked = False
+        # Monotonic deadline of our own lease (polling provider; None = unset).
+        self._lease_deadline: Optional[float] = None
         self._heartbeat_thread: Any = None  # Typed as Any to avoid Thread import issues
         self._stop_heartbeat = threading.Event()
         # ETag of the lock object as last written by us (CAS providers only).
@@ -126,24 +128,35 @@ class S3LockProviderBase(LockProvider):
         return False
 
     def is_held(self) -> bool:
-        """Verify ownership by reading the lock object content."""
+        """Verify ownership by reading the lock object content.
+
+        A content mismatch is decisive (someone else owns it). A transport
+        error is not: it is retried once, because this runs at the commit-point
+        fence, where a single S3 blip would otherwise abort an otherwise valid
+        commit. If the retry also fails, ownership is unknown and we report
+        False (fail closed).
+        """
         if not self.is_locked:
             return False
         import botocore.exceptions
 
-        try:
-            resp = self.s3.get_object(Bucket=self.bucket, Key=self.key)
-            content = resp['Body'].read().decode('utf-8')
-            if content != self.lock_id:
-                self.is_locked = False
+        for attempt in range(2):
+            try:
+                resp = self.s3.get_object(Bucket=self.bucket, Key=self.key)
+                content = resp['Body'].read().decode('utf-8')
+                if content != self.lock_id:
+                    self.is_locked = False
+                    return False
+                return True
+            except botocore.exceptions.ClientError as e:
+                from .s3_consistency import is_permanent_s3_error
+
+                if is_permanent_s3_error(e) or attempt == 1:
+                    return False
+                time.sleep(0.2)
+            except Exception:
                 return False
-            return True
-        except botocore.exceptions.ClientError:
-            # Missing object or transient failure: ownership unknown -> report False
-            # (fencing must fail closed).
-            return False
-        except Exception:
-            return False
+        return False
 
     def _start_heartbeat(self) -> None:
         """Start the heartbeat thread to renew lock lease."""
@@ -209,6 +222,7 @@ class S3LockProviderBase(LockProvider):
             logger.warning(f"Error releasing S3 lock: {e}")
 
         self.is_locked = False
+        self._lease_deadline = None
         with self._state_lock:
             self._etag = None
 
@@ -338,6 +352,27 @@ class S3PollingLockProvider(S3LockProviderBase):
     Set DATASHARD_S3_USE_CONDITIONAL_WRITES=false to use this provider.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        logger.warning(
+            "S3PollingLockProvider in use (DATASHARD_S3_USE_CONDITIONAL_WRITES=false): "
+            "distributed locking is BEST EFFORT and cannot rule out two writers "
+            "believing they hold the same lock. Enable conditional writes for "
+            "compare-and-swap locking wherever a lost commit is unacceptable."
+        )
+
+    def is_held(self) -> bool:
+        """Ownership check that also honours our local lease clock.
+
+        Past the lease deadline another process may have broken the lock, so
+        ownership is not ours to claim even if the object still reads back with
+        our id (our own late renewal could have put it there).
+        """
+        if self._lease_deadline is not None and time.monotonic() > self._lease_deadline:
+            self.is_locked = False
+            return False
+        return super().is_held()
+
     def _try_acquire(self) -> bool:
         import botocore.exceptions
 
@@ -353,7 +388,9 @@ class S3PollingLockProvider(S3LockProviderBase):
                 raise e
             # Lock doesn't exist, proceed to acquire
 
-        # Step 2: Write our lock ID
+        # Step 2: Write our lock ID. The lease is counted from BEFORE the write
+        # (the conservative end of the window).
+        write_started = time.monotonic()
         self.s3.put_object(
             Bucket=self.bucket,
             Key=self.key,
@@ -369,6 +406,7 @@ class S3PollingLockProvider(S3LockProviderBase):
             content = resp['Body'].read().decode('utf-8')
 
             if content == self.lock_id:
+                self._lease_deadline = write_started + self.lease_seconds
                 return True
             else:
                 # Someone else won the race
@@ -382,8 +420,23 @@ class S3PollingLockProvider(S3LockProviderBase):
             raise e
 
     def _renew_once(self) -> None:
-        """Read-verify-then-write renewal (non-atomic; best this provider can do)."""
+        """Read-verify-then-write renewal (non-atomic; best this provider can do).
+
+        Refuses to write once our own lease has lapsed: past that point another
+        process is entitled to break the lock, and a late PUT would resurrect
+        our ownership over theirs - the interleaving that makes two writers
+        believe they hold the same lock. Giving up instead fails closed (the
+        pre-commit fence sees is_locked=False).
+        """
         import botocore.exceptions
+
+        if self._lease_deadline is not None and time.monotonic() > self._lease_deadline:
+            logger.warning(
+                f"S3 lock lease at {self.key} lapsed before renewal could complete; "
+                f"treating the lock as lost instead of resurrecting it."
+            )
+            self.is_locked = False
+            return
 
         try:
             resp = self.s3.get_object(Bucket=self.bucket, Key=self.key)
@@ -395,11 +448,18 @@ class S3PollingLockProvider(S3LockProviderBase):
                 return
 
             # Renew: Overwrite with same content to update LastModified
+            write_started = time.monotonic()
+            if self._lease_deadline is not None and write_started > self._lease_deadline:
+                # The verification read itself took us past the lease.
+                logger.warning(f"S3 lock lease at {self.key} lapsed mid-renewal; giving up.")
+                self.is_locked = False
+                return
             self.s3.put_object(
                 Bucket=self.bucket,
                 Key=self.key,
                 Body=self.lock_id.encode('utf-8')
             )
+            self._lease_deadline = write_started + self.lease_seconds
             logger.debug(f"Renewed S3 lock at {self.key}")
         except botocore.exceptions.ClientError as e:
             logger.warning(f"Failed to renew S3 lock: {e}")

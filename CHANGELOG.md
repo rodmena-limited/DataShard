@@ -5,6 +5,76 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-25
+
+Re-audit (#44) remediation. See `AUDIT_REPORT_2.md`. Fixes tickets #45–#52.
+
+> **Upgrade note — behavior changes.** Manifest paths are now strictly
+> table-relative on read as well as write: a data file outside the table root is
+> refused instead of opened. `append_files()` validates the parquet schema of the
+> files it is given. `{"col": None}` filters raise instead of silently matching
+> nothing. `FileManager.cleanup_orphaned_files()` raises — use
+> `Table.garbage_collect()`. Minimum Python is now 3.10.
+
+### Fixed — data loss / correctness ⚠️
+
+- **Garbage collection through a symlinked table root no longer deletes the
+  whole table** (#45). `list_files` computed paths against the raw base while
+  walking the resolved tree, so every live file looked like an orphan. Paths are
+  now computed against one canonical base, and GC aborts if a listing ever
+  returns a path outside the table root.
+- **`not_in` no longer returns NULL rows** (#46); `in`/`not_in` never match NULL,
+  as documented, including when the value set contains NULL or is empty.
+- **A dangling `current_snapshot_id` fails closed** (#48): commit aborts instead
+  of building a snapshot from an empty base (which dropped all prior data), and
+  reads raise instead of reporting a broken table as an empty one.
+- **`append_files()` validates schemas** (#49): a parquet file whose schema
+  diverges from the table's is rejected at append time instead of breaking every
+  later scan.
+- **Cross-manifest de-duplication normalizes paths** (#51), so a file listed as
+  `/data/x.parquet` and `data/x.parquet` is no longer read twice.
+
+### Fixed — security
+
+- **The read path is sandboxed to the table root** (#47). `_get_arrow_path` no
+  longer returns absolute paths as-is, so a tampered manifest entry cannot make
+  the reader open arbitrary files; absolute paths inside the table still work.
+
+### Fixed — Iceberg fidelity & auditability (#51)
+
+- Snapshots now carry real **sequence numbers** (monotonic, inherited unchanged
+  by carried-over files) and their **`schema_id`**; `last_sequence_number` is
+  maintained.
+- The **metadata log** records every superseded metadata file, trimmed to
+  `write.metadata.previous-versions-max` (default 100).
+- Expiring or deleting snapshots **repoints survivors to their nearest surviving
+  ancestor** instead of leaving dangling `parent_snapshot_id` references.
+- GC **in-flight protection now covers manifests and manifest lists**, not just
+  data files, so a commit in progress cannot be swept by a concurrent GC.
+- The unsafe legacy `FileManager.cleanup_orphaned_files` now raises.
+
+### Fixed — S3 & locking robustness (#50)
+
+- `delete_file`, `get_size`, `get_modified_time` and `list_files` retry transient
+  S3 errors like the read paths do.
+- Permanent S3 errors (AccessDenied, NoSuchBucket, bad credentials …) fail fast
+  instead of being retried five times.
+- `exists()` no longer answers True for an object path merely because objects
+  exist *under* it; only directory-like paths use the prefix listing.
+- The non-CAS polling lock refuses to renew a lease that has already lapsed (the
+  interleaving that could resurrect a stolen lock), reports `is_held()` False
+  past its lease, warns loudly at construction, and the commit fence retries a
+  single transient error before failing closed.
+
+### Changed — hygiene (#52)
+
+- Docs version is derived from `pyproject.toml`; classifier moved to Beta; a
+  `datashard` console script is installed; minimum Python raised to 3.10.
+- Removed the dead `to_pyarrow_filter` (it silently dropped `IS_NULL`).
+- GC logs per-file deletions at DEBUG with an INFO summary; schema-compatibility
+  checks no longer swallow every exception; a failed parquet-writer construction
+  no longer leaks its temp file.
+
 ## [0.6.0] - 2026-07-24
 
 Full audit and bank-grade remediation. See `AUDIT_REPORT.md`. Fixes tickets #14–#43.

@@ -18,6 +18,35 @@ logger = get_logger(__name__)
 SNAPSHOT_RETENTION_PROPERTY = "datashard.snapshot.retention-count"
 
 
+def repoint_parents_to_surviving_ancestors(
+    all_snapshots: List[Snapshot], kept: List[Snapshot]
+) -> None:
+    """Rewrite kept snapshots' parent ids so none references a removed snapshot.
+
+    When snapshots are expired or deleted, a survivor whose parent was removed
+    would otherwise carry a dangling parent_snapshot_id - a reader walking the
+    chain cannot tell that from corruption. Each survivor is repointed to its
+    nearest SURVIVING ancestor (a true ancestor, so history is not invented),
+    or to None when the whole ancestry was removed.
+
+    Must be called with `all_snapshots` as the list BEFORE removal, since the
+    ancestry of removed snapshots is what the walk follows.
+    """
+    parent_of = {s.snapshot_id: s.parent_snapshot_id for s in all_snapshots}
+    kept_ids = {s.snapshot_id for s in kept}
+
+    for snapshot in kept:
+        parent = snapshot.parent_snapshot_id
+        seen: set[int] = set()
+        while parent is not None and parent != -1 and parent not in kept_ids:
+            if parent in seen:  # cycle in corrupt metadata: stop, drop the link
+                parent = None
+                break
+            seen.add(parent)
+            parent = parent_of.get(parent)
+        snapshot.parent_snapshot_id = parent
+
+
 class SnapshotManager:
     """Manages snapshots and time travel functionality"""
 
@@ -33,6 +62,7 @@ class SnapshotManager:
         base_metadata: Optional[TableMetadata] = None,
         snapshot_id: Optional[int] = None,
         metadata_mutator: Optional[Callable[[TableMetadata], None]] = None,
+        sequence_number: Optional[int] = None,
     ) -> Snapshot:
         """Create a new snapshot with proper OCC handling.
 
@@ -52,6 +82,10 @@ class SnapshotManager:
             metadata_mutator: Optional callback applied to the new metadata
                 (after the snapshot is appended, before commit). Used e.g. by
                 expire_snapshots to fold metadata changes into the same commit.
+            sequence_number: Iceberg v2 sequence number for this snapshot.
+                Callers that already stamped it into manifest entries MUST pass
+                the same value here; otherwise it is derived from the base
+                metadata's last_sequence_number.
         """
         import uuid
 
@@ -67,6 +101,12 @@ class SnapshotManager:
         if snapshot_id is None:
             snapshot_id = (uuid.uuid4().int & ((1 << 63) - 1))
 
+        # Iceberg v2 sequence number: monotonic per commit. The caller stamps
+        # the same value into this commit's manifest entries, so metadata and
+        # manifests always agree on when a file entered the table.
+        if sequence_number is None:
+            sequence_number = base_metadata.last_sequence_number + 1
+
         # Create new snapshot
         snapshot = Snapshot(
             snapshot_id=snapshot_id,
@@ -75,12 +115,19 @@ class SnapshotManager:
             parent_snapshot_id=parent_snapshot_id,
             operation=operation,
             summary=summary or {},
+            # Snapshots record the schema they were written against, so a
+            # time-travel read knows how to interpret its files.
+            schema_id=base_metadata.current_schema_id,
+            sequence_number=sequence_number,
         )
 
         # Create new metadata based on base, but with modifications
         new_metadata = deepcopy(base_metadata)
         new_metadata.snapshots.append(snapshot)
         new_metadata.current_snapshot_id = snapshot_id
+        new_metadata.last_sequence_number = max(
+            base_metadata.last_sequence_number, sequence_number
+        )
 
         # Add to snapshot log
         history_entry = HistoryEntry(
@@ -135,7 +182,9 @@ class SnapshotManager:
                 kept.append(current)
                 kept_ids.add(current_id)
 
-        metadata.snapshots = [s for s in sorted_snapshots if s.snapshot_id in kept_ids]
+        surviving = [s for s in sorted_snapshots if s.snapshot_id in kept_ids]
+        repoint_parents_to_surviving_ancestors(metadata.snapshots, surviving)
+        metadata.snapshots = surviving
         metadata.snapshot_log = [
             e for e in metadata.snapshot_log if e.snapshot_id in kept_ids
         ]
@@ -229,7 +278,10 @@ class SnapshotManager:
             # Create a NEW metadata object for the updated state
             # CRITICAL: Must use deepcopy to create separate object for OCC
             new_metadata = deepcopy(base_metadata)
+            before_removal = list(new_metadata.snapshots)
             del new_metadata.snapshots[snapshot_to_remove]
+            # No survivor may keep a parent link to the removed snapshot.
+            repoint_parents_to_surviving_ancestors(before_removal, new_metadata.snapshots)
 
             # Drop the deleted snapshot's history entries (no dangling log rows)
             new_metadata.snapshot_log = [
