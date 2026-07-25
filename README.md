@@ -22,6 +22,10 @@
 
 **Iceberg-Inspired Safe Concurrent Data Operations for Python**
 
+[![CI](https://github.com/rodmena-limited/DataShard/actions/workflows/ci.yml/badge.svg)](https://github.com/rodmena-limited/DataShard/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/datashard.svg)](https://pypi.org/project/datashard/)
+[![Python](https://img.shields.io/pypi/pyversions/datashard.svg)](https://pypi.org/project/datashard/)
+
 ---
 
 ## What is DataShard?
