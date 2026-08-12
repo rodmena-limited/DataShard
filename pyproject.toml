@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.7.0"
+version = "0.7.1"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts with S3 support"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules"
 ]
 dependencies = [
-    "pyarrow>=10.0.0",
+    "pyarrow>=10.0.0,<25.0.0",
     "lz4>=4.0.0",
     "fastavro>=1.4.0",
 ]
@@ -164,6 +164,12 @@ pretty = true
 module = ["boto3", "botocore.*", "pyarrow.*", "pandas", "pytest", "_pytest.*"]
 ignore_missing_imports = true
 ignore_errors = true
+# pyarrow's bundled py.typed stubs are partial (e.g. pyarrow 24 does not
+# declare pc.Expression / pc.is_in / pc.min / pc.max / pyarrow.fs.S3FileSystem
+# although they exist at runtime), and ignore_errors only silences errors
+# *inside* pyarrow, not at our use sites. Treat pyarrow as opaque so our own
+# code is still type-checked without depending on its stub completeness.
+follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 module = "tests.*"

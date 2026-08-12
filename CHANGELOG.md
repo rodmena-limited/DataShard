@@ -5,6 +5,25 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-08-12
+
+FreeBSD-compatibility fix (#53).
+
+### Fixed
+
+- **pyarrow is now pinned below 25.0.0** (`pyarrow>=10.0.0,<25.0.0`). FreeBSD's
+  ports provide `py312-pyarrow-24.0.0` as the newest pyarrow; the previous
+  unbounded `>=10.0.0` let pip resolve to a pyarrow with no FreeBSD wheel and
+  fail at source-build time. The ceiling makes the packaged 24.0.0 satisfy the
+  dependency (e.g. via `--system-site-packages`). Verified against pyarrow
+  24.0.0: full test suite passes (141 passed).
+- **mypy now treats pyarrow as opaque** (`follow_imports = "skip"`). pyarrow
+  24's bundled partial stubs do not declare `pc.Expression`, `pc.is_in`,
+  `pc.min`/`pc.max` or `pyarrow.fs.S3FileSystem` even though they exist at
+  runtime, and `ignore_errors` only silences errors *inside* pyarrow — so the
+  lint job failed under the newly pinned pyarrow 24. This keeps type-checking
+  green under both pyarrow 24 and 25 with no runtime change.
+
 ## [0.7.0] - 2026-07-25
 
 Re-audit (#44) remediation. See `AUDIT_REPORT_2.md`. Fixes tickets #45–#52.
