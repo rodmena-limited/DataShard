@@ -44,8 +44,8 @@ class Schema:
             "uuid", "fixed", "binary"
         }
 
-        seen_ids: set = set()
-        seen_names: set = set()
+        seen_ids: set[int] = set()
+        seen_names: set[str] = set()
         for field_def in self.fields:
             if "id" not in field_def:
                  raise ValueError(f"Invalid schema: Field missing required property 'id': {field_def}")

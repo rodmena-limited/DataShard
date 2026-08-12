@@ -5,7 +5,7 @@ Provides checksum computation and validation to detect corrupted data.
 """
 
 import hashlib
-from typing import BinaryIO
+from typing import Any, BinaryIO, Dict
 
 from .logging_config import get_logger
 
@@ -149,7 +149,9 @@ class IntegrityChecker:
         return checksum
 
 
-def add_checksum_to_metadata(metadata: dict, data: bytes) -> dict:
+def add_checksum_to_metadata(
+    metadata: Dict[str, Any], data: bytes
+) -> Dict[str, Any]:
     """Add checksum to metadata dictionary.
 
     Args:
@@ -165,7 +167,7 @@ def add_checksum_to_metadata(metadata: dict, data: bytes) -> dict:
     return metadata
 
 
-def verify_data_integrity(data: bytes, metadata: dict) -> bool:
+def verify_data_integrity(data: bytes, metadata: Dict[str, Any]) -> bool:
     """Verify data integrity using metadata checksum.
 
     Args:

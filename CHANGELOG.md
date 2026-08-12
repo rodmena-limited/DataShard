@@ -5,6 +5,53 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-08-12
+
+S3 reads now work on providers pyarrow cannot talk to (#54).
+
+### Fixed
+
+- **Parquet reads go through DataShard's own storage backend instead of
+  pyarrow's `S3FileSystem`.** Against OVH Object Storage, pyarrow's bundled AWS
+  SDK sends an `x-amz-checksum-mode` header on GetObject that OVH rejects:
+
+      AWS Error [code 134] during GetObject operation:
+      Value for x-amz-checksum-mode header is invalid.
+
+  boto3 reads the identical object with the identical credentials without
+  complaint, so the S3 backend now serves reads too. The failure mode was
+  particularly unhelpful: writes go through boto3, so `create_table` succeeded
+  and the metadata appeared in the bucket, then the **first append** died
+  validating the file it had just written.
+
+### Added
+
+- `StorageBackend.open_seekable(path)` — a seekable binary file object.
+  `S3RangeFile` implements it over ranged GETs, so pyarrow still reads only a
+  parquet footer rather than the whole object. Measured on OVH: 65 KB fetched to
+  validate a 361 KB file, 462 KB for a 2.9 MB file. A `BytesIO(read_file(path))`
+  shortcut would have downloaded 100% of every file to read a schema.
+
+  `open_seekable` is deliberately **not** abstract, so existing third-party
+  `StorageBackend` subclasses keep working; they raise only if a parquet read is
+  attempted.
+
+### Changed
+
+- `mypy --strict` is now clean across all 19 source modules (was 9 errors:
+  unparameterised `set`/`dict`/`tuple` annotations and four `Any` returns).
+
+### Notes
+
+- The path-traversal guard (#47) still runs on every read. The first cut of this
+  fix bypassed it — it still contained the path but reported `FileNotFoundError`
+  rather than refusing, which the audit suite caught.
+- `tests/test_s3_integration.py` has two failures unrelated to this change,
+  present before and after it: they assert `exists("metadata")` on a prefix,
+  which `exists()` deliberately does not answer True for. The test expectation is
+  wrong; the restraint in `exists()` is what stops a missing data file passing
+  validation.
+
 ## [0.7.1] - 2026-08-12
 
 FreeBSD-compatibility fix (#53).

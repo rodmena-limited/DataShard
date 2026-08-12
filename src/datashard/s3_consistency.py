@@ -64,7 +64,7 @@ class S3ConsistencyHandler:
         initial_delay: float = 0.1,
         max_delay: float = 5.0,
         backoff_factor: float = 2.0,
-        retryable_exceptions: tuple = RETRYABLE_EXCEPTIONS,
+        retryable_exceptions: tuple[type[BaseException], ...] = RETRYABLE_EXCEPTIONS,
     ):
         """Initialize S3 consistency handler.
 

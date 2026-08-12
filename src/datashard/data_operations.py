@@ -45,11 +45,16 @@ class DataFileReader:
 
     def __init__(
         self,
-        file_path: str,
+        file_path: Any,
         file_format: FileFormat,
         schema: Optional[pa.Schema] = None,
         filesystem: Optional[Any] = None,
     ):
+        """`file_path` is a path, or an open seekable binary file object.
+
+        Passing a file object is how S3 reads avoid pyarrow's own S3 client,
+        which OVH rejects (#54); pyarrow accepts either as a parquet source.
+        """
         self.file_path = file_path
         self.file_format = file_format
         self._schema = schema  # Use private attribute to not conflict with schema method
@@ -355,6 +360,41 @@ class DataFileManager:
                     "Install with: pip install pyarrow"
                 ) from e
         return None  # Local filesystem
+
+    def open_parquet_source(self, file_path: str) -> Any:
+        """A source for pq.ParquetFile / pq.read_table that avoids pyarrow's S3 client.
+
+        Returns an open, SEEKABLE file object read through our own storage
+        backend. Callers pass it instead of a (path, filesystem=) pair.
+
+        pyarrow's S3FileSystem sends an ``x-amz-checksum-mode`` header on
+        GetObject that OVH Object Storage rejects outright (#54), so every
+        parquet read failed there while writes succeeded — the table was
+        created, then the first append died validating its own output. boto3
+        reads the same object fine, so the read goes through the backend.
+
+        Still seekable, so pyarrow fetches only the footer to learn a schema
+        and only the column chunks a scan needs. The caller owns the object and
+        must close it.
+        """
+        # THE TRAVERSAL GUARD MUST RUN FIRST (#47). _get_arrow_path is what
+        # raises ValueError("Path traversal...") for a manifest entry pointing
+        # outside the table, e.g. a tampered '/etc/passwd'. Reading straight
+        # through the backend would still CONTAIN the path (it resolves under
+        # the table root) but would report a bland FileNotFoundError instead of
+        # refusing — and containment that reports "not found" invites someone to
+        # "fix" it by loosening the resolver. Called for the check, not the value.
+        validated = self._get_arrow_path(file_path)
+
+        if isinstance(self.storage, S3StorageBackend):
+            # open_seekable takes the manifest-relative path; the backend adds
+            # the bucket prefix itself.
+            return self.storage.open_seekable(file_path.lstrip("/"))
+
+        # Local: _get_arrow_path already returned a RESOLVED absolute path, so
+        # open it directly. Passing it back through the backend would resolve it
+        # a second time against the table root and produce /base/base/file.
+        return open(validated, "rb")
 
     def _get_arrow_path(self, path: str) -> str:
         """Convert a manifest path to a PyArrow path (bucket/key for S3, absolute for local).
@@ -673,10 +713,11 @@ class DataFileManager:
     ) -> List[Dict[str, Any]]:
         """Read data from a file and return as list of records"""
 
-        # Convert path for PyArrow (adds bucket prefix for S3)
-        arrow_path = self._get_arrow_path(file_path)
-
-        with DataFileReader(arrow_path, file_format, filesystem=self._pyarrow_fs) as reader:
+        # Read through OUR storage backend, not pyarrow's S3 filesystem (#54):
+        # pyarrow's S3 client sends a header OVH rejects on every GetObject.
+        # The object is seekable, so parquet still reads only what it needs.
+        with self.open_parquet_source(file_path) as source, \
+                DataFileReader(source, file_format) as reader:
             if columns:
                 table = reader.read_columns(columns)
             else:
@@ -698,10 +739,11 @@ class DataFileManager:
                 "pandas is not available. Install with: pip install datashard[pandas]"
             )
 
-        # Convert path for PyArrow (adds bucket prefix for S3)
-        arrow_path = self._get_arrow_path(file_path)
-
-        with DataFileReader(arrow_path, file_format, filesystem=self._pyarrow_fs) as reader:
+        # Read through OUR storage backend, not pyarrow's S3 filesystem (#54):
+        # pyarrow's S3 client sends a header OVH rejects on every GetObject.
+        # The object is seekable, so parquet still reads only what it needs.
+        with self.open_parquet_source(file_path) as source, \
+                DataFileReader(source, file_format) as reader:
             if columns:
                 return reader.read_columns_pandas(columns)
             else:

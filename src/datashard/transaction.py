@@ -131,10 +131,11 @@ class Transaction:
 
         dfm = self.file_manager.data_file_manager
         expected = dfm.create_arrow_schema(table_schema)
-        arrow_path = dfm._get_arrow_path(data_file.file_path)
-
         try:
-            actual = pq.ParquetFile(arrow_path, filesystem=dfm._pyarrow_fs).schema_arrow
+            # Read through OUR backend, not pyarrow's S3 client (#54). Seekable,
+            # so this fetches the footer only — not the whole data file.
+            with dfm.open_parquet_source(data_file.file_path) as src:
+                actual = pq.ParquetFile(src).schema_arrow
         except Exception as e:
             raise ValueError(
                 f"Cannot read the parquet schema of '{data_file.file_path}': {e}. "
@@ -933,15 +934,13 @@ class Table:
                 table = table.select(columns)
             return table
 
-        arrow_path = data_file_manager._get_arrow_path(data_file.file_path)
-        pyarrow_fs = data_file_manager._pyarrow_fs
-        if compute_expr is not None:
-            # pyarrow applies `filters` against all needed columns during the
-            # scan and returns only `columns`, so pushdown is correct here.
-            return pq.read_table(
-                arrow_path, columns=columns, filters=compute_expr, filesystem=pyarrow_fs
-            )
-        return pq.read_table(arrow_path, columns=columns, filesystem=pyarrow_fs)
+        # Read through OUR backend rather than pyarrow's S3 filesystem (#54).
+        with data_file_manager.open_parquet_source(data_file.file_path) as src:
+            if compute_expr is not None:
+                # pyarrow applies `filters` against all needed columns during the
+                # scan and returns only `columns`, so pushdown is correct here.
+                return pq.read_table(src, columns=columns, filters=compute_expr)
+            return pq.read_table(src, columns=columns)
 
     def _scan_table(
         self,
@@ -1129,7 +1128,6 @@ class Table:
         from .integrity import CorruptDataError, IntegrityChecker
 
         data_file_manager = self.file_manager.data_file_manager
-        pyarrow_fs = data_file_manager._pyarrow_fs
 
         # When filtering, read every column (the predicate may reference one not
         # in `columns`); project down to `columns` only after filtering.
@@ -1145,8 +1143,9 @@ class Table:
                     )
                 pf = pq.ParquetFile(BytesIO(raw))
             else:
-                arrow_path = data_file_manager._get_arrow_path(data_file.file_path)
-                pf = pq.ParquetFile(arrow_path, filesystem=pyarrow_fs)
+                pf = pq.ParquetFile(
+                    data_file_manager.open_parquet_source(data_file.file_path)
+                )
 
             for batch in pf.iter_batches(batch_size=batch_size, columns=read_columns):
                 # Convert batch to table for filtering

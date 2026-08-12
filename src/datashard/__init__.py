@@ -15,9 +15,9 @@ try:
     try:
         __version__ = version("datashard")
     except PackageNotFoundError:
-        __version__ = "0.7.1"
+        __version__ = "0.7.2"
 except ImportError:  # pragma: no cover - Python < 3.8
-    __version__ = "0.7.1"
+    __version__ = "0.7.2"
 
 __author__ = "RODMENA LIMITED"
 

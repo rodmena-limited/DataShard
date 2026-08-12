@@ -17,6 +17,7 @@ S3-compatible storage:
     DATASHARD_S3_PREFIX=optional/prefix/ (optional, default: "")
 """
 
+import io
 import json
 import os
 import tempfile
@@ -48,6 +49,24 @@ class StorageBackend(ABC):
     def read_file(self, path: str) -> bytes:
         """Read file contents as bytes"""
         pass
+
+    def open_seekable(self, path: str) -> Any:
+        """Open `path` as a SEEKABLE binary file object.
+
+        Parquet needs to seek (its schema is in the footer), and pyarrow's own
+        S3 filesystem cannot read from every S3-compatible provider — see
+        S3RangeFile (#54). Reading through the backend keeps one HTTP client in
+        the picture instead of two with different compatibility.
+
+        Deliberately NOT @abstractmethod: making it abstract would stop any
+        third-party StorageBackend subclass from instantiating at all, turning a
+        bug fix into a breaking change. Subclasses that do not override it fail
+        loudly when a parquet read is attempted, not at construction.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement open_seekable(); "
+            f"parquet reads require a seekable file object"
+        )
 
     @abstractmethod
     def open_file(self, path: str) -> Any:
@@ -202,6 +221,10 @@ class LocalStorageBackend(StorageBackend):
         full_path = self._resolve_path(path)
         return open(full_path, "rb")
 
+    def open_seekable(self, path: str) -> Any:
+        """Local files are already seekable; nothing to wrap."""
+        return open(self._resolve_path(path), "rb")
+
     def write_file(self, path: str, content: bytes) -> None:
         """Atomically write file with fsync for durability.
 
@@ -288,7 +311,8 @@ class LocalStorageBackend(StorageBackend):
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
-        return json.loads(content.decode("utf-8"))
+        parsed: Dict[str, Any] = json.loads(content.decode("utf-8"))
+        return parsed
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         """Atomically write JSON file with fsync.
@@ -366,7 +390,8 @@ class S3FileStream:
         self.body = body
 
     def read(self, n: Optional[int] = None) -> bytes:
-        return self.body.read(n)
+        data: bytes = self.body.read(n)
+        return data
 
     def close(self) -> None:
         self.body.close()
@@ -376,6 +401,112 @@ class S3FileStream:
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
+
+class S3RangeFile(io.RawIOBase):
+    """A seekable, range-reading file object over an S3 object (#54).
+
+    WHY THIS EXISTS
+
+    pyarrow's own S3FileSystem cannot read from every S3-compatible provider.
+    Against OVH Object Storage its bundled AWS SDK sends an
+    ``x-amz-checksum-mode`` header on GetObject and OVH rejects it:
+
+        AWS Error [code 134] during GetObject operation:
+        Value for x-amz-checksum-mode header is invalid.
+
+    boto3 reads the identical object, from the identical bucket, with the
+    identical credentials, without complaint. So the fix is to read parquet
+    through OUR backend rather than pyarrow's.
+
+    WHY SEEKABLE, RATHER THAN JUST BytesIO(read_file(path))
+
+    A parquet file's schema lives in its FOOTER. Given a seekable file object,
+    pyarrow reads the last few bytes, then the footer, then only the column
+    chunks it actually needs — kilobytes, not the whole object. Handing it a
+    fully-materialised BytesIO would be simpler but would download the entire
+    data file to answer "what is its schema", turning an O(footer) operation
+    into O(file). On a table of any size that is the difference between a
+    schema check and a full transfer.
+
+    Wrap this in io.BufferedReader (see ``open_seekable``) so pyarrow's many
+    small reads coalesce into few HTTP range requests.
+    """
+
+    def __init__(self, s3: Any, bucket: str, key: str, size: int) -> None:
+        self._s3 = s3
+        self._bucket = bucket
+        self._key = key
+        self._size = size
+        self._pos = 0
+
+    # --- capabilities -----------------------------------------------------
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    # --- positioning ------------------------------------------------------
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            new = offset
+        elif whence == io.SEEK_CUR:
+            new = self._pos + offset
+        elif whence == io.SEEK_END:
+            new = self._size + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        if new < 0:
+            raise ValueError("negative seek position")
+        # Seeking past EOF is legal; reads there simply return b"".
+        self._pos = new
+        return self._pos
+
+    def size(self) -> int:
+        return self._size
+
+    # --- reading ----------------------------------------------------------
+    def readinto(self, b: Any) -> int:
+        want = len(b)
+        if want == 0 or self._pos >= self._size:
+            return 0
+        last = min(self._pos + want, self._size) - 1
+        data = self._get_range(self._pos, last)
+        n = len(data)
+        b[:n] = data
+        self._pos += n
+        return n
+
+    def readall(self) -> bytes:
+        if self._pos >= self._size:
+            return b""
+        data = self._get_range(self._pos, self._size - 1)
+        self._pos += len(data)
+        return data
+
+    def _get_range(self, first: int, last: int) -> bytes:
+        from .s3_consistency import with_s3_retry
+
+        def op() -> bytes:
+            resp = self._s3.get_object(
+                Bucket=self._bucket,
+                Key=self._key,
+                Range=f"bytes={first}-{last}",
+            )
+            body = resp["Body"]
+            try:
+                return bytes(body.read())
+            finally:
+                body.close()
+
+        return with_s3_retry(op, f"S3 range read: {self._key} [{first}-{last}]")
+
 
 class S3StorageBackend(StorageBackend):
     """S3-compatible storage backend (AWS S3, MinIO, etc.)"""
@@ -457,7 +588,8 @@ class S3StorageBackend(StorageBackend):
         def read_op() -> bytes:
             try:
                 response = self.s3.get_object(Bucket=self.bucket, Key=key)
-                return response["Body"].read()
+                body: bytes = response["Body"].read()
+                return body
             except ClientError as e:
                 if e.response["Error"]["Code"] == "NoSuchKey":
                     raise FileNotFoundError(
@@ -490,6 +622,18 @@ class S3StorageBackend(StorageBackend):
                 raise
 
         return with_s3_retry(open_op, f"S3 open: {key}")
+
+    def open_seekable(self, path: str) -> Any:
+        """Seekable, range-reading view of an S3 object.
+
+        Buffered: pyarrow issues many small reads while walking a parquet
+        footer, and each unbuffered read would be its own HTTP range request.
+        """
+        key = self._get_s3_key(path)
+        size = self.get_size(path)
+        return io.BufferedReader(
+            S3RangeFile(self.s3, self.bucket, key, size), buffer_size=1 << 20
+        )
 
     def write_file(self, path: str, content: bytes) -> None:
         """Write file to S3 (inherently atomic).
@@ -568,7 +712,8 @@ class S3StorageBackend(StorageBackend):
 
     def read_json(self, path: str) -> Dict[str, Any]:
         content = self.read_file(path)
-        return json.loads(content.decode("utf-8"))
+        parsed: Dict[str, Any] = json.loads(content.decode("utf-8"))
+        return parsed
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         content = json.dumps(data, indent=2).encode("utf-8")
