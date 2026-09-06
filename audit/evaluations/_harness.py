@@ -99,11 +99,22 @@ def ensure_moto():
     return None
 
 
-def s3_env(bucket, conditional=True, prefix=""):
-    """Point datashard at the moto server; returns a boto3 client or None if unavailable."""
+def s3_env(bucket, conditional=True, prefix="", allow_unsafe=False):
+    """Point datashard at the moto server; returns a boto3 client or None if unavailable.
+
+    conditional: True -> force CAS, False -> force the polling lock, None -> let
+    datashard probe the endpoint (the default in 0.8.0+). allow_unsafe sets
+    DATASHARD_S3_ALLOW_UNSAFE_LOCK=1 (required for the polling lock since #59).
+    """
     ep = ensure_moto()
     if ep is None:
         return None
+    os.environ.pop("DATASHARD_S3_USE_CONDITIONAL_WRITES", None)
+    os.environ.pop("DATASHARD_S3_ALLOW_UNSAFE_LOCK", None)
+    if conditional is not None:
+        os.environ["DATASHARD_S3_USE_CONDITIONAL_WRITES"] = "true" if conditional else "false"
+    if allow_unsafe:
+        os.environ["DATASHARD_S3_ALLOW_UNSAFE_LOCK"] = "1"
     os.environ.update(
         {
             "DATASHARD_STORAGE_TYPE": "s3",
@@ -113,7 +124,6 @@ def s3_env(bucket, conditional=True, prefix=""):
             "DATASHARD_S3_BUCKET": bucket,
             "DATASHARD_S3_REGION": "us-east-1",
             "DATASHARD_S3_PREFIX": prefix,
-            "DATASHARD_S3_USE_CONDITIONAL_WRITES": "true" if conditional else "false",
             # pyarrow's S3FileSystem (still used on the write path) reads these
             "AWS_ACCESS_KEY_ID": "testing",
             "AWS_SECRET_ACCESS_KEY": "testing",

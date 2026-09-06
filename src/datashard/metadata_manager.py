@@ -32,6 +32,15 @@ class TableExistsError(Exception):
     pass
 
 
+class AmbiguousMetadataError(Exception):
+    """Raised when the version hint is missing and several metadata files share the
+    highest version, so the committed state cannot be told apart from a failed
+    committer's leftover (#60). Resolve with MetadataManager.repair_version_hint().
+    """
+
+    pass
+
+
 class AmbiguousCommitError(Exception):
     """Raised when the commit-point write failed in a way that may still have
     become visible (e.g. an S3 PUT that errored client-side after possibly
@@ -218,18 +227,35 @@ class MetadataManager:
                 metadata_path = f"{self.metadata_path}/{metadata_file}"
                 self._write_metadata_file(metadata_path, new_metadata)
 
-                # PHASE 3.5: Fencing - re-validate lock ownership immediately
-                # before the commit point. A holder whose lease was broken (e.g.
-                # after a long pause) must not flip the hint.
-                if not self.lock_provider.is_held():
-                    raise ConcurrentModificationException(
-                        "Lost distributed lock before commit point; retrying"
-                    )
+                try:
+                    # PHASE 3.5: Fencing - re-validate lock ownership immediately
+                    # before the commit point. A holder whose lease was broken
+                    # (e.g. after a long pause) must not flip the hint. On CAS
+                    # backends the conditional hint write below IS the fence (a
+                    # stolen lock plus a foreign commit changes the hint's ETag),
+                    # so the extra round trip is skipped there (#67).
+                    if not self.storage.supports_cas and not self.lock_provider.is_held():
+                        raise ConcurrentModificationException(
+                            "Lost distributed lock before commit point; retrying"
+                        )
 
-                # PHASE 4: Atomically make new version visible.
-                # This is the commit point - after this, the new metadata is visible.
-                # If we crash before this, the new metadata file is orphaned but table is consistent.
-                self._write_hint_at_commit_point(metadata_file, hint_etag)
+                    # PHASE 4: Atomically make new version visible - the commit
+                    # point. If we crash before this, the new metadata file is
+                    # orphaned but the table is consistent.
+                    self._write_hint_at_commit_point(metadata_file, hint_etag)
+                except ConcurrentModificationException:
+                    # Clean loss: our hint write definitely did not land, so the
+                    # metadata file we wrote was never committed. Remove it - if it
+                    # outlived us, hint recovery could not tell it from the real
+                    # v{N} and might resurrect it (#60).
+                    self._discard_uncommitted_metadata(metadata_path)
+                    raise
+                except AmbiguousCommitError:
+                    raise  # the hint MAY point at this file: it must stay
+                except Exception:
+                    if self.storage.atomic_write_failures:
+                        self._discard_uncommitted_metadata(metadata_path)
+                    raise
 
                 # Success - update in-memory version
                 self.current_version = next_version
@@ -318,6 +344,35 @@ class MetadataManager:
             raise AmbiguousCommitError(
                 f"Version hint write failed ambiguously: {e}"
             ) from e
+
+    def _discard_uncommitted_metadata(self, metadata_path: str) -> None:
+        """Best-effort removal of a metadata file whose commit is known to have failed."""
+        try:
+            self.storage.delete_file(metadata_path)
+        except Exception as e:
+            logger.warning(f"Could not remove uncommitted metadata file {metadata_path}: {e}")
+
+    def repair_version_hint(self, metadata_file: str) -> TableMetadata:
+        """Operator action after AmbiguousMetadataError: point the version hint at
+        `metadata_file` (a bare filename under metadata/, e.g. 'v7-1a2b3c4d.metadata.json').
+
+        The file must exist and parse. The choice is logged at WARNING level.
+        Returns the metadata that is now current.
+        """
+        name = metadata_file.replace("\\", "/").rsplit("/", 1)[-1]
+        if not _METADATA_FILE_RE.match(name):
+            raise ValueError(f"{metadata_file!r} is not a metadata file name (expected vN[-hex].metadata.json)")
+        path = f"{self.metadata_path}/{name}"
+        metadata = self._read_metadata_file(path)  # raises if missing or corrupt
+        with self._lock:
+            self.lock_provider.acquire()
+            try:
+                self.storage.write_file(self.HINT_PATH, name.encode("utf-8"))
+                self.current_version = int(_METADATA_FILE_RE.match(name).group(1))  # type: ignore[union-attr]
+            finally:
+                self._release_lock_safely()
+        logger.warning(f"Version hint for {self.table_path} repaired by operator to {name}")
+        return metadata
 
     def _release_lock_safely(self) -> None:
         """Release the distributed lock without ever raising."""
@@ -576,48 +631,49 @@ class MetadataManager:
     def _recover_version_from_files(self) -> Optional[Tuple[int, str]]:
         """Recover the latest (version, filename) by scanning metadata files.
 
-        Used when the hint is missing/corrupt/stale. Picks the highest version;
-        among same-version files (possible after historical races) prefers the
-        most recently modified.
+        Used when the hint is missing/corrupt/stale. Picks the highest version -
+        but ONLY when exactly one file carries it. Several files at the same
+        version mean one committed and the others were left by committers that
+        failed before flipping the hint (lost race, crash); nothing in the files
+        distinguishes them, and guessing by mtime once resurrected an uncommitted
+        state and dropped committed rows (#60). That case raises
+        AmbiguousMetadataError for an operator to resolve with repair_version_hint().
         """
         try:
             all_files = self.storage.list_files(self.metadata_path)
         except Exception:
             return None
 
-        best: Optional[Tuple[int, str]] = None
-        best_mtime = -1.0
+        candidates: Dict[int, List[str]] = {}
         for rel_path in all_files:
-            basename = rel_path.replace("\\", "/").rsplit("/", 1)[-1]
+            norm = rel_path.replace("\\", "/")
+            basename = norm.rsplit("/", 1)[-1]
             # Only consider files directly in metadata/ (not metadata/manifests/...)
-            parent = rel_path.replace("\\", "/").rsplit("/", 1)[0] if "/" in rel_path.replace("\\", "/") else ""
+            parent = norm.rsplit("/", 1)[0] if "/" in norm else ""
             if parent not in ("", self.metadata_path):
                 continue
             m = _METADATA_FILE_RE.match(basename)
             if not m:
                 continue
-            version = int(m.group(1))
-            if best is None or version > best[0]:
-                best = (version, basename)
-                try:
-                    best_mtime = self.storage.get_modified_time(f"{self.metadata_path}/{basename}")
-                except Exception:
-                    best_mtime = -1.0
-            elif version == best[0]:
-                try:
-                    mtime = self.storage.get_modified_time(f"{self.metadata_path}/{basename}")
-                except Exception:
-                    mtime = -1.0
-                if mtime > best_mtime:
-                    best = (version, basename)
-                    best_mtime = mtime
+            candidates.setdefault(int(m.group(1)), []).append(basename)
 
-        if best is not None:
-            logger.warning(
-                f"Version hint missing or invalid for {self.table_path}; "
-                f"recovered latest metadata {best[1]} by scanning"
+        if not candidates:
+            return None
+        top = max(candidates)
+        names = sorted(candidates[top])
+        if len(names) > 1:
+            raise AmbiguousMetadataError(
+                f"Version hint missing or invalid for {self.table_path} and {len(names)} "
+                f"metadata files share the highest version {top}: {names}. One was committed "
+                f"and the others were left by failed commits; refusing to guess. Identify the "
+                f"committed one (e.g. from the writer's logs or the file contents) and call "
+                f"Table.repair_version_hint(<filename>)."
             )
-        return best
+        logger.warning(
+            f"Version hint missing or invalid for {self.table_path}; "
+            f"recovered latest metadata {names[0]} by scanning"
+        )
+        return top, names[0]
 
     def _current_version_info(self) -> Optional[Tuple[int, str]]:
         """Resolve the current (version, metadata_filename).

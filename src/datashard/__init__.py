@@ -38,6 +38,7 @@ from .iceberg import DataFile, FileFormat, create_table, load_table
 from .integrity import CorruptDataError
 from .metadata_manager import (
     AmbiguousCommitError,
+    AmbiguousMetadataError,
     ConcurrentModificationException,
     TableExistsError,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "parse_filter_dict",
     "ConcurrentModificationException",
     "AmbiguousCommitError",
+    "AmbiguousMetadataError",
     "TableExistsError",
     "CorruptDataError",
     "GarbageCollectionAborted",

@@ -230,8 +230,9 @@ class S3LockProviderBase(LockProvider):
 class S3LockProvider(S3LockProviderBase):
     """S3-based distributed lock using conditional writes (If-None-Match / If-Match).
 
-    Requires S3 provider support for conditional PUT operations.
-    For providers without this support (e.g., OVH), use S3PollingLockProvider.
+    Requires S3 provider support for conditional PUT operations - AWS S3, OVH
+    Object Storage (verified 2026-09-06), MinIO and most others honour them.
+    S3StorageBackend probes the provider rather than trusting a list (#59).
 
     All lock-object mutations are compare-and-swap:
     - create: PUT If-None-Match:* (only one creator wins)
@@ -338,8 +339,8 @@ class S3LockProvider(S3LockProviderBase):
 class S3PollingLockProvider(S3LockProviderBase):
     """S3-based distributed lock using polling (for S3 providers without conditional writes).
 
-    This is a fallback for S3 providers like OVH that don't support If-None-Match
-    headers. Uses a check-then-write approach with verification.
+    Fallback for the rare S3 provider that does not honour If-None-Match /
+    If-Match preconditions. Uses a check-then-write approach with verification.
 
     WARNING - BEST-EFFORT ONLY: without conditional writes there are
     interleavings (delayed PUTs landing after another writer's verification
@@ -349,7 +350,9 @@ class S3PollingLockProvider(S3LockProviderBase):
     cannot close these windows. Do not rely on this provider where a lost
     commit is unacceptable.
 
-    Set DATASHARD_S3_USE_CONDITIONAL_WRITES=false to use this provider.
+    Selected only when the provider fails the conditional-write probe or
+    DATASHARD_S3_USE_CONDITIONAL_WRITES=false is set, and even then only with
+    DATASHARD_S3_ALLOW_UNSAFE_LOCK=1 (#59): a lost commit is the failure mode.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:

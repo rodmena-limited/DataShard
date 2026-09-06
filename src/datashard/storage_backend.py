@@ -508,8 +508,23 @@ class S3RangeFile(io.RawIOBase):
         return with_s3_retry(op, f"S3 range read: {self._key} [{first}-{last}]")
 
 
+# Providers found to honour / ignore conditional PUTs, keyed by (endpoint, bucket).
+# One probe per process per bucket, not one per Table.
+_CAS_SUPPORT_CACHE: Dict[Tuple[Optional[str], str], bool] = {}
+
+UNSAFE_LOCK_MESSAGE = (
+    "This S3 endpoint does not honour conditional writes (If-None-Match / If-Match), "
+    "or DATASHARD_S3_USE_CONDITIONAL_WRITES=false was set. Without them datashard "
+    "can only offer the polling lock, under which two concurrent writers can both "
+    "commit and one snapshot is silently LOST (issue #59). Refusing to start. Either "
+    "use a provider with conditional-write support (AWS S3, OVH, MinIO, ...) and "
+    "leave DATASHARD_S3_USE_CONDITIONAL_WRITES unset, or - only if this table has a "
+    "single writer - set DATASHARD_S3_ALLOW_UNSAFE_LOCK=1 to accept the risk."
+)
+
+
 class S3StorageBackend(StorageBackend):
-    """S3-compatible storage backend (AWS S3, MinIO, etc.)"""
+    """S3-compatible storage backend (AWS S3, MinIO, OVH, etc.)"""
 
     def __init__(
         self,
@@ -519,8 +534,18 @@ class S3StorageBackend(StorageBackend):
         secret_key: Optional[str] = None,
         region: str = "us-east-1",
         prefix: str = "",
-        use_conditional_writes: bool = True,
+        use_conditional_writes: Optional[bool] = None,
+        allow_unsafe_lock: bool = False,
     ):
+        """
+        Args:
+            use_conditional_writes: True = CAS lock + CAS commit point; False = the
+                best-effort polling lock; None (default) = PROBE the provider once
+                with a conditional PUT and use CAS if it is honoured (#59).
+            allow_unsafe_lock: Required to construct without conditional writes.
+                The polling lock can lose commits under concurrency, so refusing is
+                the default (fail closed).
+        """
         if not BOTO3_AVAILABLE:
             raise ImportError(
                 "boto3 is required for S3 storage backend. "
@@ -533,7 +558,6 @@ class S3StorageBackend(StorageBackend):
         self.access_key = access_key
         self.secret_key = secret_key
         self.region = region
-        self.use_conditional_writes = use_conditional_writes
 
         # Create S3 client
         session = boto3.session.Session()
@@ -557,13 +581,69 @@ class S3StorageBackend(StorageBackend):
                 f"travel unencrypted. Use https:// except for isolated test setups."
             )
 
+        if use_conditional_writes is None:
+            use_conditional_writes = self._detect_conditional_writes()
+        if not use_conditional_writes and not allow_unsafe_lock:
+            raise RuntimeError(UNSAFE_LOCK_MESSAGE)
+        self.use_conditional_writes = use_conditional_writes
+
         if not use_conditional_writes:
             logger.warning(
-                "S3 conditional writes disabled. Using polling-based locking, which is "
-                "BEST-EFFORT ONLY: under contention two writers can both acquire the lock "
-                "and a commit can be silently lost. Enable conditional writes "
-                "(DATASHARD_S3_USE_CONDITIONAL_WRITES=true) if the provider supports them."
+                "S3 conditional writes disabled (DATASHARD_S3_ALLOW_UNSAFE_LOCK=1). Using "
+                "polling-based locking, which is BEST-EFFORT ONLY: under contention two "
+                "writers can both acquire the lock and a commit can be silently lost (#59)."
             )
+
+    def _detect_conditional_writes(self) -> bool:
+        """Ask the provider, don't believe a comment (#59).
+
+        Writes a small probe object, then re-PUTs it with If-None-Match:* and with a
+        stale If-Match. A provider that honours preconditions answers 412 to both;
+        one that silently overwrites (or rejects the header) is treated as having
+        NO conditional-write support - enabling CAS there would be unsafe. The
+        result is cached per (endpoint, bucket) for the process lifetime.
+        """
+        import uuid
+
+        cache_key = (self.endpoint_url, self.bucket)
+        if cache_key in _CAS_SUPPORT_CACHE:
+            return _CAS_SUPPORT_CACHE[cache_key]
+
+        key = self._get_s3_key(f".locks/.cas-probe-{uuid.uuid4().hex}")
+        supported = False
+        try:
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=b"probe")
+            try:
+                self.s3.put_object(Bucket=self.bucket, Key=key, Body=b"overwrite", IfNoneMatch="*")
+                none_match_honoured = False  # overwrote: precondition ignored
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                none_match_honoured = code in ("PreconditionFailed", "412", "ConditionalRequestConflict")
+            try:
+                self.s3.put_object(
+                    Bucket=self.bucket, Key=key, Body=b"overwrite",
+                    IfMatch='"00000000000000000000000000000000"',
+                )
+                if_match_honoured = False
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if_match_honoured = code in ("PreconditionFailed", "412", "ConditionalRequestConflict")
+            supported = none_match_honoured and if_match_honoured
+        finally:
+            try:
+                self.s3.delete_object(Bucket=self.bucket, Key=key)
+            except Exception:  # noqa: BLE001 - best-effort cleanup of the probe object
+                pass
+
+        if supported:
+            logger.info(f"S3 endpoint {self.endpoint_url or 'aws'} honours conditional writes: using CAS locking")
+        else:
+            logger.error(
+                f"S3 endpoint {self.endpoint_url or 'aws'} does NOT honour conditional writes "
+                f"(If-None-Match / If-Match); only the unsafe polling lock is available"
+            )
+        _CAS_SUPPORT_CACHE[cache_key] = supported
+        return supported
 
     def _get_s3_key(self, path: str) -> str:
         """Convert path to S3 key"""
@@ -869,9 +949,11 @@ def create_storage_backend(table_path: str) -> StorageBackend:
             DATASHARD_S3_BUCKET: S3 bucket name
             DATASHARD_S3_REGION: AWS region (default: us-east-1)
             DATASHARD_S3_PREFIX: Optional prefix for all objects (default: "")
-            DATASHARD_S3_USE_CONDITIONAL_WRITES: "true" (default) or "false"
-                Set to "false" for S3 providers that don't support If-None-Match
-                headers (e.g., OVH Object Storage). Uses polling-based locking instead.
+            DATASHARD_S3_USE_CONDITIONAL_WRITES: unset (default) = probe the
+                provider once and use CAS locking when it honours conditional PUTs
+                (AWS S3, OVH Object Storage, MinIO and most others do); "true" forces
+                CAS; "false" selects the best-effort polling lock, which REQUIRES
+                DATASHARD_S3_ALLOW_UNSAFE_LOCK=1 because it can lose commits (#59).
 
     Args:
         table_path: Table location (local path or S3-style identifier)
@@ -892,7 +974,13 @@ def create_storage_backend(table_path: str) -> StorageBackend:
         secret_key = os.getenv("DATASHARD_S3_SECRET_KEY")
         region = os.getenv("DATASHARD_S3_REGION", "us-east-1")
         env_prefix = os.getenv("DATASHARD_S3_PREFIX", "")
-        use_conditional_writes = os.getenv("DATASHARD_S3_USE_CONDITIONAL_WRITES", "true").lower() in ("true", "1", "yes")
+        raw_cas = os.getenv("DATASHARD_S3_USE_CONDITIONAL_WRITES", "").strip().lower()
+        use_conditional_writes: Optional[bool] = (
+            None if raw_cas == "" else raw_cas in ("true", "1", "yes")
+        )
+        allow_unsafe_lock = os.getenv("DATASHARD_S3_ALLOW_UNSAFE_LOCK", "").strip().lower() in (
+            "true", "1", "yes",
+        )
 
         # Combine environment prefix with table path for full S3 prefix
         # table_path is the logical location of the table (e.g., "logs/workflow_logs")
@@ -918,6 +1006,7 @@ def create_storage_backend(table_path: str) -> StorageBackend:
             region=region,
             prefix=full_prefix,
             use_conditional_writes=use_conditional_writes,
+            allow_unsafe_lock=allow_unsafe_lock,
         )
     else:
         # Local filesystem (default)

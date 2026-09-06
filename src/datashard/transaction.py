@@ -892,6 +892,11 @@ class Table:
         metadata = self.metadata_manager.refresh()
         return metadata is not None
 
+    def repair_version_hint(self, metadata_file: str) -> None:
+        """Operator action after AmbiguousMetadataError: declare which metadata file
+        is the committed one (see MetadataManager.repair_version_hint)."""
+        self.metadata_manager.repair_version_hint(metadata_file)
+
     def garbage_collect(
         self, grace_period_ms: int = 3600000, allow_short_grace: bool = False
     ) -> Dict[str, int]:

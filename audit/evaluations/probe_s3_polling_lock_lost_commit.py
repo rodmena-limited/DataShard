@@ -10,6 +10,11 @@ writer, two Table.append_records() calls both return True and one snapshot is lo
 Control: the same orchestration with conditional writes ON loses nothing.
 Timing is injected through a proxy around B's boto3 client; every datashard code path
 is the real one.
+
+Since 0.8.0 the polling lock is unreachable without an explicit opt-in: the claims
+this probe asserts are (1) the unsafe configuration is REFUSED, (2) an unset flag
+auto-detects CAS on a provider that honours it, (3) with CAS nothing is lost. The
+polling lost-commit itself is reproduced only as INFO (it is inherent to polling).
 """
 import threading
 import time
@@ -43,10 +48,24 @@ class DelayedClient:
         return self._inner.put_object(**kw)
 
 
+def part0_refusal_and_autodetect():
+    from datashard import create_table
+
+    H.s3_env(bucket, conditional=False)  # explicit polling, no opt-in
+    try:
+        create_table(f"refuse_{int(time.time() * 1000)}", H.simple_schema())
+        H.report("unsafe-polling-lock-is-refused-without-opt-in", False, "table created with the polling lock")
+    except RuntimeError as e:
+        H.report("unsafe-polling-lock-is-refused-without-opt-in", "LOST" in str(e), f"refused: {str(e)[:90]}...")
+    H.s3_env(bucket, conditional=None)  # unset: datashard must probe the endpoint
+    t = create_table(f"detect_{int(time.time() * 1000)}", H.simple_schema())
+    H.report("cas-auto-detected-on-a-provider-that-honours-preconditions", t.storage.supports_cas, f"supports_cas={t.storage.supports_cas}")
+
+
 def part1_lock_level():
     from datashard.lock_provider import S3PollingLockProvider
 
-    s3 = H.s3_env(bucket, conditional=False)
+    s3 = H.s3_env(bucket, conditional=False, allow_unsafe=True)
     key = f"locks/p1-{uuid.uuid4().hex[:8]}.lock"
     gate, headed = threading.Event(), threading.Event()
     a = S3PollingLockProvider(s3, bucket, key, timeout=10)
@@ -59,17 +78,14 @@ def part1_lock_level():
     gate.set()  # ... then B's delayed PUT lands and B verifies its own id
     tb.join(20)
     both = bool(res.get("a")) and bool(res.get("b")) and a.is_locked and b.is_locked
-    H.report(
-        "polling-lock-is-mutually-exclusive",
-        not both,
-        f"A acquired={res.get('a')} B acquired={res.get('b')}; both hold the lock simultaneously={both}",
-    )
+    print(f"  info: polling lock (opt-in only): A acquired={res.get('a')} B acquired={res.get('b')}; "
+          f"both hold the lock simultaneously={both} - inherent to check-then-write locking")
     a.release()
     b.release()
 
 
 def part2_commit_level(conditional):
-    s3 = H.s3_env(bucket, conditional=conditional)
+    s3 = H.s3_env(bucket, conditional=conditional, allow_unsafe=not conditional)
     from datashard import create_table, load_table
 
     schema = H.simple_schema()
@@ -110,14 +126,15 @@ def part2_commit_level(conditional):
     data_keys = H.count_s3_keys(s3, bucket, f"{tpath}/data/")
     succeeded = sum(1 for v in res.values() if v is True)
     ok = rows == 1 + succeeded
-    H.report(
-        f"every-commit-that-returned-True-is-visible-({'conditional' if conditional else 'polling'}-lock)",
-        ok,
-        f"A returned {res.get('A')}, B returned {res.get('B')}; rows visible={rows}, expected {1 + succeeded}; "
-        f"data files on S3={data_keys}" + ("" if ok else f" -> {data_keys - rows} committed file(s) orphaned"),
-    )
+    msg = (f"A returned {res.get('A')}, B returned {res.get('B')}; rows visible={rows}, expected {1 + succeeded}; "
+           f"data files on S3={data_keys}" + ("" if ok else f" -> {data_keys - rows} committed file(s) orphaned"))
+    if conditional:
+        H.report("every-commit-that-returned-True-is-visible-(conditional-lock)", ok, msg)
+    else:
+        print(f"  info: polling lock (opt-in only), lost commit reproduced={not ok}: {msg}")
 
 
+part0_refusal_and_autodetect()
 part1_lock_level()
 part2_commit_level(conditional=False)
 part2_commit_level(conditional=True)
