@@ -7,3 +7,7 @@ EARS SPEC:
 - Before publishing, the release shall pass: pytest, mypy strict, ruff, audit/evaluations/run_all.sh (all probes), an adversarial pass over the new modules with at least one new probe (probe_v090_*), and the external OVH e2e probe.
 - After publishing, the release shall be installed back from PyPI into a clean venv and smoke-tested (to_arrow, sql, append_arrow), then tagged v0.9.0 and pushed.
 - The release ticket shall close with the exercised / not exercised / uncertain statement.
+
+## Outcome (2026-09-06)
+
+Released as 0.9.0 (a151a95, tag v0.9.0, PyPI). #78, #79, #80 closed; harness 33/33; the #80 latency target was not met (3.02 s vs 3.08 s) and is deferred to the 0.10 protocol change.
