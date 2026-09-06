@@ -43,7 +43,8 @@ from .metadata_manager import (
     SchemaMismatchError,
     TableExistsError,
 )
-from .transaction import Table, Transaction
+from .table import Table
+from .transaction import Transaction
 
 __all__ = [
     "create_table",

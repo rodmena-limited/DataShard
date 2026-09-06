@@ -286,7 +286,7 @@ def test_s3_exists_does_not_treat_prefix_as_object(monkeypatch):
     backend.bucket = "b"
     backend.prefix = ""
 
-    import datashard.storage_backend as sb
+    import datashard.s3_backend as sb  # S3 backend internals live here since 0.8.0 (#71)
 
     monkeypatch.setattr(sb, "ClientError", _FakeClientError)
     assert backend.exists("data/x.parquet") is False

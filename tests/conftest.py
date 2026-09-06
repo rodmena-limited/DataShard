@@ -10,10 +10,13 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
 import pytest
+
+from datashard import Schema, create_table
 
 _S3_KEYS = (
     "DATASHARD_S3_ENDPOINT",
@@ -151,3 +154,75 @@ def s3_env(s3_test_endpoint, monkeypatch):
         yield ctx
     finally:
         ctx.cleanup()
+
+
+# ---------------------------------------------------------------- scan-test fixtures
+@pytest.fixture
+def temp_table():
+    """Create a temporary table for testing"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        table_path = os.path.join(temp_dir, "test_table")
+        table = create_table(table_path)
+        yield table
+
+
+@pytest.fixture
+def table_with_data():
+    """Create a table with test data"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        table_path = os.path.join(temp_dir, "test_table")
+        table = create_table(table_path)
+
+        schema = Schema(
+            schema_id=0,
+            fields=[
+                {"id": 1, "name": "id", "type": "long", "required": True},
+                {"id": 2, "name": "name", "type": "string", "required": False},
+                {"id": 3, "name": "age", "type": "int", "required": False},
+                {"id": 4, "name": "status", "type": "string", "required": False},
+                {"id": 5, "name": "score", "type": "double", "required": False},
+            ],
+        )
+
+        # Insert test records
+        records = [
+            {"id": 1, "name": "Alice", "age": 30, "status": "active", "score": 95.5},
+            {"id": 2, "name": "Bob", "age": 25, "status": "inactive", "score": 82.0},
+            {"id": 3, "name": "Charlie", "age": 35, "status": "active", "score": 88.5},
+            {"id": 4, "name": "Diana", "age": 28, "status": "pending", "score": 91.0},
+            {"id": 5, "name": "Eve", "age": 32, "status": "active", "score": 77.5},
+        ]
+
+        table.append_records(records, schema)
+        yield table
+
+
+@pytest.fixture
+def table_with_multiple_files():
+    """Create a table with multiple parquet files for parallel/pruning tests"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        table_path = os.path.join(temp_dir, "test_table")
+        table = create_table(table_path)
+
+        schema = Schema(
+            schema_id=0,
+            fields=[
+                {"id": 1, "name": "id", "type": "long", "required": True},
+                {"id": 2, "name": "value", "type": "int", "required": False},
+                {"id": 3, "name": "category", "type": "string", "required": False},
+            ],
+        )
+
+        # Create multiple batches (each becomes a separate file)
+        for batch_num in range(5):
+            records = [
+                {
+                    "id": batch_num * 100 + i,
+                    "value": batch_num * 10 + i,
+                    "category": f"cat_{batch_num}",
+                }
+                for i in range(20)
+            ]
+            table.append_records(records, schema)
+
+        yield table

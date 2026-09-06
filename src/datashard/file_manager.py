@@ -6,23 +6,29 @@ Supports both local filesystem and S3-compatible storage via StorageBackend abst
 
 import json
 import uuid
-from datetime import date, datetime, time as dt_time
-from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from io import BytesIO
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import fastavro
 
 from .avro_schemas import MANIFEST_ENTRY_SCHEMA, MANIFEST_FILE_SCHEMA
+from .bounds import decode_bound, encode_bound, infer_value_legacy
 from .data_operations import DataFileManager
 from .data_structures import (
     DataFile,
-    FileFormat,
     ManifestContent,
     ManifestFile,
     Snapshot,
 )
 from .integrity import CorruptDataError, IntegrityChecker
+from .manifest_codec import (
+    AVRO_MAGIC,
+    avro_records,
+    data_file_from_avro,
+    data_files_from_json,
+    manifest_from_avro,
+)
 from .metadata_manager import MetadataManager
 from .storage_backend import StorageBackend
 
@@ -34,9 +40,6 @@ ENTRY_STATUS_ADDED = 1
 # time, so a truncated or overwritten list is rejected on read (#58).
 SUMMARY_LIST_LENGTH = "manifest-list-length"
 SUMMARY_LIST_SHA256 = "manifest-list-sha256"
-
-_AVRO_MAGIC = b"Obj\x01"
-
 
 class ManifestListInfo(NamedTuple):
     """What a commit must record about the manifest list it wrote."""
@@ -109,91 +112,14 @@ class FileManager:
             return int(value)
         return default
 
-    # ------------------------------------------------------------------
-    # Bound value encoding: type-faithful round-trip through Avro strings
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _encode_bound(value: Any) -> str:
-        """Encode a bound value with an explicit type tag.
-
-        Bounds travel through an Avro map<string>; encoding the type prevents
-        the lossy stringify-then-guess round trip that could invert min/max or
-        change comparison semantics (and thus wrongly prune files).
-        """
-        # NOTE: bool before int (bool subclasses int); datetime before date.
-        if isinstance(value, bool):
-            payload: Dict[str, Any] = {"t": "bool", "v": value}
-        elif isinstance(value, int):
-            payload = {"t": "int", "v": value}
-        elif isinstance(value, float):
-            payload = {"t": "float", "v": value}
-        elif isinstance(value, Decimal):
-            payload = {"t": "dec", "v": str(value)}  # exact; never via float
-        elif isinstance(value, datetime):
-            payload = {"t": "ts", "v": value.isoformat()}
-        elif isinstance(value, date):
-            payload = {"t": "date", "v": value.isoformat()}
-        elif isinstance(value, dt_time):
-            payload = {"t": "time", "v": value.isoformat()}
-        elif isinstance(value, str):
-            payload = {"t": "str", "v": value}
-        else:
-            payload = {"t": "str", "v": str(value)}
-        return json.dumps(payload)
-
-    @classmethod
-    def _decode_bound(cls, raw: Any) -> Any:
-        """Decode a bound value, supporting both tagged and legacy formats."""
-        if not isinstance(raw, str):
-            return raw
-        try:
-            payload = json.loads(raw)
-        except (ValueError, TypeError):
-            return cls._infer_value_legacy(raw)
-        if not isinstance(payload, dict) or "t" not in payload or "v" not in payload:
-            return cls._infer_value_legacy(raw)
-
-        tag, v = payload["t"], payload["v"]
-        try:
-            if tag == "bool":
-                return bool(v)
-            if tag == "int":
-                return int(v)
-            if tag == "float":
-                return float(v)
-            if tag == "dec":
-                return Decimal(v)
-            if tag == "ts":
-                return datetime.fromisoformat(v)
-            if tag == "date":
-                return date.fromisoformat(v)
-            if tag == "time":
-                return dt_time.fromisoformat(v)
-            if tag == "str":
-                return str(v)
-        except (ValueError, TypeError, InvalidOperation):
-            return v
-        return v
-
-    @staticmethod
-    def _infer_value_legacy(value: str) -> Any:
-        """Best-effort type inference for bounds written by older versions."""
-        if value.isdigit():
-            return int(value)
-        try:
-            return float(value)
-        except ValueError:
-            pass
-        if value.lower() == 'true':
-            return True
-        if value.lower() == 'false':
-            return False
-        return value
+    # Bound encoding lives in bounds.py; kept as methods for compatibility.
+    _encode_bound = staticmethod(encode_bound)
+    _decode_bound = staticmethod(decode_bound)
+    _infer_value_legacy = staticmethod(infer_value_legacy)
 
     def _infer_value(self, value: Any) -> Any:
         """Backward-compatible entry point for bound decoding."""
-        return self._decode_bound(value)
+        return decode_bound(value)
 
     def create_manifest_file(
         self,
@@ -265,8 +191,8 @@ class FileManager:
                     "column_sizes": {str(k): self._safe_int(v) for k, v in df.column_sizes.items()} if df.column_sizes else None,
                     "value_counts": {str(k): self._safe_int(v) for k, v in df.value_counts.items()} if df.value_counts else None,
                     "null_value_counts": {str(k): self._safe_int(v) for k, v in df.null_value_counts.items()} if df.null_value_counts else None,
-                    "lower_bounds": {str(k): self._encode_bound(v) for k, v in df.lower_bounds.items()} if df.lower_bounds else None,
-                    "upper_bounds": {str(k): self._encode_bound(v) for k, v in df.upper_bounds.items()} if df.upper_bounds else None,
+                    "lower_bounds": {str(k): encode_bound(v) for k, v in df.lower_bounds.items()} if df.lower_bounds else None,
+                    "upper_bounds": {str(k): encode_bound(v) for k, v in df.upper_bounds.items()} if df.upper_bounds else None,
                     "checksum": df.checksum,
                 }
             }
@@ -353,25 +279,6 @@ class FileManager:
         self._verify_container(path, content, expected_length, expected_checksum, kind)
         return content
 
-    @staticmethod
-    def _avro_records(content: bytes, path: str, kind: str) -> List[Dict[str, Any]]:
-        """Decode every record of an Avro container, or raise CorruptDataError.
-
-        fastavro stops cleanly when a file ends exactly on a block boundary, which
-        is why the length/sha256 check above exists; this catches everything else
-        (a block cut mid-way, a bad header, trailing garbage).
-        """
-        bio = BytesIO(content)
-        try:
-            records = [dict(r) for r in fastavro.reader(bio)]  # type: ignore[arg-type]
-        except Exception as e:
-            raise CorruptDataError(f"{kind} {path} is not a readable Avro container: {e}") from e
-        if bio.tell() != len(content):
-            raise CorruptDataError(
-                f"{kind} {path} has {len(content) - bio.tell()} unread trailing bytes"
-            )
-        return records
-
     def read_manifest_file(
         self,
         manifest_path: str,
@@ -386,82 +293,12 @@ class FileManager:
         structural Avro damage is detected.
         """
         content = self._read_container(manifest_path, expected_length, expected_checksum, "Manifest")
-        if content.startswith(_AVRO_MAGIC):
+        if content.startswith(AVRO_MAGIC):
             return [
-                self._data_file_from_avro(record)
-                for record in self._avro_records(content, manifest_path, "Manifest")
+                data_file_from_avro(record)
+                for record in avro_records(content, manifest_path, "Manifest")
             ]
-        return self._data_files_from_json(content, manifest_path)
-
-    def _data_file_from_avro(self, record: Dict[str, Any]) -> DataFile:
-        df_record: Dict[str, Any] = record["data_file"]
-
-        # Parse bounds: convert keys to int, decode typed values
-        lower_bounds = df_record.get("lower_bounds")
-        if lower_bounds:
-            lower_bounds = {int(k): self._decode_bound(v) for k, v in lower_bounds.items()}
-
-        upper_bounds = df_record.get("upper_bounds")
-        if upper_bounds:
-            upper_bounds = {int(k): self._decode_bound(v) for k, v in upper_bounds.items()}
-
-        # Stats maps: Avro string keys -> int field ids
-        column_sizes = df_record.get("column_sizes")
-        if column_sizes:
-            column_sizes = {int(k): v for k, v in column_sizes.items()}
-        value_counts = df_record.get("value_counts")
-        if value_counts:
-            value_counts = {int(k): v for k, v in value_counts.items()}
-        null_value_counts = df_record.get("null_value_counts")
-        if null_value_counts:
-            null_value_counts = {int(k): v for k, v in null_value_counts.items()}
-
-        return DataFile(
-            file_path=df_record["file_path"],
-            file_format=FileFormat(df_record["file_format"]),
-            partition_values=df_record["partition"]["values"],
-            record_count=df_record["record_count"],
-            file_size_in_bytes=df_record["file_size_in_bytes"],
-            column_sizes=column_sizes,
-            value_counts=value_counts,
-            null_value_counts=null_value_counts,
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
-            checksum=df_record.get("checksum"),
-            added_snapshot_id=record.get("snapshot_id"),
-            sequence_number=(
-                record.get("file_sequence_number")
-                if record.get("file_sequence_number") is not None
-                else record.get("sequence_number")
-            ),
-        )
-
-    def _data_files_from_json(self, content: bytes, manifest_path: str) -> List[DataFile]:
-        """Legacy (pre-Avro) JSON manifests."""
-        try:
-            manifest_data = json.loads(content.decode("utf-8"))
-            data_files = []
-            for file_entry in manifest_data.get("files", []):
-                data_files.append(DataFile(
-                    file_path=file_entry["file_path"],
-                    file_format=FileFormat(file_entry["file_format"]),
-                    partition_values=file_entry["partition_values"],
-                    record_count=file_entry["record_count"],
-                    file_size_in_bytes=file_entry["file_size_in_bytes"],
-                    column_sizes=file_entry.get("column_sizes"),
-                    value_counts=file_entry.get("value_counts"),
-                    null_value_counts=file_entry.get("null_value_counts"),
-                    lower_bounds=file_entry.get("lower_bounds"),
-                    upper_bounds=file_entry.get("upper_bounds"),
-                    checksum=file_entry.get("checksum"),
-                    added_snapshot_id=file_entry.get("added_snapshot_id"),
-                    sequence_number=file_entry.get("sequence_number"),
-                ))
-            return data_files
-        except Exception as e:
-            raise CorruptDataError(
-                f"Could not parse manifest file {manifest_path} (neither Avro nor JSON)"
-            ) from e
+        return data_files_from_json(content, manifest_path)
 
     def create_manifest_list(
         self,
@@ -534,10 +371,10 @@ class FileManager:
         snapshot_list_integrity) so a damaged list is rejected, not read short (#58).
         """
         content = self._read_container(list_path, expected_length, expected_checksum, "Manifest list")
-        if content.startswith(_AVRO_MAGIC):
+        if content.startswith(AVRO_MAGIC):
             return [
-                self._manifest_from_avro(record)
-                for record in self._avro_records(content, list_path, "Manifest list")
+                manifest_from_avro(record)
+                for record in avro_records(content, list_path, "Manifest list")
             ]
         try:
             list_data = json.loads(content.decode("utf-8"))
@@ -559,23 +396,6 @@ class FileManager:
             raise CorruptDataError(
                 f"Could not parse manifest list file {list_path} (neither Avro nor JSON)"
             ) from e
-
-    @staticmethod
-    def _manifest_from_avro(record: Dict[str, Any]) -> ManifestFile:
-        return ManifestFile(
-            manifest_path=record["manifest_path"],
-            manifest_length=record["manifest_length"],
-            partition_spec_id=record["partition_spec_id"],
-            added_snapshot_id=record["added_snapshot_id"],
-            added_data_files_count=record["added_data_files_count"],
-            existing_data_files_count=record["existing_data_files_count"],
-            deleted_data_files_count=record["deleted_data_files_count"],
-            partitions=[],
-            content=ManifestContent(record["content"]),
-            sequence_number=record.get("sequence_number"),
-            min_sequence_number=record.get("min_sequence_number"),
-            checksum=record.get("checksum"),
-        )
 
     def cleanup_orphaned_files(self, valid_file_paths: List[str]) -> int:
         """Removed: unsafe legacy cleanup. Use Table.garbage_collect() instead.

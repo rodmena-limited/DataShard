@@ -27,7 +27,8 @@ from typing import Dict, Set
 
 from .data_structures import ManifestFile, Snapshot, TableMetadata
 from .file_manager import FileManager
-from .metadata_manager import _METADATA_FILE_RE, MetadataManager
+from .metadata_manager import MetadataManager
+from .version_hint import _METADATA_FILE_RE
 
 logger = logging.getLogger(__name__)
 

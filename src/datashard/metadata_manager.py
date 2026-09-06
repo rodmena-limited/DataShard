@@ -2,66 +2,41 @@
 Metadata management for the Python Iceberg implementation
 """
 
-import re
 import threading
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from .data_structures import HistoryEntry, Schema, Snapshot, TableMetadata
+from .data_structures import HistoryEntry, Snapshot, TableMetadata
+from .exceptions import (
+    AmbiguousCommitError,
+    AmbiguousMetadataError,
+    ConcurrentModificationException,
+    SchemaMismatchError,
+    TableExistsError,
+)
 from .logging_config import get_logger
+from .metadata_serde import dict_to_metadata, metadata_to_dict
+from .version_hint import _METADATA_FILE_RE, _VersionHintMixin
 
 if TYPE_CHECKING:
     from .storage_backend import StorageBackend
 
 logger = get_logger(__name__)
 
-# Matches both legacy (v3.metadata.json) and current (v3-1a2b3c4d.metadata.json) names
-_METADATA_FILE_RE = re.compile(r"^v(\d+)(?:-[0-9a-f]{8})?\.metadata\.json$")
+__all__ = [
+    "MetadataManager",
+    "AmbiguousCommitError",
+    "AmbiguousMetadataError",
+    "ConcurrentModificationException",
+    "SchemaMismatchError",
+    "TableExistsError",
+    "_METADATA_FILE_RE",
+    "_VersionHintMixin",
+]
 
 
-class ConcurrentModificationException(Exception):
-    """Exception thrown when concurrent modifications are detected"""
-
-    pass
-
-
-class TableExistsError(Exception):
-    """Raised when initializing a table over an already-initialized table."""
-
-    pass
-
-
-class SchemaMismatchError(TableExistsError):
-    """Raised by create_table() when the table already exists with a different
-    persisted schema than the one requested (#64)."""
-
-    pass
-
-
-class AmbiguousMetadataError(Exception):
-    """Raised when the version hint is missing and several metadata files share the
-    highest version, so the committed state cannot be told apart from a failed
-    committer's leftover (#60). Resolve with MetadataManager.repair_version_hint().
-    """
-
-    pass
-
-
-class AmbiguousCommitError(Exception):
-    """Raised when the commit-point write failed in a way that may still have
-    become visible (e.g. an S3 PUT that errored client-side after possibly
-    succeeding server-side).
-
-    Callers MUST NOT delete files written for this transaction: the commit may
-    be durable and referencing them. Orphan cleanup is the garbage collector's
-    job once the true outcome is observable.
-    """
-
-    pass
-
-
-class MetadataManager:
+class MetadataManager(_VersionHintMixin):
     """Manages table metadata persistence and updates"""
 
     HINT_PATH = "metadata.version-hint.text"
@@ -406,28 +381,6 @@ class MetadataManager:
         except Exception as e:
             logger.warning(f"Could not remove uncommitted metadata file {metadata_path}: {e}")
 
-    def repair_version_hint(self, metadata_file: str) -> TableMetadata:
-        """Operator action after AmbiguousMetadataError: point the version hint at
-        `metadata_file` (a bare filename under metadata/, e.g. 'v7-1a2b3c4d.metadata.json').
-
-        The file must exist and parse. The choice is logged at WARNING level.
-        Returns the metadata that is now current.
-        """
-        name = metadata_file.replace("\\", "/").rsplit("/", 1)[-1]
-        if not _METADATA_FILE_RE.match(name):
-            raise ValueError(f"{metadata_file!r} is not a metadata file name (expected vN[-hex].metadata.json)")
-        path = f"{self.metadata_path}/{name}"
-        metadata = self._read_metadata_file(path)  # raises if missing or corrupt
-        with self._lock:
-            self.lock_provider.acquire()
-            try:
-                self.storage.write_file(self.HINT_PATH, name.encode("utf-8"))
-                self.current_version = int(_METADATA_FILE_RE.match(name).group(1))  # type: ignore[union-attr]
-            finally:
-                self._release_lock_safely()
-        logger.warning(f"Version hint for {self.table_path} repaired by operator to {name}")
-        return metadata
-
     def _release_lock_safely(self) -> None:
         """Release the distributed lock without ever raising."""
         try:
@@ -488,258 +441,8 @@ class MetadataManager:
 
     def _metadata_to_dict(self, metadata: TableMetadata) -> Dict[str, Any]:
         """Convert TableMetadata to dictionary for JSON serialization"""
-        return {
-            "location": metadata.location,
-            "table_uuid": metadata.table_uuid,
-            "format_version": metadata.format_version,
-            "last_sequence_number": metadata.last_sequence_number,
-            "last_updated_ms": metadata.last_updated_ms,
-            "last_column_id": metadata.last_column_id,
-            "schemas": [
-                {
-                    "schema_id": schema.schema_id,
-                    "fields": schema.fields,
-                    "schema_string": schema.schema_string,
-                }
-                for schema in metadata.schemas
-            ],
-            "current_schema_id": metadata.current_schema_id,
-            "partition_specs": [
-                {
-                    "spec_id": spec.spec_id,
-                    "fields": [
-                        {
-                            "source_id": field.source_id,
-                            "field_id": field.field_id,
-                            "name": field.name,
-                            "transform": field.transform,
-                        }
-                        for field in spec.fields
-                    ],
-                }
-                for spec in metadata.partition_specs
-            ],
-            "default_spec_id": metadata.default_spec_id,
-            "sort_orders": [
-                {
-                    "order_id": order.order_id,
-                    "fields": [
-                        {
-                            "source_id": field.source_id,
-                            "field_id": field.field_id,
-                            "transform": field.transform,
-                            "direction": field.direction,
-                        }
-                        for field in order.fields
-                    ],
-                }
-                for order in metadata.sort_orders
-            ],
-            "default_sort_order_id": metadata.default_sort_order_id,
-            "properties": metadata.properties,
-            "current_snapshot_id": metadata.current_snapshot_id,
-            "snapshots": [
-                {
-                    "snapshot_id": snapshot.snapshot_id,
-                    "timestamp_ms": snapshot.timestamp_ms,
-                    "manifest_list": snapshot.manifest_list,
-                    "parent_snapshot_id": snapshot.parent_snapshot_id,
-                    "operation": snapshot.operation,
-                    "summary": snapshot.summary,
-                    "schema_id": snapshot.schema_id,
-                    "sequence_number": snapshot.sequence_number,
-                }
-                for snapshot in metadata.snapshots
-            ],
-            "snapshot_log": [
-                {"timestamp_ms": entry.timestamp_ms, "snapshot_id": entry.snapshot_id}
-                for entry in metadata.snapshot_log
-            ],
-            "metadata_log": metadata.metadata_log,
-            "last_commit_id": metadata.last_commit_id,
-        }
+        return metadata_to_dict(metadata)
 
     def _dict_to_metadata(self, metadata_dict: Dict[str, Any]) -> TableMetadata:
         """Convert dictionary back to TableMetadata"""
-        from .data_structures import (
-            HistoryEntry as HistoryEntryStruct,
-            PartitionField,
-            PartitionSpec,
-            Snapshot as SnapshotStruct,
-            SortField,
-            SortOrder,
-        )
-
-        # Reconstruct schemas
-        schemas = [
-            Schema(
-                schema_id=schema_dict["schema_id"],
-                fields=schema_dict["fields"],
-                schema_string=schema_dict.get("schema_string", ""),
-            )
-            for schema_dict in metadata_dict["schemas"]
-        ]
-
-        # Reconstruct partition specs
-        partition_specs = []
-        for spec_dict in metadata_dict["partition_specs"]:
-            fields = [
-                PartitionField(
-                    source_id=field_dict["source_id"],
-                    field_id=field_dict["field_id"],
-                    name=field_dict["name"],
-                    transform=field_dict["transform"],
-                )
-                for field_dict in spec_dict["fields"]
-            ]
-            partition_specs.append(PartitionSpec(spec_id=spec_dict["spec_id"], fields=fields))
-
-        # Reconstruct sort orders
-        sort_orders = []
-        for order_dict in metadata_dict["sort_orders"]:
-            sort_fields = [
-                SortField(
-                    source_id=field_dict["source_id"],
-                    field_id=field_dict["field_id"],
-                    transform=field_dict["transform"],
-                    direction=field_dict["direction"],
-                )
-                for field_dict in order_dict["fields"]
-            ]
-            sort_orders.append(SortOrder(order_id=order_dict["order_id"], fields=sort_fields))
-
-        # Reconstruct snapshots
-        snapshots = [
-            SnapshotStruct(
-                snapshot_id=snapshot_dict["snapshot_id"],
-                timestamp_ms=snapshot_dict["timestamp_ms"],
-                manifest_list=snapshot_dict["manifest_list"],
-                parent_snapshot_id=snapshot_dict.get("parent_snapshot_id"),
-                operation=snapshot_dict.get("operation"),
-                summary=snapshot_dict.get("summary", {}),
-                schema_id=snapshot_dict.get("schema_id"),
-                sequence_number=snapshot_dict.get("sequence_number"),
-            )
-            for snapshot_dict in metadata_dict["snapshots"]
-        ]
-
-        # Reconstruct history
-        snapshot_log = [
-            HistoryEntryStruct(
-                timestamp_ms=entry_dict["timestamp_ms"], snapshot_id=entry_dict["snapshot_id"]
-            )
-            for entry_dict in metadata_dict["snapshot_log"]
-        ]
-
-        return TableMetadata(
-            location=metadata_dict["location"],
-            table_uuid=metadata_dict["table_uuid"],
-            format_version=metadata_dict["format_version"],
-            last_sequence_number=metadata_dict["last_sequence_number"],
-            last_updated_ms=metadata_dict["last_updated_ms"],
-            last_column_id=metadata_dict["last_column_id"],
-            schemas=schemas,
-            current_schema_id=metadata_dict["current_schema_id"],
-            partition_specs=partition_specs,
-            default_spec_id=metadata_dict["default_spec_id"],
-            sort_orders=sort_orders,
-            default_sort_order_id=metadata_dict["default_sort_order_id"],
-            properties=metadata_dict["properties"],
-            current_snapshot_id=metadata_dict["current_snapshot_id"],
-            snapshots=snapshots,
-            snapshot_log=snapshot_log,
-            metadata_log=metadata_dict.get("metadata_log", []),
-            last_commit_id=metadata_dict.get("last_commit_id", ""),
-        )
-
-    # ------------------------------------------------------------------
-    # Version-hint handling (hint = pointer, metadata files = truth)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_hint_content(content: bytes) -> Optional[Tuple[int, str]]:
-        """Parse hint file content into (version, metadata_filename).
-
-        Supports the legacy format (bare version number) and the current
-        format (full metadata filename). Returns None if unparseable.
-        """
-        try:
-            text = content.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            return None
-        if not text:
-            return None
-        if text.isdigit():
-            # Legacy format: plain version number -> legacy filename
-            return int(text), f"v{text}.metadata.json"
-        m = _METADATA_FILE_RE.match(text)
-        if m:
-            return int(m.group(1)), text
-        return None
-
-    def _read_version_hint(self) -> Optional[Tuple[int, str]]:
-        """Read (version, metadata_filename) from the hint file, or None."""
-        try:
-            content = self.storage.read_file(self.HINT_PATH)
-        except FileNotFoundError:
-            return None
-        return self._parse_hint_content(content)
-
-    def _recover_version_from_files(self) -> Optional[Tuple[int, str]]:
-        """Recover the latest (version, filename) by scanning metadata files.
-
-        Used when the hint is missing/corrupt/stale. Picks the highest version -
-        but ONLY when exactly one file carries it. Several files at the same
-        version mean one committed and the others were left by committers that
-        failed before flipping the hint (lost race, crash); nothing in the files
-        distinguishes them, and guessing by mtime once resurrected an uncommitted
-        state and dropped committed rows (#60). That case raises
-        AmbiguousMetadataError for an operator to resolve with repair_version_hint().
-        """
-        try:
-            all_files = self.storage.list_files(self.metadata_path)
-        except Exception:
-            return None
-
-        candidates: Dict[int, List[str]] = {}
-        for rel_path in all_files:
-            norm = rel_path.replace("\\", "/")
-            basename = norm.rsplit("/", 1)[-1]
-            # Only consider files directly in metadata/ (not metadata/manifests/...)
-            parent = norm.rsplit("/", 1)[0] if "/" in norm else ""
-            if parent not in ("", self.metadata_path):
-                continue
-            m = _METADATA_FILE_RE.match(basename)
-            if not m:
-                continue
-            candidates.setdefault(int(m.group(1)), []).append(basename)
-
-        if not candidates:
-            return None
-        top = max(candidates)
-        names = sorted(candidates[top])
-        if len(names) > 1:
-            raise AmbiguousMetadataError(
-                f"Version hint missing or invalid for {self.table_path} and {len(names)} "
-                f"metadata files share the highest version {top}: {names}. One was committed "
-                f"and the others were left by failed commits; refusing to guess. Identify the "
-                f"committed one (e.g. from the writer's logs or the file contents) and call "
-                f"Table.repair_version_hint(<filename>)."
-            )
-        logger.warning(
-            f"Version hint missing or invalid for {self.table_path}; "
-            f"recovered latest metadata {names[0]} by scanning"
-        )
-        return top, names[0]
-
-    def _current_version_info(self) -> Optional[Tuple[int, str]]:
-        """Resolve the current (version, metadata_filename).
-
-        A parseable hint is trusted here without a separate existence probe (one
-        round trip fewer, #67); refresh() falls back to scanning if the file it
-        names turns out to be missing. No hint at all -> scan (#22).
-        """
-        hinted = self._read_version_hint()
-        if hinted is not None:
-            return hinted
-        return self._recover_version_from_files()
+        return dict_to_metadata(metadata_dict)

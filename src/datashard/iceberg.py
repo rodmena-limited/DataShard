@@ -9,7 +9,8 @@ from typing import Any, List, Optional, Tuple
 from .data_structures import DataFile, FileFormat, PartitionSpec, Schema
 from .logging_config import get_logger
 from .metadata_manager import SchemaMismatchError
-from .transaction import Table, Transaction
+from .table import Table
+from .transaction import Transaction
 
 logger = get_logger(__name__)
 
