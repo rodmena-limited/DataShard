@@ -51,7 +51,7 @@ def get_disk_space(path: str) -> DiskSpace:
     )
 
 
-DEFAULT_MIN_FREE_BYTES = 1 << 30  # 1 GiB
+DEFAULT_MIN_FREE_BYTES = 64 << 20  # 64 MiB: sized for datashard's own writes, not for 'a healthy server' (#82)
 
 
 def check_disk_space(
@@ -63,11 +63,12 @@ def check_disk_space(
 ) -> None:
     """Refuse a write only when the volume is genuinely short of space.
 
-    A write is refused when free bytes < max(2 x required_bytes, min_free_bytes);
-    min_free_bytes defaults to DATASHARD_MIN_FREE_BYTES or 1 GiB. The percentage
+    A write is refused when free bytes < max(4 x required_bytes, min_free_bytes);
+    min_free_bytes defaults to DATASHARD_MIN_FREE_BYTES or 64 MiB. The percentage
     thresholds only WARN: a 95 %-full 10 TB volume still has 500 GB free, and
     refusing every write there - including the commit-point hint - turned the
-    whole lake read-only (#70).
+    whole lake read-only (#70). A 1 GiB floor in turn refused 2 KB metadata writes
+    on /tmp and in containers with less than a gigabyte free (#82).
 
     Raises:
         IOError: If free space is below the absolute floor.
@@ -81,7 +82,7 @@ def check_disk_space(
             min_free_bytes = DEFAULT_MIN_FREE_BYTES
 
     space = get_disk_space(path)
-    needed = max(2 * required_bytes, min_free_bytes)
+    needed = max(4 * required_bytes, min_free_bytes)
 
     logger.debug(
         f"Disk space check for {path}: "
@@ -92,8 +93,8 @@ def check_disk_space(
     if space.free < needed:
         msg = (
             f"Insufficient disk space: {space.free / (1024**3):.2f} GB free, "
-            f"need at least {needed / (1024**3):.2f} GB (2 x write size or the "
-            f"{min_free_bytes / (1024**3):.2f} GB floor)"
+            f"need at least {needed / (1024**2):.1f} MB (4 x write size or the "
+            f"{min_free_bytes / (1024**2):.0f} MB floor; DATASHARD_MIN_FREE_BYTES)"
         )
         logger.error(msg)
         raise IOError(msg)

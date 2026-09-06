@@ -284,6 +284,19 @@ def test_disk_guard_uses_an_absolute_floor(monkeypatch):
                         lambda p: shutil._ntuple_diskusage(10 * TB, 10 * TB - 100, 100))
     with pytest.raises(IOError):
         disk_utils.check_disk_space("/", 1024)
+    # #82: a small volume with a few hundred MB free must keep working for KB-sized writes...
+    monkeypatch.setattr(disk_utils.shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(2 * 1024**3, 2 * 1024**3 - 500 * 1024**2, 500 * 1024**2))
+    disk_utils.check_disk_space("/", 2048)
+    # ...while 10 MB free is refused, and a write that itself needs more than the floor is too
+    monkeypatch.setattr(disk_utils.shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(2 * 1024**3, 2 * 1024**3 - 10 * 1024**2, 10 * 1024**2))
+    with pytest.raises(IOError):
+        disk_utils.check_disk_space("/", 2048)
+    monkeypatch.setattr(disk_utils.shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(2 * 1024**3, 2 * 1024**3 - 500 * 1024**2, 500 * 1024**2))
+    with pytest.raises(IOError):
+        disk_utils.check_disk_space("/", 200 * 1024**2)
 
 
 # ---------------------------------------------------------------- #68

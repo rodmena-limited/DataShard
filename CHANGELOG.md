@@ -5,6 +5,15 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-09-06
+
+### Fixed
+- **Free-space floor refused every write on small volumes (#82).** The absolute floor introduced in 0.8.0 (#70)
+  defaulted to 1 GiB, so a table under /tmp, in a container or on any volume with less than a gigabyte free
+  failed with `Insufficient disk space` for a 2 KB metadata write. The default floor is now 64 MiB and a write
+  is refused when free bytes < max(4 x write size, floor). `DATASHARD_MIN_FREE_BYTES` still overrides it.
+  Found by the 0.9.0 post-publish smoke test, which failed on this exact condition.
+
 ## [0.9.0] - 2026-09-06
 
 First release of the uplift plan: DuckDB as the analytics layer and Arrow as the
