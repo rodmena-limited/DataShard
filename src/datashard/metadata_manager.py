@@ -146,8 +146,19 @@ class MetadataManager:
                 return None
 
             _version, metadata_file = info
-            metadata_path = f"{self.metadata_path}/{metadata_file}"
-            return self._read_metadata_file(metadata_path)
+            try:
+                return self._read_metadata_file(f"{self.metadata_path}/{metadata_file}")
+            except FileNotFoundError:
+                # The hint points at a file that is gone (stale or corrupt hint):
+                # recover by scanning, as for a missing hint (#22).
+                recovered = self._recover_version_from_files()
+                if recovered is None or recovered[1] == metadata_file:
+                    raise
+                logger.warning(
+                    f"Version hint for {self.table_path} points at missing {metadata_file}; "
+                    f"using recovered {recovered[1]}"
+                )
+                return self._read_metadata_file(f"{self.metadata_path}/{recovered[1]}")
 
     def commit(self, base_metadata: TableMetadata, new_metadata: TableMetadata) -> TableMetadata:
         """Commit new metadata with Optimistic Concurrency Control following Iceberg pattern.
@@ -173,8 +184,12 @@ class MetadataManager:
             self.lock_provider.acquire()
 
             try:
-                # PHASE 1: Validation (inside lock to prevent races)
-                current = self.refresh()
+                # PHASE 1: Validation (inside lock to prevent races). One hint read
+                # (carrying the ETag on CAS backends) and one metadata read - the
+                # earlier refresh() + separate ETag read cost 5 round trips (#67).
+                current, hint_etag, filesystem_version, previous_metadata_file = (
+                    self._read_current_for_commit()
+                )
 
                 # Check UUID consistency
                 if current and current.table_uuid != base_metadata.table_uuid:
@@ -195,29 +210,24 @@ class MetadataManager:
                         f"but found: {current.last_updated_ms}"
                     )
 
+                # Commit identity: two metadata-only commits in the same millisecond
+                # share last_updated_ms and the snapshot id; the commit id cannot
+                # collide (#74). Empty on versions written before 0.8.0.
+                if (
+                    current
+                    and current.last_commit_id
+                    and current.last_commit_id != base_metadata.last_commit_id
+                ):
+                    raise ConcurrentModificationException(
+                        f"Cannot commit metadata: concurrent modification detected. "
+                        f"Expected commit {base_metadata.last_commit_id or '<none>'}, "
+                        f"but found: {current.last_commit_id}"
+                    )
+
                 # PHASE 2: Prepare new version
                 new_metadata.last_updated_ms = int(datetime.now().timestamp() * 1000)
-
-                # Read current version (and, on CAS backends, the hint's ETag so
-                # the commit point below can be a true compare-and-swap).
-                hint_etag: Optional[str] = None
-                filesystem_version: Optional[int] = None
-                previous_metadata_file: Optional[str] = None
-                if self.storage.supports_cas:
-                    try:
-                        hint_bytes, hint_etag = self.storage.read_file_with_etag(self.HINT_PATH)
-                        parsed = self._parse_hint_content(hint_bytes)
-                        if parsed is not None:
-                            filesystem_version, previous_metadata_file = parsed
-                    except FileNotFoundError:
-                        hint_etag = None
-                if filesystem_version is None:
-                    info = self._current_version_info()
-                    if info is not None:
-                        filesystem_version, previous_metadata_file = info
-                if filesystem_version is None:
-                    filesystem_version = 0
-                next_version = filesystem_version + 1
+                new_metadata.last_commit_id = uuid.uuid4().hex
+                next_version = (filesystem_version or 0) + 1
 
                 # Record the version this commit supersedes, so the metadata
                 # file chain is auditable (Iceberg's metadata-log).
@@ -274,9 +284,12 @@ class MetadataManager:
                 # reported as failed because unlock hiccuped).
                 self._release_lock_safely()
 
-    # Iceberg's cap on retained metadata-log entries.
+    # Cap on retained metadata-log entries (Iceberg's property name). Superseded
+    # metadata files outside the log are reclaimed by garbage_collect() (#68), so
+    # this is also how many previous versions stay on disk; 10 keeps the chain
+    # auditable without the quadratic growth 100 caused on busy tables.
     PREVIOUS_VERSIONS_MAX_PROPERTY = "write.metadata.previous-versions-max"
-    DEFAULT_PREVIOUS_VERSIONS_MAX = 100
+    DEFAULT_PREVIOUS_VERSIONS_MAX = 10
 
     def _append_metadata_log(
         self,
@@ -351,6 +364,40 @@ class MetadataManager:
             raise AmbiguousCommitError(
                 f"Version hint write failed ambiguously: {e}"
             ) from e
+
+    def _read_current_for_commit(
+        self,
+    ) -> Tuple[Optional[TableMetadata], Optional[str], Optional[int], Optional[str]]:
+        """(current metadata, hint ETag, current version, current metadata filename).
+
+        The hint is read once - with its ETag on CAS backends, so the commit point
+        can be a conditional PUT - and the metadata file it names once. A missing
+        or unparseable hint falls back to scanning (hint = pointer, files = truth).
+        """
+        hint_etag: Optional[str] = None
+        info: Optional[Tuple[int, str]] = None
+        try:
+            if self.storage.supports_cas:
+                hint_bytes, hint_etag = self.storage.read_file_with_etag(self.HINT_PATH)
+            else:
+                hint_bytes = self.storage.read_file(self.HINT_PATH)
+            info = self._parse_hint_content(hint_bytes)
+        except FileNotFoundError:
+            hint_etag = None
+        if info is None:
+            info = self._recover_version_from_files()
+        if info is None:
+            return None, hint_etag, None, None
+        version, metadata_file = info
+        try:
+            current = self._read_metadata_file(f"{self.metadata_path}/{metadata_file}")
+        except FileNotFoundError:
+            recovered = self._recover_version_from_files()
+            if recovered is None or recovered[1] == metadata_file:
+                raise
+            version, metadata_file = recovered
+            current = self._read_metadata_file(f"{self.metadata_path}/{metadata_file}")
+        return current, hint_etag, version, metadata_file
 
     def _discard_uncommitted_metadata(self, metadata_path: str) -> None:
         """Best-effort removal of a metadata file whose commit is known to have failed."""
@@ -509,6 +556,7 @@ class MetadataManager:
                 for entry in metadata.snapshot_log
             ],
             "metadata_log": metadata.metadata_log,
+            "last_commit_id": metadata.last_commit_id,
         }
 
     def _dict_to_metadata(self, metadata_dict: Dict[str, Any]) -> TableMetadata:
@@ -600,7 +648,8 @@ class MetadataManager:
             current_snapshot_id=metadata_dict["current_snapshot_id"],
             snapshots=snapshots,
             snapshot_log=snapshot_log,
-            metadata_log=metadata_dict["metadata_log"],
+            metadata_log=metadata_dict.get("metadata_log", []),
+            last_commit_id=metadata_dict.get("last_commit_id", ""),
         )
 
     # ------------------------------------------------------------------
@@ -630,9 +679,10 @@ class MetadataManager:
 
     def _read_version_hint(self) -> Optional[Tuple[int, str]]:
         """Read (version, metadata_filename) from the hint file, or None."""
-        if not self.storage.exists(self.HINT_PATH):
+        try:
+            content = self.storage.read_file(self.HINT_PATH)
+        except FileNotFoundError:
             return None
-        content = self.storage.read_file(self.HINT_PATH)
         return self._parse_hint_content(content)
 
     def _recover_version_from_files(self) -> Optional[Tuple[int, str]]:
@@ -685,12 +735,11 @@ class MetadataManager:
     def _current_version_info(self) -> Optional[Tuple[int, str]]:
         """Resolve the current (version, metadata_filename).
 
-        Prefers a valid hint that points at an existing file; otherwise falls
-        back to scanning metadata files (#22: the hint is only a hint).
+        A parseable hint is trusted here without a separate existence probe (one
+        round trip fewer, #67); refresh() falls back to scanning if the file it
+        names turns out to be missing. No hint at all -> scan (#22).
         """
         hinted = self._read_version_hint()
         if hinted is not None:
-            _version, filename = hinted
-            if self.storage.exists(f"{self.metadata_path}/{filename}"):
-                return hinted
+            return hinted
         return self._recover_version_from_files()

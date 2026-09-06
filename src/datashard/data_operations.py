@@ -19,7 +19,7 @@ except ImportError:
     PANDAS_AVAILABLE = False
     pd = None  # Define as None to avoid reference errors
 
-from .data_structures import DataFile, FileFormat, Schema
+from .data_structures import DataFile, FileFormat, Schema, parse_decimal_type
 from .integrity import IntegrityChecker
 from .logging_config import get_logger
 from .storage_backend import LocalStorageBackend, S3StorageBackend, StorageBackend
@@ -519,6 +519,7 @@ class DataFileManager:
             "date": pa.date32(),
             "time": pa.time64("us"),
             "timestamp": pa.timestamp("us"),
+            "timestamptz": pa.timestamp("us", tz="UTC"),
             "string": pa.string(),
             "uuid": pa.string(),  # For UUID handling
             "binary": pa.binary(),
@@ -527,6 +528,9 @@ class DataFileManager:
 
         # Handle complex types
         if isinstance(iceberg_type, str):
+            decimal_spec = parse_decimal_type(iceberg_type)
+            if decimal_spec is not None:
+                return pa.decimal128(*decimal_spec)
             if iceberg_type.startswith("list<"):
                 # Extract element type and map it
                 element_type = iceberg_type[5:-1]  # Remove 'list<>' wrapper

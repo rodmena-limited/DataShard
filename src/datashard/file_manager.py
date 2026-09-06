@@ -7,6 +7,7 @@ Supports both local filesystem and S3-compatible storage via StorageBackend abst
 import json
 import uuid
 from datetime import date, datetime, time as dt_time
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
@@ -127,6 +128,8 @@ class FileManager:
             payload = {"t": "int", "v": value}
         elif isinstance(value, float):
             payload = {"t": "float", "v": value}
+        elif isinstance(value, Decimal):
+            payload = {"t": "dec", "v": str(value)}  # exact; never via float
         elif isinstance(value, datetime):
             payload = {"t": "ts", "v": value.isoformat()}
         elif isinstance(value, date):
@@ -159,6 +162,8 @@ class FileManager:
                 return int(v)
             if tag == "float":
                 return float(v)
+            if tag == "dec":
+                return Decimal(v)
             if tag == "ts":
                 return datetime.fromisoformat(v)
             if tag == "date":
@@ -167,7 +172,7 @@ class FileManager:
                 return dt_time.fromisoformat(v)
             if tag == "str":
                 return str(v)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, InvalidOperation):
             return v
         return v
 

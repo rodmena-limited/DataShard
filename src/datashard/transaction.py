@@ -6,7 +6,9 @@ import copy
 import json
 import os
 import threading
+import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Union
 
 from .data_structures import (
@@ -33,6 +35,27 @@ logger = get_logger(__name__)
 # Kept in sync with garbage_collector.INFLIGHT_PATH.
 _INFLIGHT_PATH = "metadata/inflight"
 
+# Table property: rewrite the active manifests into one when their count reaches
+# this value (0 disables). One manifest per commit, never merged, made scan I/O
+# grow with the number of commits ever made (#68).
+MANIFEST_COMPACTION_THRESHOLD_PROPERTY = "datashard.manifest.compaction-threshold"
+DEFAULT_MANIFEST_COMPACTION_THRESHOLD = 64
+
+# Default snapshot age for Table.expire_snapshots() when no policy is given.
+DEFAULT_SNAPSHOT_MAX_AGE_MS = 5 * 24 * 3600 * 1000
+
+
+@dataclass
+class _Plan:
+    """Queued operations of one transaction, partitioned for commit."""
+
+    append_files: List[DataFile] = field(default_factory=list)
+    deleted_paths: Set[str] = field(default_factory=set)
+    expire_cutoff: Optional[int] = None
+    retain_last: Optional[int] = None
+    properties: Dict[str, Optional[str]] = field(default_factory=dict)
+    compact: bool = False
+
 
 class Transaction:
     """Represents a database transaction with ACID properties"""
@@ -55,6 +78,9 @@ class Transaction:
 
         # Operations queue
         self._operations: List[Dict[str, Any]] = []
+        # True after commit() when a NEW snapshot was created (metadata-only
+        # commits and no-op compactions leave it False).
+        self.did_commit_snapshot = False
 
         # Track files written during transaction for cleanup on rollback
         self._written_files: List[str] = []
@@ -63,10 +89,17 @@ class Transaction:
         # Table-relative paths already protected by a marker (one marker per path)
         self._marked_paths: Set[str] = set()
         self._marker_names: Set[str] = set()
+        # Manifests / manifest lists written by the CURRENT commit attempt: a lost
+        # OCC race means they were never referenced, so the retry removes them
+        # instead of leaving one orphan pair per attempt for GC (#74).
+        self._attempt_files: List[str] = []
         # The table schema is read once per transaction (no schema evolution): every
         # append_* used to re-read the metadata - 2-4 S3 round trips each (#67).
         self._schema_cache: Optional[Schema] = None
         self._schema_cache_set = False
+        # Metadata read while resolving the schema doubles as the first commit
+        # attempt's OCC base; a stale base just retries with a fresh read (#67).
+        self._base_metadata_cache: Optional[TableMetadata] = None
 
         self._lock = threading.RLock()
 
@@ -87,8 +120,10 @@ class Transaction:
             self._inflight_markers = []
             self._marked_paths = set()
             self._marker_names = set()
+            self._attempt_files = []
             self._schema_cache = None
             self._schema_cache_set = False
+            self._base_metadata_cache = None
 
             return self
 
@@ -226,6 +261,7 @@ class Transaction:
             return self._schema_cache
         result: Optional[Schema] = None
         metadata = self.metadata_manager.refresh()
+        self._base_metadata_cache = metadata
         if metadata and metadata.schemas:
             for s in metadata.schemas:
                 if s.schema_id == metadata.current_schema_id and s.fields:
@@ -376,6 +412,8 @@ class Transaction:
         self._inflight_markers.append(marker_path)
         self._marked_paths.add(rel_path)
         self._marker_names.add(marker_name)
+        if rel_path.startswith(self.file_manager.manifests_path + "/"):
+            self._attempt_files.append(rel_path)
 
     def delete_files(self, file_paths: List[str]) -> "Transaction":
         """Queue files to delete from the table"""
@@ -400,17 +438,72 @@ class Transaction:
             "did nothing.)"
         )
 
-    def expire_snapshots(self, older_than_ms: int) -> "Transaction":
-        """Queue snapshot expiration: snapshots with timestamp_ms older than the
-        given cutoff are removed from table metadata at commit (the current
-        snapshot is never expired). Physical file cleanup is done by
+    def expire_snapshots(
+        self, older_than_ms: Optional[int] = None, retain_last: Optional[int] = None
+    ) -> "Transaction":
+        """Queue snapshot expiration, applied at commit.
+
+        Snapshots with timestamp_ms below `older_than_ms` are removed, except the
+        `retain_last` most recent ones and the current snapshot, which are always
+        kept. At least one criterion is required. Physical file cleanup is done by
         garbage_collect() once the snapshots are unreachable."""
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
+        if older_than_ms is None and retain_last is None:
+            raise ValueError("expire_snapshots needs older_than_ms and/or retain_last")
+        if retain_last is not None and retain_last < 1:
+            raise ValueError("retain_last must be >= 1")
 
-        self._operations.append({"type": "expire_snapshots", "older_than_ms": older_than_ms})
+        self._operations.append({
+            "type": "expire_snapshots", "older_than_ms": older_than_ms, "retain_last": retain_last,
+        })
 
         return self
+
+    def set_properties(self, properties: Dict[str, Optional[str]]) -> "Transaction":
+        """Queue table-property changes (value None removes a property). Properties
+        drive retention and compaction policies - e.g. write.metadata.previous-versions-max,
+        datashard.manifest.compaction-threshold, datashard.snapshot.retention-count (#68)."""
+        if not self.is_active():
+            raise RuntimeError("Transaction is not active")
+        for k, v in properties.items():
+            if not isinstance(k, str) or not k:
+                raise ValueError(f"property names must be non-empty strings, got {k!r}")
+            if v is not None and not isinstance(v, str):
+                raise ValueError(f"property values must be strings or None, got {v!r} for {k}")
+        self._operations.append({"type": "set_properties", "properties": dict(properties)})
+        return self
+
+    def compact_manifests(self) -> "Transaction":
+        """Queue a rewrite of the active manifests into one (no-op below 2 manifests)."""
+        if not self.is_active():
+            raise RuntimeError("Transaction is not active")
+        self._operations.append({"type": "compact_manifests"})
+        return self
+
+    def _plan_operations(self) -> _Plan:
+        plan = _Plan()
+        for operation in self._operations:
+            kind = operation["type"]
+            if kind == "append_files":
+                plan.append_files.extend(operation["files"])
+            elif kind == "delete_files":
+                plan.deleted_paths.update(operation["file_paths"])
+            elif kind == "expire_snapshots":
+                cutoff = operation.get("older_than_ms")
+                if cutoff is not None:
+                    cutoff = int(cutoff)
+                    plan.expire_cutoff = cutoff if plan.expire_cutoff is None else max(plan.expire_cutoff, cutoff)
+                keep = operation.get("retain_last")
+                if keep is not None:
+                    plan.retain_last = int(keep) if plan.retain_last is None else min(plan.retain_last, int(keep))
+            elif kind == "set_properties":
+                plan.properties.update(operation["properties"])
+            elif kind == "compact_manifests":
+                plan.compact = True
+            else:
+                raise RuntimeError(f"Unknown queued operation type {kind!r}")
+        return plan
 
     def commit(self) -> bool:
         """Commit the transaction with ACID properties using Optimistic Concurrency Control.
@@ -444,51 +537,50 @@ class Transaction:
         while retry_count < max_retries:
             try:
                 with self._lock:
-                    # Get current metadata as the "base" for our operations
-                    base_metadata = self.metadata_manager.refresh()
+                    # Base for OCC. The first attempt reuses the metadata this
+                    # transaction read while resolving the schema; a stale base
+                    # just fails the OCC check and retries with a fresh read (#67).
+                    if retry_count == 0 and self._base_metadata_cache is not None:
+                        base_metadata: Optional[TableMetadata] = self._base_metadata_cache
+                    else:
+                        base_metadata = self.metadata_manager.refresh()
+                    self._base_metadata_cache = None
                     if base_metadata is None:
                         raise RuntimeError("No current metadata - table is not initialized")
 
-                    # Partition queued operations
-                    append_files: List[DataFile] = []
-                    deleted_paths: Set[str] = set()
-                    expire_cutoff: Optional[int] = None
-                    for operation in self._operations:
-                        if operation["type"] == "append_files":
-                            append_files.extend(operation["files"])
-                        elif operation["type"] == "delete_files":
-                            deleted_paths.update(operation["file_paths"])
-                        elif operation["type"] == "expire_snapshots":
-                            cutoff = int(operation["older_than_ms"])
-                            expire_cutoff = (
-                                cutoff if expire_cutoff is None else max(expire_cutoff, cutoff)
-                            )
+                    plan = self._plan_operations()
+                    mutators: List[Callable[[TableMetadata], None]] = []
+                    if plan.expire_cutoff is not None or plan.retain_last is not None:
+                        mutators.append(self._make_expire_mutator(plan.expire_cutoff, plan.retain_last))
+                    if plan.properties:
+                        mutators.append(self._make_properties_mutator(plan.properties))
+                    mutator = self._chain_mutators(mutators)
 
-                    mutator = (
-                        self._make_expire_mutator(expire_cutoff)
-                        if expire_cutoff is not None
-                        else None
-                    )
-
-                    if append_files or deleted_paths:
-                        self._commit_file_ops(
-                            base_metadata, append_files, deleted_paths, mutator
+                    committed = False
+                    if plan.append_files or plan.deleted_paths or plan.compact:
+                        committed = self._commit_file_ops(
+                            base_metadata, plan.append_files, plan.deleted_paths, mutator,
+                            compact=plan.compact,
                         )
-                    else:
-                        # Metadata-only transaction (expire_snapshots): commit the
+                    if not committed and mutator is not None:
+                        # Metadata-only transaction (expire / properties): commit the
                         # metadata change directly without fabricating a snapshot.
                         new_metadata = self._deep_copy_metadata(base_metadata)
-                        if mutator is not None:
-                            mutator(new_metadata)
+                        mutator(new_metadata)
                         self.metadata_manager.commit(base_metadata, new_metadata)
 
                     # ---- COMMIT POINT PASSED ----
                     # Only infallible bookkeeping below (no storage reads, no
                     # refresh): nothing here may throw us into the rollback path.
+                    self.did_commit_snapshot = committed
                     self._finish_committed()
                     return True
 
             except ConcurrentModificationException as e:
+                # Clean loss: nothing we wrote this attempt is referenced by any
+                # snapshot. Drop the attempt's manifests now rather than leaving a
+                # pair of orphans per retry for GC to find (#74).
+                self._discard_attempt_files()
                 retry_count += 1
                 if retry_count >= max_retries:
                     # Final failure - cannot commit even after retries
@@ -522,8 +614,13 @@ class Transaction:
         append_files: List[DataFile],
         deleted_paths: Set[str],
         mutator: Optional[Callable[[TableMetadata], None]],
-    ) -> None:
-        """Build manifests for file-level operations and commit the snapshot."""
+        compact: bool = False,
+    ) -> bool:
+        """Build manifests for file-level operations and commit the snapshot.
+
+        Returns False when there was nothing to commit (an explicit compaction on a
+        table with fewer than two manifests and no other file operation).
+        """
         # One snapshot id for EVERYTHING this commit writes: manifest entries,
         # manifest-list filename, and the Snapshot itself must agree, or
         # lineage joins dangle.
@@ -636,6 +733,20 @@ class Transaction:
         else:
             final_manifests = list(existing_manifests)
 
+        # 2b. Manifest compaction (#68). When the active set reaches the threshold
+        # - or on an explicit compact_manifests() - the small manifests are
+        # rewritten into one; entries keep their original snapshot and sequence
+        # numbers (status EXISTING), so history is not falsified. The superseded
+        # manifests become unreachable and GC reclaims them.
+        threshold = self._compaction_threshold(base_metadata)
+        if compact or (threshold and len(final_manifests) >= threshold):
+            if len(final_manifests) >= 2:
+                final_manifests = [
+                    self._compact_manifests(final_manifests, snapshot_id, sequence_number)
+                ]
+            elif compact and not append_files and not deleted_paths:
+                return False  # nothing to compact, nothing else to commit
+
         # 3. Process appends (create new manifest). Existence was checked when the
         # files were queued; a second HEAD per file here bought nothing (#67).
         if append_files:
@@ -656,10 +767,11 @@ class Transaction:
         )
 
         # 5. Commit the snapshot - with the SAME id stamped into the manifests.
+        operation = "append" if append_files else ("delete" if deleted_paths else "replace")
         self.snapshot_manager.create_snapshot(
             manifest_list_path=list_info.path,
             summary=list_info.summary(),
-            operation="append" if append_files else "delete",
+            operation=operation,
             parent_snapshot_id=(
                 base_metadata.current_snapshot_id
                 if base_metadata.current_snapshot_id is not None
@@ -670,18 +782,93 @@ class Transaction:
             metadata_mutator=mutator,
             sequence_number=sequence_number,
         )
+        return True
 
     @staticmethod
-    def _make_expire_mutator(cutoff_ms: int) -> Callable[[TableMetadata], None]:
-        """Mutator removing snapshots older than cutoff (never the current one)."""
+    def _compaction_threshold(metadata: TableMetadata) -> int:
+        raw = metadata.properties.get(MANIFEST_COMPACTION_THRESHOLD_PROPERTY)
+        if raw is None:
+            return DEFAULT_MANIFEST_COMPACTION_THRESHOLD
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            logger.warning(f"Ignoring invalid {MANIFEST_COMPACTION_THRESHOLD_PROPERTY}={raw!r}")
+            return DEFAULT_MANIFEST_COMPACTION_THRESHOLD
+
+    def _compact_manifests(
+        self, manifests: List[ManifestFile], snapshot_id: int, sequence_number: int
+    ) -> ManifestFile:
+        """Rewrite `manifests` into one manifest of EXISTING entries."""
+        entries: List[DataFile] = []
+        for manifest in manifests:
+            manifest_path = manifest.manifest_path.lstrip("/")
+            try:
+                entries.extend(self.file_manager.read_manifest_file(
+                    manifest_path,
+                    expected_length=manifest.manifest_length,
+                    expected_checksum=manifest.checksum,
+                ))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to read manifest {manifest.manifest_path} during compaction"
+                ) from e
+        merged = self.file_manager.create_manifest_file(
+            [],
+            ManifestContent.DATA,
+            snapshot_id,
+            existing_files=entries,
+            sequence_number=sequence_number,
+            pre_write_hook=self._register_inflight,
+        )
+        logger.info(f"Compacted {len(manifests)} manifests ({len(entries)} files) into {merged.manifest_path}")
+        return merged
+
+    @staticmethod
+    def _chain_mutators(
+        mutators: List[Callable[[TableMetadata], None]]
+    ) -> Optional[Callable[[TableMetadata], None]]:
+        if not mutators:
+            return None
+        if len(mutators) == 1:
+            return mutators[0]
+
+        def chained(metadata: TableMetadata) -> None:
+            for m in mutators:
+                m(metadata)
+
+        return chained
+
+    @staticmethod
+    def _make_properties_mutator(
+        properties: Dict[str, Optional[str]]
+    ) -> Callable[[TableMetadata], None]:
+        def mutator(metadata: TableMetadata) -> None:
+            for k, v in properties.items():
+                if v is None:
+                    metadata.properties.pop(k, None)
+                else:
+                    metadata.properties[k] = v
+
+        return mutator
+
+    @staticmethod
+    def _make_expire_mutator(
+        cutoff_ms: Optional[int], retain_last: Optional[int] = None
+    ) -> Callable[[TableMetadata], None]:
+        """Mutator removing snapshots older than cutoff, always keeping the current
+        snapshot and the `retain_last` most recent ones."""
 
         def mutator(metadata: TableMetadata) -> None:
             from .snapshot_manager import repoint_parents_to_surviving_ancestors
 
+            protected = {metadata.current_snapshot_id}
+            if retain_last:
+                by_time = sorted(metadata.snapshots, key=lambda s: s.timestamp_ms)
+                protected.update(s.snapshot_id for s in by_time[-retain_last:])
             kept = [
                 s for s in metadata.snapshots
-                if s.timestamp_ms >= cutoff_ms
-                or s.snapshot_id == metadata.current_snapshot_id
+                if s.snapshot_id in protected
+                or (cutoff_ms is not None and s.timestamp_ms >= cutoff_ms)
             ]
             kept_ids = {s.snapshot_id for s in kept}
             # Survivors must not keep parent links to expired snapshots.
@@ -750,6 +937,15 @@ class Transaction:
         self._marker_names = set()
 
         return True
+
+    def _discard_attempt_files(self) -> None:
+        """Best-effort removal of manifests written by a commit attempt that lost its race."""
+        if self._attempt_files:
+            try:
+                self.file_manager.storage.delete_files(list(self._attempt_files))
+            except Exception as e:
+                logger.debug(f"Could not remove attempt manifests (GC will): {e}")
+        self._attempt_files = []
 
     def _delete_markers(self) -> None:
         """Best-effort bulk removal of this transaction's GC-protection markers (#67)."""
@@ -902,10 +1098,10 @@ class Table:
     ) -> Any:
         """Look up a historical Snapshot by id or timestamp.
 
-        NOTE: This returns snapshot METADATA (id, timestamp, manifest list
-        reference); it does not switch the table's state, and scan() always
-        reads the CURRENT snapshot. Reading data as-of an old snapshot is not
-        implemented yet.
+        Returns snapshot METADATA (id, timestamp, manifest list reference); it
+        does not switch the table's state. To READ the data as of that snapshot,
+        pass its id to scan(), to_pandas(), scan_batches(), iter_*() or
+        row_count() as snapshot_id=... (#72).
         """
         if snapshot_id is not None:
             return self.snapshot_manager.time_travel_to(snapshot_id)
@@ -949,6 +1145,49 @@ class Table:
         metadata = self.metadata_manager.refresh()
         return metadata is not None
 
+    # ------------------------------------------------------------------
+    # Maintenance (#68)
+    # ------------------------------------------------------------------
+
+    def properties(self) -> Dict[str, str]:
+        """The table's properties (retention / compaction policy knobs)."""
+        metadata = self.metadata_manager.refresh()
+        return dict(metadata.properties) if metadata else {}
+
+    def set_properties(self, properties: Dict[str, Optional[str]]) -> bool:
+        """Set (or with None, remove) table properties in one metadata commit."""
+        with self.new_transaction() as tx:
+            tx.set_properties(properties)
+            return bool(tx.commit())
+
+    def expire_snapshots(
+        self, older_than_ms: Optional[int] = None, retain_last: Optional[int] = None
+    ) -> int:
+        """Expire snapshots and return how many were removed.
+
+        With no arguments, snapshots older than DEFAULT_SNAPSHOT_MAX_AGE_MS (5 days)
+        are expired. The current snapshot and the `retain_last` most recent ones are
+        always kept. Files owned only by expired snapshots are reclaimed by the next
+        garbage_collect() once they exceed its grace period.
+        """
+        if older_than_ms is None and retain_last is None:
+            older_than_ms = int(time.time() * 1000) - DEFAULT_SNAPSHOT_MAX_AGE_MS
+        before = len(self.snapshots())
+        with self.new_transaction() as tx:
+            tx.expire_snapshots(older_than_ms=older_than_ms, retain_last=retain_last)
+            tx.commit()
+        return before - len(self.snapshots())
+
+    def compact_manifests(self) -> bool:
+        """Rewrite the active manifests into one. Returns True when a compaction
+        snapshot was committed, False when there was nothing to compact. Commits
+        also compact automatically once the manifest count reaches the
+        datashard.manifest.compaction-threshold property (default 64)."""
+        with self.new_transaction() as tx:
+            tx.compact_manifests()
+            tx.commit()
+        return tx.did_commit_snapshot
+
     def repair_version_hint(self, metadata_file: str) -> None:
         """Operator action after AmbiguousMetadataError: declare which metadata file
         is the committed one (see MetadataManager.repair_version_hint)."""
@@ -978,17 +1217,20 @@ class Table:
         gc = GarbageCollector(self.table_path, self.metadata_manager, self.file_manager)
         return gc.collect(grace_period_ms, allow_short_grace=allow_short_grace)
 
-    def row_count(self) -> int:
-        """Get total row count from parquet metadata without scanning data.
+    def row_count(self, snapshot_id: Optional[int] = None) -> int:
+        """Get total row count from manifest metadata without scanning data.
 
         This is a fast O(manifest_files) operation that reads only metadata,
         not the actual parquet data files. Use this for count-only queries
         instead of len(table.scan()).
 
+        Args:
+            snapshot_id: Count as of a historical snapshot (default: current).
+
         Returns:
-            Total number of rows across all data files in current snapshot.
+            Total number of rows across all data files in the snapshot.
         """
-        data_files = self._get_all_data_files()
+        data_files = self._get_all_data_files(snapshot_id=snapshot_id)
         return sum(df.record_count for df in data_files)
 
     # ------------------------------------------------------------------
@@ -1108,6 +1350,7 @@ class Table:
         filter_dict: Optional[Dict[str, Any]],
         parallel: Union[bool, int],
         verify_checksums: Optional[Union[bool, str]],
+        snapshot_id: Optional[int] = None,
     ) -> Any:
         """Shared scan core: returns a pyarrow Table, or None for an empty table.
 
@@ -1126,7 +1369,9 @@ class Table:
             to_pyarrow_compute_expression,
         )
 
-        data_files = self._get_all_data_files()
+        # ONE metadata read per scan: snapshot and schema come from the same view (#67).
+        metadata = self.metadata_manager.refresh()
+        data_files = self._get_all_data_files(metadata, snapshot_id)
         if not data_files:
             return None
 
@@ -1135,7 +1380,7 @@ class Table:
 
         # File-level pruning via column bounds
         if expressions:
-            schema = self._get_current_schema()
+            schema = self._get_current_schema(metadata)
             if schema:
                 data_files = prune_files_by_bounds(data_files, expressions, schema)
         if not data_files:
@@ -1183,8 +1428,9 @@ class Table:
         filter: Optional[Dict[str, Any]] = None,
         parallel: Union[bool, int] = False,
         verify_checksums: Optional[Union[bool, str]] = None,
+        snapshot_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Scan the table's CURRENT snapshot and return records.
+        """Scan the table (current snapshot, or `snapshot_id` for time travel) and return records.
 
         Args:
             columns: Optional list of column names to read. If None, reads all columns.
@@ -1205,6 +1451,9 @@ class Table:
                 the bytes actually read), "full" (whole-file sha256 recorded at
                 write time - downloads every byte) or "off". True/False select
                 full/off. Defaults to the DATASHARD_VERIFY_CHECKSUMS env var.
+            snapshot_id: Read the table as of this snapshot (see snapshots(),
+                time_travel()). Default: the current snapshot. Raises ValueError
+                for an unknown or expired snapshot.
 
         Returns:
             List of dictionaries, each representing a record.
@@ -1214,7 +1463,7 @@ class Table:
                 cannot be read - errors are never swallowed into partial results.
             CorruptDataError: If checksum verification fails.
         """
-        combined = self._scan_table(columns, filter, parallel, verify_checksums)
+        combined = self._scan_table(columns, filter, parallel, verify_checksums, snapshot_id)
         if combined is None:
             return []
         result: List[Dict[str, Any]] = combined.to_pylist()
@@ -1226,8 +1475,9 @@ class Table:
         filter: Optional[Dict[str, Any]] = None,
         parallel: Union[bool, int] = False,
         verify_checksums: Optional[Union[bool, str]] = None,
+        snapshot_id: Optional[int] = None,
     ) -> Any:
-        """Read the table's CURRENT snapshot as a pandas DataFrame.
+        """Read the table (current snapshot, or `snapshot_id`) as a pandas DataFrame.
 
         Same filtering, error, and checksum semantics as scan().
 
@@ -1241,7 +1491,7 @@ class Table:
                 "pandas is required for to_pandas(). Install with: pip install pandas"
             ) from e
 
-        combined = self._scan_table(columns, filter, parallel, verify_checksums)
+        combined = self._scan_table(columns, filter, parallel, verify_checksums, snapshot_id)
         if combined is None:
             return pd.DataFrame()
         return combined.to_pandas()
@@ -1252,6 +1502,7 @@ class Table:
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
         verify_checksums: Optional[Union[bool, str]] = None,
+        snapshot_id: Optional[int] = None,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Scan data in batches for memory-efficient processing.
 
@@ -1277,11 +1528,12 @@ class Table:
             to_pyarrow_compute_expression,
         )
 
-        data_files = self._get_all_data_files()
+        metadata = self.metadata_manager.refresh()
+        data_files = self._get_all_data_files(metadata, snapshot_id)
 
         expressions = parse_filter_dict(filter) if filter else []
         if expressions and data_files:
-            schema = self._get_current_schema()
+            schema = self._get_current_schema(metadata)
             if schema:
                 data_files = prune_files_by_bounds(data_files, expressions, schema)
 
@@ -1357,6 +1609,7 @@ class Table:
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
         verify_checksums: Optional[Union[bool, str]] = None,
+        snapshot_id: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Iterate over records one at a time.
 
@@ -1372,7 +1625,8 @@ class Table:
             Individual records as dicts
         """
         for batch in self.scan_batches(
-            batch_size=1000, columns=columns, filter=filter, verify_checksums=verify_checksums
+            batch_size=1000, columns=columns, filter=filter, verify_checksums=verify_checksums,
+            snapshot_id=snapshot_id,
         ):
             for record in batch:
                 yield record
@@ -1383,6 +1637,7 @@ class Table:
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
         verify_checksums: Optional[Union[bool, str]] = None,
+        snapshot_id: Optional[int] = None,
     ) -> Iterator[Any]:
         """Iterate over data as pandas DataFrame chunks.
 
@@ -1409,31 +1664,45 @@ class Table:
             ) from e
 
         for batch in self.scan_batches(
-            batch_size=chunksize, columns=columns, filter=filter, verify_checksums=verify_checksums
+            batch_size=chunksize, columns=columns, filter=filter, verify_checksums=verify_checksums,
+            snapshot_id=snapshot_id,
         ):
             yield pd.DataFrame(batch)
 
-    def _get_all_data_files(self) -> List[DataFile]:
-        """Get ALL data files referenced by the CURRENT snapshot.
+    def _get_all_data_files(
+        self, metadata: Optional[TableMetadata] = None, snapshot_id: Optional[int] = None
+    ) -> List[DataFile]:
+        """Get ALL data files referenced by a snapshot (current by default).
 
         Fail closed: a snapshot that references a missing or unreadable
         manifest (list) raises instead of returning partial/empty results -
         readers must be able to distinguish "empty table" from "broken table".
+        Pass `metadata` to reuse a view already read (one read per scan, #67).
         """
-        snapshot = self.current_snapshot()
-        if not snapshot:
-            # An unset current_snapshot_id means "empty table". A SET id that
-            # resolves to nothing means the metadata is inconsistent - returning
-            # [] there would report a broken table as an empty one (#48).
+        if metadata is None:
             metadata = self.metadata_manager.refresh()
-            current_id = metadata.current_snapshot_id if metadata else None
-            if current_id is not None and current_id != -1:
-                raise RuntimeError(
-                    f"Table metadata is inconsistent: current_snapshot_id {current_id} "
-                    f"does not match any snapshot in metadata.snapshots - refusing to "
-                    f"report a broken table as an empty one"
-                )
+        if metadata is None:
             return []
+        if snapshot_id is not None:
+            snapshot = next((s for s in metadata.snapshots if s.snapshot_id == snapshot_id), None)
+            if snapshot is None:
+                raise ValueError(
+                    f"Snapshot {snapshot_id} does not exist in this table (expired, or never committed)"
+                )
+        else:
+            current_id = metadata.current_snapshot_id
+            snapshot = next((s for s in metadata.snapshots if s.snapshot_id == current_id), None)
+            if snapshot is None:
+                # An unset current_snapshot_id means "empty table". A SET id that
+                # resolves to nothing means the metadata is inconsistent - returning
+                # [] there would report a broken table as an empty one (#48).
+                if current_id is not None and current_id != -1:
+                    raise RuntimeError(
+                        f"Table metadata is inconsistent: current_snapshot_id {current_id} "
+                        f"does not match any snapshot in metadata.snapshots - refusing to "
+                        f"report a broken table as an empty one"
+                    )
+                return []
 
         manifest_list_path = snapshot.manifest_list
         if manifest_list_path.startswith("/"):
@@ -1496,13 +1765,14 @@ class Table:
         """
         return self._get_all_data_files()
 
-    def _get_current_schema(self) -> Optional[Schema]:
-        """Get the current schema from metadata.
+    def _get_current_schema(self, metadata: Optional[TableMetadata] = None) -> Optional[Schema]:
+        """Get the current schema from metadata (pass a view already read to avoid a re-read).
 
         Returns:
             Current Schema object, or None if the table has no schema.
         """
-        metadata = self.metadata_manager.refresh()
+        if metadata is None:
+            metadata = self.metadata_manager.refresh()
         if metadata and metadata.schemas:
             # Find current schema by ID
             for schema in metadata.schemas:

@@ -270,8 +270,17 @@ class LocalStorageBackend(StorageBackend):
         )
 
         try:
-            # Write content to temp file
-            os.write(fd, content)
+            # Write ALL of the content: a single os.write() may write fewer bytes
+            # than asked (large buffers, network filesystems, signals), and a short
+            # metadata file would have passed fsync + rename unnoticed (#74).
+            view = memoryview(content)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            if os.fstat(fd).st_size != len(content):
+                raise IOError(
+                    f"Short write to {temp_path}: {os.fstat(fd).st_size} of {len(content)} bytes"
+                )
 
             # Ensure data is written to disk (durability guarantee)
             os.fsync(fd)
@@ -435,14 +444,24 @@ class S3RangeFile(io.RawIOBase):
 
     Wrap this in io.BufferedReader (see ``open_seekable``) so pyarrow's many
     small reads coalesce into few HTTP range requests.
+
+    SIZE IS LEARNT LAZILY (#67). Parquet readers start at the end of the file,
+    so the first request is a suffix-range GET of the last TAIL_BYTES: its
+    Content-Range header carries the object size and its body IS the footer,
+    which is cached. A small file therefore costs ONE request instead of a HEAD
+    plus two or three GETs. Pass `size` to skip the tail fetch.
     """
 
-    def __init__(self, s3: Any, bucket: str, key: str, size: int) -> None:
+    TAIL_BYTES = 64 * 1024
+
+    def __init__(self, s3: Any, bucket: str, key: str, size: Optional[int] = None) -> None:
         self._s3 = s3
         self._bucket = bucket
         self._key = key
-        self._size = size
+        self._size: Optional[int] = size
         self._pos = 0
+        self._tail: bytes = b""
+        self._tail_start = 0
 
     # --- capabilities -----------------------------------------------------
     def readable(self) -> bool:
@@ -464,7 +483,7 @@ class S3RangeFile(io.RawIOBase):
         elif whence == io.SEEK_CUR:
             new = self._pos + offset
         elif whence == io.SEEK_END:
-            new = self._size + offset
+            new = self.size() + offset
         else:
             raise ValueError(f"invalid whence: {whence}")
         if new < 0:
@@ -474,24 +493,70 @@ class S3RangeFile(io.RawIOBase):
         return self._pos
 
     def size(self) -> int:
+        if self._size is None:
+            self._fetch_tail()
+        assert self._size is not None
         return self._size
 
+    def _fetch_tail(self) -> None:
+        """Learn the object size from a suffix-range GET and cache the footer bytes."""
+        from .s3_consistency import with_s3_retry
+
+        def op() -> Tuple[int, bytes]:
+            try:
+                resp = self._s3.get_object(
+                    Bucket=self._bucket, Key=self._key, Range=f"bytes=-{self.TAIL_BYTES}"
+                )
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("NoSuchKey", "404", "NotFound"):
+                    raise FileNotFoundError(f"S3 object not found: s3://{self._bucket}/{self._key}") from e
+                if code == "InvalidRange":  # empty object: no bytes to suffix-range
+                    head = self._s3.head_object(Bucket=self._bucket, Key=self._key)
+                    return int(head["ContentLength"]), b""
+                raise
+            body = resp["Body"]
+            try:
+                data = bytes(body.read())
+            finally:
+                body.close()
+            content_range = resp.get("ContentRange") or ""
+            if "/" in content_range and content_range.rsplit("/", 1)[1].isdigit():
+                total = int(content_range.rsplit("/", 1)[1])
+            else:  # provider returned the whole object without a Content-Range
+                total = int(resp.get("ContentLength", len(data)))
+            return total, data
+
+        total, data = with_s3_retry(op, f"S3 tail read: {self._key}")
+        self._size = total
+        self._tail = data
+        self._tail_start = total - len(data)
+
     # --- reading ----------------------------------------------------------
+    def _read_span(self, first: int, last: int) -> bytes:
+        """Bytes [first, last] inclusive, served from the cached tail when possible."""
+        if self._tail and first >= self._tail_start:
+            off = first - self._tail_start
+            return self._tail[off : off + (last - first + 1)]
+        return self._get_range(first, last)
+
     def readinto(self, b: Any) -> int:
+        size = self.size()
         want = len(b)
-        if want == 0 or self._pos >= self._size:
+        if want == 0 or self._pos >= size:
             return 0
-        last = min(self._pos + want, self._size) - 1
-        data = self._get_range(self._pos, last)
+        last = min(self._pos + want, size) - 1
+        data = self._read_span(self._pos, last)
         n = len(data)
         b[:n] = data
         self._pos += n
         return n
 
     def readall(self) -> bytes:
-        if self._pos >= self._size:
+        size = self.size()
+        if self._pos >= size:
             return b""
-        data = self._get_range(self._pos, self._size - 1)
+        data = self._read_span(self._pos, size - 1)
         self._pos += len(data)
         return data
 
@@ -721,9 +786,9 @@ class S3StorageBackend(StorageBackend):
         footer, and each unbuffered read would be its own HTTP range request.
         """
         key = self._get_s3_key(path)
-        size = self.get_size(path)
+        # Size is learnt from the first (suffix-range) read - no HEAD (#67).
         return io.BufferedReader(
-            S3RangeFile(self.s3, self.bucket, key, size), buffer_size=1 << 20
+            S3RangeFile(self.s3, self.bucket, key), buffer_size=1 << 20
         )
 
     def write_file(self, path: str, content: bytes) -> None:

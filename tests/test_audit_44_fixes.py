@@ -43,7 +43,7 @@ def test_gc_via_symlinked_root_keeps_live_data(tmp_path):
     linked = ds.load_table(str(link))
     stats = linked.garbage_collect(grace_period_ms=0, allow_short_grace=True)
 
-    assert stats == {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
+    assert stats == {"data_files": 0, "manifest_files": 0, "manifest_lists": 0, "metadata_files": 0}
     # The table is still readable through both the symlink and the real path.
     assert linked.row_count() == 2
     assert ds.load_table(str(real)).scan() == [

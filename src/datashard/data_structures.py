@@ -3,11 +3,28 @@ Core data structures for the Python Iceberg implementation
 """
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+
+# Iceberg decimal type: decimal(P,S) with precision 1..38 (fits pyarrow's decimal128).
+DECIMAL_TYPE_RE = re.compile(r"^decimal\(\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)$")
+
+
+def parse_decimal_type(type_str: str) -> Optional[tuple[int, int]]:
+    """(precision, scale) for a 'decimal(P,S)' type string, else None."""
+    m = DECIMAL_TYPE_RE.match(type_str.strip()) if isinstance(type_str, str) else None
+    if not m:
+        return None
+    precision, scale = int(m.group(1)), int(m.group(2))
+    if not 1 <= precision <= 38 or not 0 <= scale <= precision:
+        raise ValueError(
+            f"Invalid decimal type '{type_str}': precision must be 1..38 and scale 0..precision"
+        )
+    return precision, scale
 
 
 class FileFormat(Enum):
@@ -38,9 +55,11 @@ class Schema:
             self.schema_string = json.dumps(self.fields)
 
         # Validate fields
+        # timestamptz (UTC-adjusted) and decimal(P,S) exist for financial data (#73):
+        # prices and quantities must not be forced into binary floating point.
         valid_primitive_types = {
             "boolean", "int", "long", "float", "double",
-            "date", "time", "timestamp", "string",
+            "date", "time", "timestamp", "timestamptz", "string",
             "uuid", "fixed", "binary"
         }
 
@@ -68,8 +87,8 @@ class Schema:
 
             f_type = field_def["type"]
             if isinstance(f_type, str):
-                if f_type not in valid_primitive_types:
-                     raise ValueError(f"Invalid schema: Unknown field type '{f_type}' in field '{field_def['name']}'. Supported primitive types: {valid_primitive_types}")
+                if f_type not in valid_primitive_types and parse_decimal_type(f_type) is None:
+                     raise ValueError(f"Invalid schema: Unknown field type '{f_type}' in field '{field_def['name']}'. Supported primitive types: {sorted(valid_primitive_types)} and decimal(P,S)")
             # We permit dict/list for complex types (struct, list, map) without deep validation for now
 
 
@@ -216,6 +235,11 @@ class TableMetadata:
     snapshots: List[Snapshot] = field(default_factory=list)
     snapshot_log: List[HistoryEntry] = field(default_factory=list)
     metadata_log: List[Dict[str, Any]] = field(default_factory=list)
+    # Unique id of the commit that wrote this metadata version. The OCC check
+    # compares it, so two metadata-only commits within the same millisecond can
+    # no longer both pass on an equal last_updated_ms (#74). Empty for versions
+    # written before 0.8.0.
+    last_commit_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.schemas:

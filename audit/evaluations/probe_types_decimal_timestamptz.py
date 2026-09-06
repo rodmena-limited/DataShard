@@ -15,12 +15,17 @@ H.quiet_logs()
 from datashard import Schema, create_table  # noqa: E402
 
 tmp = tempfile.mkdtemp(prefix="audit_types_")
-for tname in ("decimal(18,8)", "decimal", "timestamptz"):
+for tname in ("decimal(18,8)", "timestamptz"):
     try:
         Schema(schema_id=1, fields=[{"id": 1, "name": "x", "type": tname}])
         H.report(f"type-{tname}-supported", True, "accepted")
     except ValueError as e:
         H.report(f"type-{tname}-supported", False, str(e)[:90])
+try:  # Iceberg decimals carry precision and scale; a bare 'decimal' must be refused clearly
+    Schema(schema_id=1, fields=[{"id": 1, "name": "x", "type": "decimal"}])
+    H.report("bare-decimal-without-precision-is-rejected", False, "accepted without precision/scale")
+except ValueError as e:
+    H.report("bare-decimal-without-precision-is-rejected", "decimal(P,S)" in str(e), str(e)[-60:])
 schema = Schema(schema_id=1, fields=[{"id": 1, "name": "ts", "type": "timestamp", "required": True}])
 t = create_table(os.path.join(tmp, "ts"), schema)
 plus2 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone(timedelta(hours=2)))

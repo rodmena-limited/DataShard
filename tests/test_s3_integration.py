@@ -101,5 +101,5 @@ def test_s3_garbage_collect_keeps_live_data(s3_env):
     for i in range(3):
         table.append_records([{"id": i, "message": "m", "count": i}], SCHEMA)
     stats = table.garbage_collect(grace_period_ms=0, allow_short_grace=True)
-    assert stats == {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
+    assert stats == {"data_files": 0, "manifest_files": 0, "manifest_lists": 0, "metadata_files": 0}
     assert load_table(name).row_count() == 3

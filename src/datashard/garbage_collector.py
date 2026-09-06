@@ -25,9 +25,9 @@ import logging
 import time
 from typing import Dict, Set
 
-from .data_structures import ManifestFile, Snapshot
+from .data_structures import ManifestFile, Snapshot, TableMetadata
 from .file_manager import FileManager
-from .metadata_manager import MetadataManager
+from .metadata_manager import _METADATA_FILE_RE, MetadataManager
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ class GarbageCollector:
                 f"concurrent writers."
             )
 
-        stats = {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
+        stats = {"data_files": 0, "manifest_files": 0, "manifest_lists": 0, "metadata_files": 0}
 
         # 0. The clock for every age decision is taken BEFORE any storage read.
         gc_start_ms = time.time() * 1000
@@ -180,8 +180,60 @@ class GarbageCollector:
             cutoff_ms,
         )
 
+        # Superseded metadata files (v*.metadata.json outside the current version
+        # and the retained metadata log) and temp-file leftovers under metadata/.
+        stats["metadata_files"] = self._gc_metadata_files(metadata, cutoff_ms)
+
         logger.info(f"Garbage collection complete. Deleted: {stats}")
         return stats
+
+    def _gc_metadata_files(self, metadata: TableMetadata, cutoff_ms: float) -> int:
+        """Delete superseded metadata files older than the cutoff (#68).
+
+        Kept: the current metadata file, every file named in metadata_log (the
+        auditable chain, write.metadata.previous-versions-max deep), and anything
+        newer than the cutoff (a commit in flight). Everything else under
+        metadata/ that is a v*.metadata.json or a '.tmp.*' leftover is reclaimed.
+        Every commit used to leave a full metadata copy behind forever, which is
+        quadratic in the number of commits.
+        """
+        meta_dir = self.metadata_manager.metadata_path
+        keep: Set[str] = set()
+        info = self.metadata_manager._current_version_info()
+        if info is not None:
+            keep.add(f"{meta_dir}/{info[1]}")
+        for entry in metadata.metadata_log:
+            named = entry.get("metadata-file") if isinstance(entry, dict) else None
+            if named:
+                keep.add(self._normalize_path(named))
+
+        try:
+            listed = self.storage.list_files(meta_dir)
+        except Exception as e:
+            raise GarbageCollectionAborted(
+                f"Aborting GC: cannot list files under {meta_dir}: {e}"
+            ) from e
+
+        deleted = 0
+        for rel in listed:
+            norm = self._normalize_path(rel)
+            parent, _, base = norm.rpartition("/")
+            if parent != meta_dir:
+                continue  # manifests/, inflight/ are handled elsewhere
+            if not (_METADATA_FILE_RE.match(base) or base.startswith(".tmp.")):
+                continue
+            if norm in keep:
+                continue
+            try:
+                if self.storage.get_modified_time(norm) * 1000 < cutoff_ms:
+                    logger.debug(f"Deleting superseded metadata file: {norm}")
+                    self.storage.delete_file(norm)
+                    deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to process superseded metadata file {norm}: {e}")
+        if deleted:
+            logger.info(f"Deleted {deleted} superseded metadata file(s) under {meta_dir}")
+        return deleted
 
     def _load_inflight_protection(self, inflight_timeout_ms: int, now_ms: float) -> Set[str]:
         """Collect paths protected by fresh in-flight markers.
