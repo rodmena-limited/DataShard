@@ -491,6 +491,30 @@ with table.new_transaction() as tx:
     tx.commit()
 ```
 
+### Analytics with DuckDB
+
+```python
+# pip install datashard[duckdb]
+table.sql("SELECT symbol, sum(qty) AS qty FROM t GROUP BY 1")      # -> pyarrow.Table
+table.sql("SELECT count(*) FROM trades", alias="trades", snapshot_id=old_id)
+
+arrow = table.to_arrow(filter={"status": "failed"}, columns=["id", "ts"])   # verified read
+con = table.to_duckdb(view_name="trades")                                   # your own connection
+con.execute("SELECT ... FROM trades JOIN other ...")
+
+# Fast path: let DuckDB read the parquet files itself (no page-CRC verification)
+paths = table.parquet_paths()
+con.execute(table.duckdb_s3_secret_sql())            # S3 tables: credentials for httpfs
+con.execute("SELECT count(*) FROM read_parquet($p)", {"p": paths})
+
+# Ingest from Arrow producers (DuckDB results, Polars, pyarrow) without a dict round trip
+table.append_arrow(con.execute("SELECT ...").fetch_arrow_table())
+```
+
+`scan()` returns Python dicts and is meant for small results; analytics belongs in
+`to_arrow()` / `sql()`. Batch thousands of rows per append: a commit costs a fixed
+handful of round trips whatever its size.
+
 ### Reading Data
 
 ```python

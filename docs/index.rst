@@ -18,6 +18,7 @@ Welcome to the official documentation for **datashard**, a Python implementation
    transactions
    schemas
    time_travel
+   duckdb
    concurrency
    s3_storage
 

@@ -5,6 +5,32 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-06
+
+First release of the uplift plan: DuckDB as the analytics layer and Arrow as the
+ingestion path. No format change; 0.8.x tables read unchanged.
+
+### Added
+
+- `Table.to_arrow(columns, filter, parallel, verify_checksums, snapshot_id)` - the
+  verified read path as a `pyarrow.Table` (schema-preserving when empty).
+- `Table.to_duckdb(connection=None, view_name="t", **scan_kwargs)` and
+  `Table.sql(query, alias="t", **scan_kwargs)` - run DuckDB SQL over the table, results as
+  Arrow; `Table.parquet_paths(snapshot_id)` and `Table.duckdb_s3_secret_sql()` for DuckDB's
+  native `read_parquet` fast path (documented as bypassing page-CRC verification). New extra
+  `datashard[duckdb]`.
+- `Transaction.append_arrow(table)` / `Table.append_arrow(table)` - Arrow tables written in
+  one pass: unknown columns refused, absent optional columns null-filled, columns reordered
+  and cast to the table's types (a DuckDB result appends as is); `append_pandas` now shares
+  this writer.
+
+### Changed
+
+- A commit's manifest and manifest-list GC markers are written in one concurrent batch on
+  S3 (`StorageBackend.write_files`). S3 calls per single-row append stay at 16; OVH
+  single-writer p50 3.08 s -> 3.02 s. The other calls depend on each other, so latency
+  moves substantially only with the 0.10 commit-protocol change.
+
 ## [0.8.1] - 2026-09-06
 
 Re-audit of 0.8.0 (issuedb #75): the remediation itself was put under the same

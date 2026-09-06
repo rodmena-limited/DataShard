@@ -273,6 +273,40 @@ class DataFileManager:
             return os.path.relpath(validated, self.storage._real_base_path()).replace(os.sep, "/")
         return file_path.replace("\\", "/").lstrip("/")
 
+    @staticmethod
+    def _type_family(t: pa.DataType) -> str:
+        pt = pa.types
+        if pt.is_boolean(t):
+            return "bool"
+        if pt.is_integer(t) or pt.is_floating(t) or pt.is_decimal(t):
+            return "number"
+        if pt.is_timestamp(t):
+            return "timestamp"
+        if pt.is_date(t):
+            return "date"
+        if pt.is_time(t):
+            return "time"
+        if pt.is_string(t) or pt.is_large_string(t):
+            return "string"
+        if pt.is_binary(t) or pt.is_large_binary(t) or pt.is_fixed_size_binary(t):
+            return "binary"
+        if pt.is_null(t):
+            return "null"
+        return str(t)
+
+    @classmethod
+    def _check_cast_family(cls, name: str, source: pa.DataType, target: pa.DataType) -> None:
+        """Refuse cross-family coercions pyarrow would perform silently: the string "12"
+        must not become the integer 12, an int must not become text. Widening inside a
+        family (int32 -> long, float -> double, decimal precision) and null columns are fine.
+        """
+        src, dst = cls._type_family(source), cls._type_family(target)
+        if src != "null" and src != dst:
+            raise ValueError(
+                f"Column '{name}' is {source} but the table field is {target}; refusing to coerce "
+                f"across type families - convert it explicitly before appending"
+            )
+
     def write_data_file(
         self,
         file_path: str,
@@ -341,6 +375,8 @@ class DataFileManager:
         for field in arrow_schema:
             if field.name not in table.column_names:
                 table = table.append_column(field.name, pa.nulls(table.num_rows, type=field.type))
+            else:
+                self._check_cast_family(field.name, table.schema.field(field.name).type, field.type)
         try:
             table = table.select(arrow_schema.names).cast(arrow_schema)
         except _SCHEMA_MISMATCH_ERRORS as e:

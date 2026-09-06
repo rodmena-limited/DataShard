@@ -97,10 +97,16 @@ def test_append_arrow_rejects_unknown_columns_nulls_in_required_and_bad_types(tm
         t.append_arrow(pa.table({"symbol": ["X"], "qty": [1], "extra": [1]}))
     with pytest.raises(ValueError, match="null"):
         t.append_arrow(pa.table({"symbol": ["X"], "qty": pa.array([None], pa.int64())}))
+    with pytest.raises(ValueError, match="type families"):
+        t.append_arrow(pa.table({"symbol": ["X"], "qty": ["12"]}))  # would silently become 12
+    with pytest.raises(ValueError, match="type families"):
+        t.append_arrow(pa.table({"symbol": [7], "qty": [1]}))  # int into a string field
     with pytest.raises(ValueError, match="not compatible"):
-        t.append_arrow(pa.table({"symbol": ["X"], "qty": ["not a number"]}))
+        t.append_arrow(pa.table({"symbol": ["X"], "qty": [1.5]}))  # fractional into long
     assert t.append_arrow(pa.table({"symbol": pa.array([], pa.string()), "qty": pa.array([], pa.int64())})) is True
     assert len(t.snapshots()) == 0  # empty append queued nothing
+    t.append_arrow(pa.table({"symbol": ["OK"], "qty": pa.array([2.0], pa.float64())}))  # whole float widens
+    assert t.to_arrow().to_pylist() == [{"symbol": "OK", "qty": 2, "px": None}]
 
 
 def test_duckdb_result_round_trips_into_the_table(tmp_path):
