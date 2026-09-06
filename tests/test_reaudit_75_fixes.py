@@ -41,8 +41,8 @@ def test_gc_keeps_metadata_chain_when_a_commit_lands_during_gc(tmp_path):
     after = load_table(path)
     for entry in after.metadata_manager.refresh().metadata_log:
         assert os.path.exists(os.path.join(path, entry["metadata-file"])), entry
-    versions = sorted(int(os.path.basename(f)[1:].split("-")[0]) for f in glob.glob(str(meta / "v*.json")))
-    assert versions[-1] == 16 and versions[0] >= 16 - 10  # the retention window survived
+    versions = sorted(int(os.path.basename(f)[1:].split(".")[0]) for f in glob.glob(str(meta / "v*.json")))
+    assert versions[-1] == 17 and versions[0] >= 17 - 10  # v1 create + 16 commits; the retention window survived
     assert after.row_count() == 16
 
 

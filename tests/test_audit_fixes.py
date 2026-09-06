@@ -188,7 +188,7 @@ def test_scan_fails_closed_on_missing_manifest(tmp_path):
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "x"}])
     # Delete a manifest referenced by the current snapshot
-    for m in glob.glob(str(tmp_path / "t" / "metadata" / "manifests" / "manifest_*.avro")):
+    for m in glob.glob(str(tmp_path / "t" / "metadata" / "*-m0.avro")):
         os.remove(m)
     with pytest.raises((RuntimeError, OSError)):
         t.scan(verify_checksums=False)
@@ -199,7 +199,7 @@ def test_gc_fails_closed_on_unreadable_manifest(tmp_path):
     import glob
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "x"}])
-    manifests = glob.glob(str(tmp_path / "t" / "metadata" / "manifests" / "manifest_*.avro"))
+    manifests = glob.glob(str(tmp_path / "t" / "metadata" / "*-m0.avro"))
     with open(manifests[0], "r+b") as f:
         f.seek(0)
         f.write(b"garbage-not-avro")
@@ -222,7 +222,7 @@ def test_recovers_from_corrupt_version_hint(tmp_path):
     t = _table(tmp_path)
     for i in range(2):
         t.append_records([{"id": i, "name": "n"}])
-    hint = tmp_path / "t" / "metadata.version-hint.text"
+    hint = tmp_path / "t" / "metadata" / "version-hint.text"
     hint.write_text("not-a-number")
     reopened = ds.load_table(str(tmp_path / "t"))
     assert reopened.row_count() == 2
@@ -231,7 +231,7 @@ def test_recovers_from_corrupt_version_hint(tmp_path):
 def test_create_table_does_not_destroy_existing_on_bad_hint(tmp_path):
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "x"}])
-    (tmp_path / "t" / "metadata.version-hint.text").write_text("garbage")
+    (tmp_path / "t" / "metadata" / "version-hint.text").write_text("garbage")
     again = ds.create_table(str(tmp_path / "t"), schema=_schema())
     assert again.row_count() == 1
 

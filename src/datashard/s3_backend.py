@@ -445,7 +445,7 @@ class S3StorageBackend(StorageBackend):
 
         from .s3_consistency import with_s3_retry
 
-        key = self._get_s3_key("metadata.version-hint.text")
+        key = self._get_s3_key("metadata/version-hint.text")
 
         def head_op() -> Dict[str, Any]:
             try:

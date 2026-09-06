@@ -144,6 +144,7 @@ class _CommitOpsMixin:
                         existing_files=surviving_files,
                         sequence_number=sequence_number,
                         pre_write_hook=self._register_inflight,
+                        table_metadata=base_metadata,
                     )
                     new_manifest.partition_spec_id = manifest.partition_spec_id
                     final_manifests.append(new_manifest)
@@ -167,7 +168,7 @@ class _CommitOpsMixin:
         if compact or (threshold and len(final_manifests) >= threshold):
             if len(final_manifests) >= 2:
                 final_manifests = [
-                    self._compact_manifests(final_manifests, snapshot_id, sequence_number)
+                    self._compact_manifests(final_manifests, snapshot_id, sequence_number, base_metadata)
                 ]
             elif compact and not append_files and not deleted_paths:
                 return False  # nothing to compact, nothing else to commit
@@ -188,21 +189,35 @@ class _CommitOpsMixin:
                 snapshot_id,
                 sequence_number=sequence_number,
                 manifest_path=append_manifest_path,
+                table_metadata=base_metadata,
             )
             final_manifests.append(new_append_manifest)
 
         # 4. Create the manifest list (ALL active manifests for the table). Its
         # length and sha256 go into the snapshot summary so a damaged list is
         # rejected on read instead of yielding a partial file set (#58).
+        parent_id = base_metadata.current_snapshot_id
         list_info = self.file_manager.create_manifest_list(
-            final_manifests, snapshot_id, list_path=list_path
+            final_manifests,
+            snapshot_id,
+            list_path=list_path,
+            parent_snapshot_id=parent_id if parent_id not in (None, -1) else None,
+            sequence_number=sequence_number,
+            location=base_metadata.location,
         )
 
-        # 5. Commit the snapshot - with the SAME id stamped into the manifests.
+        # 5. Commit the snapshot - with the SAME id stamped into the manifests. The
+        # summary carries Iceberg's standard counters plus datashard's list integrity.
         operation = "append" if append_files else ("delete" if deleted_paths else "replace")
+        summary = list_info.summary()
+        summary["added-data-files"] = str(len(append_files))
+        summary["added-records"] = str(sum(df.record_count for df in append_files))
+        summary["added-files-size"] = str(sum(df.file_size_in_bytes for df in append_files))
+        summary["total-data-files"] = str(sum(m.added_data_files_count + m.existing_data_files_count for m in final_manifests))
+        summary["total-records"] = str(sum((m.added_rows_count or 0) + (m.existing_rows_count or 0) for m in final_manifests))
         self.snapshot_manager.create_snapshot(
             manifest_list_path=list_info.path,
-            summary=list_info.summary(),
+            summary=summary,
             operation=operation,
             parent_snapshot_id=(
                 base_metadata.current_snapshot_id
@@ -228,7 +243,11 @@ class _CommitOpsMixin:
             return DEFAULT_MANIFEST_COMPACTION_THRESHOLD
 
     def _compact_manifests(
-        self, manifests: List[ManifestFile], snapshot_id: int, sequence_number: int
+        self,
+        manifests: List[ManifestFile],
+        snapshot_id: int,
+        sequence_number: int,
+        base_metadata: Optional[TableMetadata] = None,
     ) -> ManifestFile:
         """Rewrite `manifests` into one manifest of EXISTING entries."""
         entries: List[DataFile] = []
@@ -251,6 +270,7 @@ class _CommitOpsMixin:
             existing_files=entries,
             sequence_number=sequence_number,
             pre_write_hook=self._register_inflight,
+            table_metadata=base_metadata,
         )
         logger.info(f"Compacted {len(manifests)} manifests ({len(entries)} files) into {merged.manifest_path}")
         return merged

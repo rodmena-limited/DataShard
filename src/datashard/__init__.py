@@ -30,15 +30,19 @@ from .metadata_manager import (
     AmbiguousCommitError,
     AmbiguousMetadataError,
     ConcurrentModificationException,
+    LegacyLayoutError,
     SchemaMismatchError,
     TableExistsError,
 )
+from .migrate import migrate_table
 from .table import Table
 from .transaction import Transaction
 
 __all__ = [
     "create_table",
     "load_table",
+    "migrate_table",
+    "LegacyLayoutError",
     "DataFile",
     "FileFormat",
     "Schema",

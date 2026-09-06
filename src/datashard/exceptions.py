@@ -44,3 +44,10 @@ class AmbiguousCommitError(Exception):
     pass
 
 
+
+
+class LegacyLayoutError(Exception):
+    """Raised when a table still uses the pre-0.10 datashard layout. Run
+    'datashard migrate <table>' once; there is no downgrade afterwards (#86, #89)."""
+
+    pass

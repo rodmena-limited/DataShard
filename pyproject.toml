@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.9.1"
+version = "0.10.0"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts with S3 support"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -58,6 +58,8 @@ dev = [
     "boto3>=1.26.0",
     "moto[server]>=5.0",
     "duckdb>=1.1",
+    # the foreign-reader acceptance probe needs a second, independent Iceberg reader
+    "pyiceberg[sql-sqlite]>=0.12",
 ]
 docs = [
     "sphinx>=4.0",

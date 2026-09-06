@@ -73,7 +73,10 @@ class _DuckDBMixin:
         con = duckdb.connect()
         try:
             self.to_duckdb(con, view_name=alias, **scan_kwargs)
-            return con.execute(query).fetch_arrow_table()
+            result = con.execute(query)
+            # duckdb >= 1.5 deprecates fetch_arrow_table() in favour of to_arrow_table()
+            fetch = getattr(result, "to_arrow_table", None) or result.fetch_arrow_table
+            return fetch()
         finally:
             con.close()
 

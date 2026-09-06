@@ -4,6 +4,7 @@ Each test is the unit-sized twin of a live probe under audit/evaluations/.
 """
 import glob
 import io
+import json
 import os
 import shutil
 import time
@@ -52,7 +53,7 @@ def _age(path, seconds=7200):
 
 
 def _manifests(tmp_path, name="t"):
-    return sorted(glob.glob(str(tmp_path / name / "metadata" / "manifests" / "*.avro")))
+    return sorted(glob.glob(str(tmp_path / name / "metadata" / "*.avro")))
 
 
 # ---------------------------------------------------------------- #56
@@ -139,8 +140,8 @@ def test_manifest_list_integrity_recorded_and_enforced(tmp_path):
     t = _table(tmp_path)
     t.append_records([{"id": 1}], SCHEMA)
     snap = t.current_snapshot()
-    assert snap.summary["manifest-list-length"].isdigit()
-    assert len(snap.summary["manifest-list-sha256"]) == 64
+    assert snap.summary["datashard.manifest-list-length"].isdigit()
+    assert len(snap.summary["datashard.manifest-list-sha256"]) == 64
     (tmp_path / "t" / snap.manifest_list).write_bytes(b"Obj\x01 not really avro")
     with pytest.raises(CorruptDataError):
         t.scan()
@@ -149,40 +150,55 @@ def test_manifest_list_integrity_recorded_and_enforced(tmp_path):
 
 
 # ---------------------------------------------------------------- #60
-def test_clean_commit_failure_removes_its_metadata_file(tmp_path):
+def test_clean_commit_failure_leaves_no_metadata_file(tmp_path):
+    """#86: the commit point is the exclusive create of v{N}.metadata.json. A failure
+    there is clean (nothing visible); a hint failure AFTER it is not a failure at all."""
     t = _table(tmp_path)
     t.append_records([{"id": 1}], SCHEMA)
     before = set(os.listdir(tmp_path / "t" / "metadata"))
-    real_write = t.storage.write_file
+    real_create = t.storage.create_exclusive
 
-    def failing_hint(path, content):
-        if path == t.metadata_manager.HINT_PATH:
-            raise OSError("simulated disk error at the commit point")
-        return real_write(path, content)
+    def failing_create(path, content):
+        raise OSError("simulated disk error at the commit point")
 
-    t.storage.write_file = failing_hint
+    t.storage.create_exclusive = failing_create
     with pytest.raises(OSError):
         t.append_records([{"id": 2}], SCHEMA)
-    t.storage.write_file = real_write
+    t.storage.create_exclusive = real_create
     new_files = {f for f in os.listdir(tmp_path / "t" / "metadata") if f.endswith(".metadata.json")} - before
     assert not new_files
     assert t.row_count() == 1
 
+    real_write = t.storage.write_file
 
-def test_ambiguous_hint_recovery_refuses_and_repair_restores(tmp_path):
+    def failing_hint(path, content):
+        if path == t.metadata_manager.HINT_PATH:
+            raise OSError("simulated disk error writing the hint")
+        return real_write(path, content)
+
+    t.storage.write_file = failing_hint
+    assert t.append_records([{"id": 2}], SCHEMA) is True  # committed: the hint is advisory
+    t.storage.write_file = real_write
+    assert (tmp_path / "t" / "metadata" / "version-hint.text").read_text() == "2"  # lagging
+    assert load_table(str(tmp_path / "t")).row_count() == 2  # a reader probes past the hint...
+    assert (tmp_path / "t" / "metadata" / "version-hint.text").read_text() == "3"  # ...and heals it
+
+
+def test_missing_or_stale_hint_is_healed_and_repair_still_works(tmp_path):
+    """#86: versions are unique by construction (exclusive create), so a lost hint is
+    recovered from the listing and a stale one by probing - never ambiguous."""
     t = _table(tmp_path)
     t.append_records([{"id": 1}], SCHEMA)
-    v1 = t.metadata_manager._current_version_info()[1]
     t.append_records([{"id": 2}], SCHEMA)
-    v2 = t.metadata_manager._current_version_info()[1]
-    meta = tmp_path / "t" / "metadata"
-    shutil.copy(meta / v1, meta / "v2-deadbeef.metadata.json")  # a crashed racer's leftover
-    os.remove(tmp_path / "t" / "metadata.version-hint.text")
-    with pytest.raises(AmbiguousMetadataError, match="v2-deadbeef"):
-        load_table(str(tmp_path / "t"))
-    t.repair_version_hint(v2)
+    hint = tmp_path / "t" / "metadata" / "version-hint.text"
+    os.remove(hint)
+    assert load_table(str(tmp_path / "t")).row_count() == 2
+    assert hint.read_text() == "3"
+    hint.write_text("1")
+    assert load_table(str(tmp_path / "t")).row_count() == 2
+    assert hint.read_text() == "3"
+    t.repair_version_hint("v3.metadata.json")
     fixed = load_table(str(tmp_path / "t"))
-    assert fixed.row_count() == 2
     fixed.append_records([{"id": 3}], SCHEMA)
     assert load_table(str(tmp_path / "t")).row_count() == 3
     with pytest.raises(ValueError):
@@ -423,10 +439,13 @@ def test_lost_occ_attempt_removes_its_manifests(tmp_path):
 
 
 def test_local_write_is_complete_even_with_short_os_write(tmp_path, monkeypatch):
-    import datashard.storage_backend as sb
+    import datashard.local_backend as lb
 
     real_write = os.write
-    monkeypatch.setattr(sb.os, "write", lambda fd, buf: real_write(fd, memoryview(buf)[:7]))
-    t = _table(tmp_path)  # every metadata/hint write goes through the loop
-    t.append_records([{"id": 1}], SCHEMA)
+    monkeypatch.setattr(lb.os, "write", lambda fd, buf: real_write(fd, memoryview(buf)[:7]))
+    t = _table(tmp_path)  # create_table + every metadata/hint write goes through the loop
+    t.append_records([{"id": 1}], SCHEMA)  # commit point (create_exclusive) too
     assert load_table(t.table_path).row_count() == 1
+    meta = tmp_path / "t" / "metadata"
+    for f in meta.glob("v*.metadata.json"):
+        assert json.loads(f.read_text())["format-version"] == 2, f  # not truncated

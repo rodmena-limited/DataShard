@@ -30,7 +30,7 @@ H.report(
 for i in range(20):
     t.append_records([{"id": i, "name": "x", "value": 1.0}], schema)
 n_before = len(t.snapshots())
-lists_before = len(glob.glob(os.path.join(path, "metadata", "manifests", "manifest_list_*.avro")))
+lists_before = len(glob.glob(os.path.join(path, "metadata", "snap-*.avro")))
 time.sleep(0.05)
 with t.new_transaction() as tx:
     tx.expire_snapshots(older_than_ms=int(time.time() * 1000))
@@ -39,7 +39,7 @@ n_after = len(t.snapshots())
 H.report("expire_snapshots-removes-old-snapshots-keeps-current", n_after == 1 and n_before == 20, f"snapshots {n_before}->{n_after}")
 time.sleep(0.05)
 stats = t.garbage_collect(grace_period_ms=0, allow_short_grace=True)
-lists_after = len(glob.glob(os.path.join(path, "metadata", "manifests", "manifest_list_*.avro")))
+lists_after = len(glob.glob(os.path.join(path, "metadata", "snap-*.avro")))
 rows = load_table(path).row_count()
 H.report(
     "gc-after-expiry-reclaims-unreachable-manifest-lists-and-keeps-data",

@@ -141,9 +141,10 @@ def test_gc_protects_in_flight_manifests(tmp_path):
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "a"}])
 
-    manifests_dir = tmp_path / "t" / "metadata" / "manifests"
+    manifests_dir = tmp_path / "t" / "metadata" / "manifests"  # pre-0.10 location, still swept
     inflight_dir = tmp_path / "t" / "metadata" / "inflight"
     os.makedirs(inflight_dir, exist_ok=True)
+    os.makedirs(manifests_dir, exist_ok=True)
 
     # Simulate a commit that wrote its manifest but has not committed metadata.
     pending = manifests_dir / "manifest_pending_1.avro"
@@ -161,7 +162,7 @@ def test_gc_still_collects_unprotected_orphan_manifest(tmp_path):
     """The protection above must not turn GC into a no-op."""
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "a"}])
-    orphan = tmp_path / "t" / "metadata" / "manifests" / "manifest_orphan.avro"
+    orphan = tmp_path / "t" / "metadata" / "manifest_orphan.avro"
     orphan.write_bytes(b"orphan manifest")
     old = time.time() - 7200
     os.utime(orphan, (old, old))

@@ -2,7 +2,8 @@
 
 Counts the S3 API calls datashard's boto3 client issues per operation against a moto
 server. Budget (0.8.0, CAS backend): a single-row append <= 20 calls (was 37 + pyarrow's
-own PUTs), a 5-file scan <= 15, current_snapshot() <= 2. Markers (3 PUT + 1 bulk
+own PUTs), a 5-file scan <= 15, current_snapshot() <= 3 (0.10 adds one HEAD for the
+read-your-writes probe past the version hint). Markers (3 PUT + 1 bulk
 DELETE) and the lock (PUT / GET+DELETE) are the deliberate remainder.
 """
 import collections
@@ -55,7 +56,11 @@ H.report(
     f"{n_scan} boto3 calls in {dt * 1000:.0f} ms: {by_op}",
 )
 dt, by_op, n_cur = measure(lambda: t.current_snapshot())
-H.report("current_snapshot-costs-at-most-2-calls", n_cur <= 2, f"{n_cur} calls: {by_op}")
+# 0.10: a READ costs one more call than the two object reads (hint + metadata): a HEAD
+# for v{N+1}, so a hint that lags a durable commit (writer died between its metadata
+# write and its hint write) can never hide committed rows. The write path does NOT pay
+# it - a commit conflict heals the hint instead - so an append still costs 16 (#86).
+H.report("current_snapshot-costs-at-most-3-calls", n_cur <= 3, f"{n_cur} calls: {by_op}")
 dt, by_op, n_gc = measure(lambda: t.garbage_collect())
 print(f"  info: garbage_collect() on a 5-file table = {n_gc} calls in {dt * 1000:.0f} ms: {by_op}")
 H.finish()

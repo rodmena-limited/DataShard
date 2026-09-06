@@ -84,6 +84,8 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
         # Metadata read while resolving the schema doubles as the first commit
         # attempt's OCC base; a stale base just retries with a fresh read (#67).
         self._base_metadata_cache: Optional[TableMetadata] = None
+        # Schema a schema-less table adopts with this transaction's first append
+        self._adopted_schema: Optional[Schema] = None
 
         self._lock = threading.RLock()
 
@@ -108,6 +110,7 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
             self._schema_cache = None
             self._schema_cache_set = False
             self._base_metadata_cache = None
+            self._adopted_schema = None
 
             return self
 
@@ -253,6 +256,9 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
                         mutators.append(self._make_expire_mutator(plan.expire_cutoff, plan.retain_last))
                     if plan.properties:
                         mutators.append(self._make_properties_mutator(plan.properties))
+                    if self._adopted_schema is not None and plan.append_files:
+                        base_metadata = self._with_adopted_schema(base_metadata, self._adopted_schema)
+                        mutators.append(self._make_schema_mutator(self._adopted_schema))
                     mutator = self._chain_mutators(mutators)
 
                     committed = False
@@ -383,6 +389,46 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
                 logger.debug(f"Marker cleanup failed (GC sweeps leftovers): {e}")
         self._inflight_markers = []
 
+    @staticmethod
+    def _with_adopted_schema(base: TableMetadata, schema: Schema) -> TableMetadata:
+        """A view of `base` carrying `schema` as its current schema - used for the
+        manifest headers of this commit; the OCC fields are untouched so the commit
+        still validates against the real base."""
+        view = copy.deepcopy(base)
+        Transaction._make_schema_mutator(schema)(view)
+        return view
+
+    @staticmethod
+    def _make_schema_mutator(schema: Schema) -> Callable[[TableMetadata], None]:
+        from .metadata_serde import (
+            NAME_MAPPING_PROPERTY,
+            check_iceberg_representable,
+            name_mapping_json,
+        )
+
+        check_iceberg_representable(schema)
+
+        def mutator(metadata: TableMetadata) -> None:
+            current = next((s for s in metadata.schemas if s.schema_id == metadata.current_schema_id), None)
+            if current is not None and current.fields:
+                # Another writer persisted a schema between our append and this commit.
+                # Identical is fine (nothing to adopt); different means the file we just
+                # wrote does not match the table, so fail before the commit point rather
+                # than commit a file every later scan would choke on.
+                if Transaction._schema_signature(current) != Transaction._schema_signature(schema):
+                    raise ValueError(
+                        "Another writer persisted a different schema for this table while this "
+                        f"transaction was in flight. Table fields: {[f.get('name') for f in current.fields]}; "
+                        f"this append wrote: {[f.get('name') for f in schema.fields]}. Nothing was committed."
+                    )
+                return
+            metadata.schemas = [s for s in metadata.schemas if s.fields] + [schema]
+            metadata.current_schema_id = schema.schema_id
+            metadata.last_column_id = max(metadata.last_column_id, max((int(f["id"]) for f in schema.fields), default=0))
+            metadata.properties[NAME_MAPPING_PROPERTY] = name_mapping_json(schema)
+
+        return mutator
+
     def _deep_copy_metadata(self, metadata: TableMetadata) -> TableMetadata:
         """Create a deep copy of metadata for transaction isolation"""
         return copy.deepcopy(metadata)
@@ -399,59 +445,15 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
             self.commit()
 
 
-class TransactionManager:
-    """Manages multiple transactions and ensures ACID compliance"""
-
-    def __init__(
-        self,
-        metadata_manager: MetadataManager,
-        snapshot_manager: SnapshotManager,
-        file_manager: FileManager,
-    ):
-        self.metadata_manager = metadata_manager
-        self.snapshot_manager = snapshot_manager
-        self.file_manager = file_manager
-        self._active_transactions: Dict[int, "Transaction"] = {}
-        self._lock = threading.RLock()
-
-    def begin_transaction(self) -> Transaction:
-        """Begin a new transaction"""
-        with self._lock:
-            # Evict finished transactions so long-running processes don't leak
-            # one Transaction object per commit.
-            self._cleanup_locked()
-
-            transaction = Transaction(
-                self.metadata_manager, self.snapshot_manager, self.file_manager
-            )
-            transaction_id = id(transaction)
-            self._active_transactions[transaction_id] = transaction
-            return transaction
-
-    def get_active_transactions(self) -> List[Transaction]:
-        """Get all active transactions"""
-        with self._lock:
-            return [tx for tx in self._active_transactions.values() if tx.is_active()]
-
-    def cleanup_completed_transactions(self) -> None:
-        """Remove completed/failed transactions from tracking"""
-        with self._lock:
-            self._cleanup_locked()
-
-    def _cleanup_locked(self) -> None:
-        completed_ids = [
-            tx_id for tx_id, tx in self._active_transactions.items() if not tx.is_active()
-        ]
-        for tx_id in completed_ids:
-            del self._active_transactions[tx_id]
-
-
-
-
 def __getattr__(name: str) -> Any:
-    """`Table` moved to datashard.table (#71); keep `datashard.transaction.Table` importable."""
+    """`Table` moved to datashard.table and TransactionManager to transaction_manager
+    (#71, #86); both stay importable from here."""
     if name == "Table":
         from .table import Table
 
         return Table
+    if name == "TransactionManager":
+        from .transaction_manager import TransactionManager
+
+        return TransactionManager
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

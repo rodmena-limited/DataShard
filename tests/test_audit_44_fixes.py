@@ -170,7 +170,8 @@ def _break_current_snapshot_id(table_dir):
     latest = versions[-1]
     with open(latest) as f:
         meta = json.load(f)
-    meta["current_snapshot_id"] = 123456789
+    meta["current-snapshot-id"] = 123456789
+    meta["refs"] = {}
     with open(latest, "w") as f:
         json.dump(meta, f, indent=2)
 

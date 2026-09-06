@@ -26,7 +26,7 @@ def test_s3_storage_create_table(s3_env):
     assert table.created
     assert table.current_snapshot() is None  # initialised, empty
     # The hint and the v0 metadata are real objects under the table prefix.
-    assert table.storage.exists("metadata.version-hint.text")
+    assert table.storage.exists("metadata/version-hint.text")
     assert any(k.endswith(".metadata.json") for k in s3_env.keys_under(name + "/metadata/"))
     assert load_table(name).row_count() == 0
 

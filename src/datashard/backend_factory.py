@@ -6,8 +6,9 @@ the 500-line file cap, #71).
 import os
 from typing import Optional
 
+from .local_backend import LocalStorageBackend
 from .logging_config import get_logger
-from .storage_backend import LocalStorageBackend, StorageBackend
+from .storage_backend import StorageBackend
 
 logger = get_logger(__name__)
 

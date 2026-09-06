@@ -14,7 +14,8 @@ from .logging_config import get_logger
 from .metadata_manager import MetadataManager
 from .snapshot_manager import SnapshotManager
 from .table_scan import _ScanMixin
-from .transaction import Transaction, TransactionManager
+from .transaction import Transaction
+from .transaction_manager import TransactionManager
 
 logger = get_logger(__name__)
 
@@ -61,13 +62,28 @@ class Table(_ScanMixin, _DuckDBMixin):
     ) -> None:
         """Initialize a new table, persisting the provided schema/partition spec."""
         from .metadata_manager import TableExistsError
+        from .metadata_serde import (
+            NAME_MAPPING_PROPERTY,
+            check_iceberg_representable,
+            name_mapping_json,
+        )
 
+        if partition_spec is not None and getattr(partition_spec, "fields", None):
+            raise NotImplementedError(
+                "Partition specs with fields are not supported by this version "
+                "(partitioning by value ships in 0.11)"
+            )
         if schema is not None:
+            check_iceberg_representable(schema)
             initial_metadata = TableMetadata(
                 location=self.table_path,
                 schemas=[schema],
                 current_schema_id=schema.schema_id,
                 partition_specs=[partition_spec] if partition_spec is not None else [],
+                last_column_id=max((int(f["id"]) for f in schema.fields), default=0),
+                # Parquet files without field ids (append_files from another writer)
+                # still resolve in DuckDB / pyiceberg through the name mapping (#88).
+                properties={NAME_MAPPING_PROPERTY: name_mapping_json(schema)},
             )
         else:
             initial_metadata = TableMetadata(
@@ -201,9 +217,22 @@ class Table(_ScanMixin, _DuckDBMixin):
         return tx.did_commit_snapshot
 
     def repair_version_hint(self, metadata_file: str) -> None:
-        """Operator action after AmbiguousMetadataError: declare which metadata file
-        is the committed one (see MetadataManager.repair_version_hint)."""
+        """Operator action: point the version hint at a metadata version (see
+        MetadataManager.repair_version_hint). Readers heal a stale hint by themselves."""
         self.metadata_manager.repair_version_hint(metadata_file)
+
+    def relocate(self) -> Dict[str, int]:
+        """Rewrite the metadata so its recorded location is where the table lives
+        NOW (after a move / bucket rename). datashard reads a moved table anyway;
+        this makes foreign readers work without allow_moved_paths (#87)."""
+        from .migrate import relocate_table
+
+        return relocate_table(self)
+
+    @property
+    def location(self) -> str:
+        """The table's location URI as foreign readers see it (file:///... or s3://...)."""
+        return self.metadata_manager.recorded_location or self.metadata_manager.location_uri
 
     def garbage_collect(
         self, grace_period_ms: int = 3600000, allow_short_grace: bool = False

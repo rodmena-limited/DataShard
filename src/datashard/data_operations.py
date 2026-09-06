@@ -14,9 +14,10 @@ from .column_stats import compute_column_bounds
 from .data_io import PANDAS_AVAILABLE, DataFileReader, DataFileWriter, pd
 from .data_structures import DataFile, FileFormat, Schema
 from .integrity import IntegrityChecker
+from .local_backend import LocalStorageBackend
 from .logging_config import get_logger
 from .s3_backend import S3StorageBackend
-from .storage_backend import LocalStorageBackend, StorageBackend
+from .storage_backend import StorageBackend
 
 if TYPE_CHECKING:
     from .file_manager import FileManager
@@ -196,7 +197,12 @@ class DataFileManager:
             # Check if field is required
             is_nullable = not field_dict.get("required", False)
 
-            fields.append(pa.field(field_name, arrow_type, nullable=is_nullable))
+            # Iceberg readers resolve columns by field id (#88); without it DuckDB
+            # returns all-NULL rows silently (spike #83).
+            fields.append(pa.field(
+                field_name, arrow_type, nullable=is_nullable,
+                metadata={b"PARQUET:field_id": str(field_id).encode("utf-8")},
+            ))
 
         schema = pa.schema(fields)
         self._arrow_schema_cache[cache_key] = schema

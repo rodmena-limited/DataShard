@@ -63,6 +63,6 @@ class _InflightMixin:
         for (marker_path, _), rel_path in zip(items, new_rel_paths, strict=True):
             self._inflight_markers.append(marker_path)
             self._marked_paths.add(rel_path)
-            if rel_path.startswith(self.file_manager.manifests_path + "/"):
+            if rel_path.startswith(self.file_manager.metadata_path + "/") and rel_path.endswith(".avro"):
                 self._attempt_files.append(rel_path)
 

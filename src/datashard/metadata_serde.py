@@ -1,175 +1,278 @@
 """
-TableMetadata <-> JSON dict conversion (split out of metadata_manager.py, #71).
+TableMetadata <-> Iceberg v2 metadata.json (#84).
+
+On the way out: the kebab-case Iceberg v2 document, with every path as an absolute
+URI under `location`. On the way in: the Iceberg form (ours or a foreign writer's)
+or the legacy snake_case form written before 0.10 (see metadata_serde_legacy); the
+result's paths are table-relative, which is what the rest of datashard speaks.
 """
 
-from typing import Any, Dict
+import json
+from typing import Any, Dict, List, Optional
 
-from .data_structures import Schema, TableMetadata
+from .data_structures import (
+    HistoryEntry,
+    PartitionField,
+    PartitionSpec,
+    Schema,
+    Snapshot,
+    SortField,
+    SortOrder,
+    TableMetadata,
+)
+from .metadata_serde_legacy import legacy_dict_to_metadata
+from .table_paths import is_uri, join_uri, to_relative
+
+# Snapshot summary keys carrying datashard's manifest-list integrity data (#58),
+# namespaced so foreign writers' snapshots are simply "unverified", never "corrupt".
+SUMMARY_LIST_LENGTH = "datashard.manifest-list-length"
+SUMMARY_LIST_SHA256 = "datashard.manifest-list-sha256"
+LEGACY_SUMMARY_LIST_LENGTH = "manifest-list-length"
+LEGACY_SUMMARY_LIST_SHA256 = "manifest-list-sha256"
+NAME_MAPPING_PROPERTY = "schema.name-mapping.default"
+NO_SNAPSHOT = -1
+
+
+def is_legacy_document(doc: Dict[str, Any]) -> bool:
+    """True for the snake_case form datashard wrote before 0.10."""
+    return "format-version" not in doc and "format_version" in doc
+
+
+# Types datashard accepts but cannot represent as an Iceberg column that BOTH major
+# readers accept, because the parquet datashard writes does not match what the Iceberg
+# type promises (verified against pyiceberg 0.12 and DuckDB 1.5.5, spike #83):
+#   uuid  -> we write a parquet STRING; pyiceberg refuses ("Cannot promote string to uuid")
+#   fixed -> Iceberg requires fixed[L]; a bare "fixed" fails pyiceberg's type parser
+# Both hold exactly the same bytes as `string` / `binary`, so switching the declared type
+# costs nothing on disk.
+NOT_ICEBERG_REPRESENTABLE = {"uuid": "string", "fixed": "binary"}
+
+
+def unrepresentable_fields(schema: Schema) -> Dict[str, str]:
+    """{field name: suggested type} for columns no Iceberg reader could read reliably."""
+    return {
+        str(f["name"]): NOT_ICEBERG_REPRESENTABLE[f["type"]]
+        for f in schema.fields
+        if isinstance(f.get("type"), str) and f["type"] in NOT_ICEBERG_REPRESENTABLE
+    }
+
+
+def check_iceberg_representable(schema: Schema) -> None:
+    """Refuse to CREATE a table whose columns would not be readable by Iceberg engines.
+
+    Existing tables keep working - this is only checked when a schema is first persisted.
+    """
+    bad = unrepresentable_fields(schema)
+    if bad:
+        detail = ", ".join(f"'{n}' ({''}use '{t}')" for n, t in bad.items())
+        raise ValueError(
+            f"datashard tables are Iceberg v2 tables since 0.10, and these columns cannot be "
+            f"expressed as Iceberg columns that every engine reads: {detail}. The parquet bytes "
+            f"are identical, so changing the declared type is a no-op on disk. (pyiceberg refuses "
+            f"'uuid' backed by a parquet string, and a bare 'fixed' is not a valid Iceberg type - "
+            f"it requires a length, fixed[L], which datashard does not write yet.)"
+        )
+
+
+def schema_to_iceberg(schema: Schema) -> Dict[str, Any]:
+    fields = []
+    for f in schema.fields:
+        entry: Dict[str, Any] = {
+            "id": int(f["id"]),
+            "name": str(f["name"]),
+            "required": bool(f.get("required", False)),
+            "type": f["type"],
+        }
+        if f.get("doc"):
+            entry["doc"] = f["doc"]
+        fields.append(entry)
+    return {"type": "struct", "schema-id": schema.schema_id, "fields": fields}
+
+
+def name_mapping_json(schema: Schema) -> str:
+    """schema.name-mapping.default for parquet files that carry no field ids (#88)."""
+    return json.dumps([{"field-id": int(f["id"]), "names": [str(f["name"])]} for f in schema.fields])
+
+
+def _partition_spec_to_iceberg(spec: PartitionSpec) -> Dict[str, Any]:
+    return {
+        "spec-id": spec.spec_id,
+        "fields": [
+            {"source-id": pf.source_id, "field-id": pf.field_id, "name": pf.name, "transform": pf.transform}
+            for pf in spec.fields
+        ],
+    }
+
+
+def _sort_order_to_iceberg(order: SortOrder) -> Dict[str, Any]:
+    # Iceberg's unsorted order is id 0; datashard's pre-0.10 default carried id 1.
+    order_id = 0 if not order.fields else order.order_id
+    return {
+        "order-id": order_id,
+        "fields": [
+            {"source-id": sf.source_id, "transform": sf.transform, "direction": sf.direction, "null-order": "nulls-first"}
+            for sf in order.fields
+        ],
+    }
+
+
+def _snapshot_to_iceberg(snapshot: Snapshot, location: str) -> Dict[str, Any]:
+    summary: Dict[str, str] = {"operation": snapshot.operation or "append"}
+    for k, v in (snapshot.summary or {}).items():
+        if k == "operation":
+            continue
+        # integrity keys written before 0.10 move into the datashard.* namespace
+        key = {LEGACY_SUMMARY_LIST_LENGTH: SUMMARY_LIST_LENGTH, LEGACY_SUMMARY_LIST_SHA256: SUMMARY_LIST_SHA256}.get(k, k)
+        summary[key] = str(v)
+    doc: Dict[str, Any] = {
+        "snapshot-id": snapshot.snapshot_id,
+        "sequence-number": snapshot.sequence_number if snapshot.sequence_number is not None else 0,
+        "timestamp-ms": snapshot.timestamp_ms,
+        "manifest-list": join_uri(location, snapshot.manifest_list),
+        "summary": summary,
+    }
+    if snapshot.parent_snapshot_id is not None and snapshot.parent_snapshot_id != NO_SNAPSHOT:
+        doc["parent-snapshot-id"] = snapshot.parent_snapshot_id
+    if snapshot.schema_id is not None:
+        doc["schema-id"] = snapshot.schema_id
+    return doc
 
 
 def metadata_to_dict(metadata: TableMetadata) -> Dict[str, Any]:
-    """Convert TableMetadata to dictionary for JSON serialization"""
-    return {
-        "location": metadata.location,
-        "table_uuid": metadata.table_uuid,
-        "format_version": metadata.format_version,
-        "last_sequence_number": metadata.last_sequence_number,
-        "last_updated_ms": metadata.last_updated_ms,
-        "last_column_id": metadata.last_column_id,
-        "schemas": [
+    """Iceberg v2 metadata.json document for `metadata` (paths become URIs)."""
+    location = metadata.location
+    current = metadata.current_snapshot_id if metadata.current_snapshot_id is not None else NO_SNAPSHOT
+    partition_ids = [pf.field_id for spec in metadata.partition_specs for pf in spec.fields]
+    orders = [_sort_order_to_iceberg(o) for o in metadata.sort_orders] or [{"order-id": 0, "fields": []}]
+    default_order = metadata.default_sort_order_id
+    if not any(o["order-id"] == default_order for o in orders):
+        default_order = orders[0]["order-id"]
+    doc: Dict[str, Any] = {
+        "format-version": 2,
+        "table-uuid": metadata.table_uuid,
+        "location": location,
+        "last-sequence-number": metadata.last_sequence_number,
+        "last-updated-ms": metadata.last_updated_ms,
+        "last-column-id": metadata.last_column_id or max(
+            (int(f["id"]) for s in metadata.schemas for f in s.fields), default=0
+        ),
+        "current-schema-id": metadata.current_schema_id,
+        "schemas": [schema_to_iceberg(s) for s in metadata.schemas],
+        "default-spec-id": metadata.default_spec_id,
+        "partition-specs": [_partition_spec_to_iceberg(s) for s in metadata.partition_specs],
+        "last-partition-id": max(partition_ids, default=999),
+        "default-sort-order-id": default_order,
+        "sort-orders": orders,
+        "properties": {str(k): str(v) for k, v in metadata.properties.items()},
+        "current-snapshot-id": current,
+        "snapshots": [_snapshot_to_iceberg(s, location) for s in metadata.snapshots],
+        "snapshot-log": [
+            {"timestamp-ms": e.timestamp_ms, "snapshot-id": e.snapshot_id} for e in metadata.snapshot_log
+        ],
+        "metadata-log": [
             {
-                "schema_id": schema.schema_id,
-                "fields": schema.fields,
-                "schema_string": schema.schema_string,
+                "timestamp-ms": e["timestamp-ms"],
+                # Entries are table-relative; one kept verbatim (a foreign writer's file
+                # outside this table) is already a URI and must not be joined again.
+                "metadata-file": e["metadata-file"] if is_uri(e["metadata-file"]) else join_uri(location, e["metadata-file"]),
             }
-            for schema in metadata.schemas
+            for e in metadata.metadata_log
+            if isinstance(e, dict) and e.get("metadata-file")
         ],
-        "current_schema_id": metadata.current_schema_id,
-        "partition_specs": [
-            {
-                "spec_id": spec.spec_id,
-                "fields": [
-                    {
-                        "source_id": field.source_id,
-                        "field_id": field.field_id,
-                        "name": field.name,
-                        "transform": field.transform,
-                    }
-                    for field in spec.fields
-                ],
-            }
-            for spec in metadata.partition_specs
-        ],
-        "default_spec_id": metadata.default_spec_id,
-        "sort_orders": [
-            {
-                "order_id": order.order_id,
-                "fields": [
-                    {
-                        "source_id": field.source_id,
-                        "field_id": field.field_id,
-                        "transform": field.transform,
-                        "direction": field.direction,
-                    }
-                    for field in order.fields
-                ],
-            }
-            for order in metadata.sort_orders
-        ],
-        "default_sort_order_id": metadata.default_sort_order_id,
-        "properties": metadata.properties,
-        "current_snapshot_id": metadata.current_snapshot_id,
-        "snapshots": [
-            {
-                "snapshot_id": snapshot.snapshot_id,
-                "timestamp_ms": snapshot.timestamp_ms,
-                "manifest_list": snapshot.manifest_list,
-                "parent_snapshot_id": snapshot.parent_snapshot_id,
-                "operation": snapshot.operation,
-                "summary": snapshot.summary,
-                "schema_id": snapshot.schema_id,
-                "sequence_number": snapshot.sequence_number,
-            }
-            for snapshot in metadata.snapshots
-        ],
-        "snapshot_log": [
-            {"timestamp_ms": entry.timestamp_ms, "snapshot_id": entry.snapshot_id}
-            for entry in metadata.snapshot_log
-        ],
-        "metadata_log": metadata.metadata_log,
-        "last_commit_id": metadata.last_commit_id,
+        "refs": {"main": {"snapshot-id": current, "type": "branch"}} if current != NO_SNAPSHOT else {},
     }
+    return doc
 
-def dict_to_metadata(metadata_dict: Dict[str, Any]) -> TableMetadata:
-    """Convert dictionary back to TableMetadata"""
-    from .data_structures import (
-        HistoryEntry as HistoryEntryStruct,
-        PartitionField,
-        PartitionSpec,
-        Snapshot as SnapshotStruct,
-        SortField,
-        SortOrder,
+
+def _schema_from_iceberg(doc: Dict[str, Any]) -> Schema:
+    fields = []
+    for f in doc.get("fields", []):
+        entry = {"id": f["id"], "name": f["name"], "type": f["type"], "required": bool(f.get("required", False))}
+        if f.get("doc"):
+            entry["doc"] = f["doc"]
+        fields.append(entry)
+    return Schema(schema_id=int(doc.get("schema-id", 0)), fields=fields)
+
+
+def _snapshot_from_iceberg(doc: Dict[str, Any], locations: List[Optional[str]]) -> Snapshot:
+    summary = {str(k): str(v) for k, v in (doc.get("summary") or {}).items()}
+    operation = summary.pop("operation", None)
+    return Snapshot(
+        snapshot_id=int(doc["snapshot-id"]),
+        timestamp_ms=int(doc["timestamp-ms"]),
+        manifest_list=to_relative(doc["manifest-list"], locations),
+        parent_snapshot_id=doc.get("parent-snapshot-id"),
+        operation=operation,
+        summary=summary,
+        schema_id=doc.get("schema-id"),
+        sequence_number=doc.get("sequence-number"),
     )
 
-    # Reconstruct schemas
-    schemas = [
-        Schema(
-            schema_id=schema_dict["schema_id"],
-            fields=schema_dict["fields"],
-            schema_string=schema_dict.get("schema_string", ""),
+
+def dict_to_metadata(doc: Dict[str, Any], actual_location: Optional[str] = None) -> TableMetadata:
+    """Parse a metadata.json document of either form. `actual_location` is the URI
+    of the root the table is opened at; paths under the recorded location OR the
+    actual one resolve (a moved table keeps reading, #87)."""
+    if is_legacy_document(doc):
+        return legacy_dict_to_metadata(doc)
+    location = str(doc["location"])
+    locations: List[Optional[str]] = [location, actual_location]
+    schemas = [_schema_from_iceberg(s) for s in doc.get("schemas", [])]
+    if not schemas and "schema" in doc:  # v1 documents carry a single schema
+        schemas = [_schema_from_iceberg(doc["schema"])]
+    specs = [
+        PartitionSpec(
+            spec_id=int(s["spec-id"]),
+            fields=[
+                PartitionField(source_id=f["source-id"], field_id=f["field-id"], name=f["name"], transform=f["transform"])
+                for f in s.get("fields", [])
+            ],
         )
-        for schema_dict in metadata_dict["schemas"]
+        for s in doc.get("partition-specs", [])
     ]
-
-    # Reconstruct partition specs
-    partition_specs = []
-    for spec_dict in metadata_dict["partition_specs"]:
-        fields = [
-            PartitionField(
-                source_id=field_dict["source_id"],
-                field_id=field_dict["field_id"],
-                name=field_dict["name"],
-                transform=field_dict["transform"],
-            )
-            for field_dict in spec_dict["fields"]
-        ]
-        partition_specs.append(PartitionSpec(spec_id=spec_dict["spec_id"], fields=fields))
-
-    # Reconstruct sort orders
-    sort_orders = []
-    for order_dict in metadata_dict["sort_orders"]:
-        sort_fields = [
-            SortField(
-                source_id=field_dict["source_id"],
-                field_id=field_dict["field_id"],
-                transform=field_dict["transform"],
-                direction=field_dict["direction"],
-            )
-            for field_dict in order_dict["fields"]
-        ]
-        sort_orders.append(SortOrder(order_id=order_dict["order_id"], fields=sort_fields))
-
-    # Reconstruct snapshots
-    snapshots = [
-        SnapshotStruct(
-            snapshot_id=snapshot_dict["snapshot_id"],
-            timestamp_ms=snapshot_dict["timestamp_ms"],
-            manifest_list=snapshot_dict["manifest_list"],
-            parent_snapshot_id=snapshot_dict.get("parent_snapshot_id"),
-            operation=snapshot_dict.get("operation"),
-            summary=snapshot_dict.get("summary", {}),
-            schema_id=snapshot_dict.get("schema_id"),
-            sequence_number=snapshot_dict.get("sequence_number"),
+    orders = [
+        SortOrder(
+            order_id=int(o["order-id"]),
+            fields=[
+                SortField(source_id=f["source-id"], field_id=0, transform=f["transform"], direction=f["direction"])
+                for f in o.get("fields", [])
+            ],
         )
-        for snapshot_dict in metadata_dict["snapshots"]
+        for o in doc.get("sort-orders", [])
     ]
-
-    # Reconstruct history
-    snapshot_log = [
-        HistoryEntryStruct(
-            timestamp_ms=entry_dict["timestamp_ms"], snapshot_id=entry_dict["snapshot_id"]
-        )
-        for entry_dict in metadata_dict["snapshot_log"]
-    ]
-
+    current = doc.get("current-snapshot-id", NO_SNAPSHOT)
     return TableMetadata(
-        location=metadata_dict["location"],
-        table_uuid=metadata_dict["table_uuid"],
-        format_version=metadata_dict["format_version"],
-        last_sequence_number=metadata_dict["last_sequence_number"],
-        last_updated_ms=metadata_dict["last_updated_ms"],
-        last_column_id=metadata_dict["last_column_id"],
+        location=location,
+        table_uuid=str(doc["table-uuid"]),
+        format_version=int(doc.get("format-version", 2)),
+        last_sequence_number=int(doc.get("last-sequence-number", 0)),
+        last_updated_ms=int(doc.get("last-updated-ms", 0)),
+        last_column_id=int(doc.get("last-column-id", 0)),
         schemas=schemas,
-        current_schema_id=metadata_dict["current_schema_id"],
-        partition_specs=partition_specs,
-        default_spec_id=metadata_dict["default_spec_id"],
-        sort_orders=sort_orders,
-        default_sort_order_id=metadata_dict["default_sort_order_id"],
-        properties=metadata_dict["properties"],
-        current_snapshot_id=metadata_dict["current_snapshot_id"],
-        snapshots=snapshots,
-        snapshot_log=snapshot_log,
-        metadata_log=metadata_dict.get("metadata_log", []),
-        last_commit_id=metadata_dict.get("last_commit_id", ""),
+        current_schema_id=int(doc.get("current-schema-id", schemas[0].schema_id if schemas else 0)),
+        partition_specs=specs,
+        default_spec_id=int(doc.get("default-spec-id", 0)),
+        sort_orders=orders,
+        default_sort_order_id=int(doc.get("default-sort-order-id", 0)),
+        properties={str(k): str(v) for k, v in (doc.get("properties") or {}).items()},
+        current_snapshot_id=int(current) if current is not None else NO_SNAPSHOT,
+        snapshots=[_snapshot_from_iceberg(s, locations) for s in doc.get("snapshots", [])],
+        snapshot_log=[
+            HistoryEntry(timestamp_ms=int(e["timestamp-ms"]), snapshot_id=int(e["snapshot-id"]))
+            for e in doc.get("snapshot-log", [])
+        ],
+        metadata_log=[
+            {"timestamp-ms": e["timestamp-ms"], "metadata-file": _relative_or_none(e.get("metadata-file"), locations)}
+            for e in doc.get("metadata-log", [])
+            if isinstance(e, dict)
+        ],
     )
 
+
+def _relative_or_none(path: Optional[str], locations: List[Optional[str]]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        return to_relative(path, locations)
+    except ValueError:
+        return path  # a foreign writer's file elsewhere: kept verbatim, never deleted by GC

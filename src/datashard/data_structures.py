@@ -185,6 +185,9 @@ class ManifestFile:
     # sha256 of the manifest file's bytes, recorded in the manifest list so a
     # truncated or overwritten manifest is rejected instead of read short (#58).
     checksum: Optional[str] = None
+    # Row counts of the entries by status (Iceberg manifest_file fields 512/513).
+    added_rows_count: Optional[int] = None
+    existing_rows_count: Optional[int] = None
 
 
 @dataclass
@@ -229,16 +232,14 @@ class TableMetadata:
     partition_specs: List[PartitionSpec] = field(default_factory=list)
     default_spec_id: int = 0
     sort_orders: List[SortOrder] = field(default_factory=list)
-    default_sort_order_id: int = 1
+    default_sort_order_id: int = 0
     properties: Dict[str, str] = field(default_factory=dict)
     current_snapshot_id: Optional[int] = None
     snapshots: List[Snapshot] = field(default_factory=list)
     snapshot_log: List[HistoryEntry] = field(default_factory=list)
     metadata_log: List[Dict[str, Any]] = field(default_factory=list)
-    # Unique id of the commit that wrote this metadata version. The OCC check
-    # compares it, so two metadata-only commits within the same millisecond can
-    # no longer both pass on an equal last_updated_ms (#74). Empty for versions
-    # written before 0.8.0.
+    # Pre-0.10 commit identity (#74); the version number is the commit identity
+    # since 0.10 (#86). Populated only when a legacy document is read.
     last_commit_id: str = ""
 
     def __post_init__(self) -> None:
@@ -250,4 +251,4 @@ class TableMetadata:
         if not self.partition_specs:
             self.partition_specs = [PartitionSpec(spec_id=0, fields=[])]
         if not self.sort_orders:
-            self.sort_orders = [SortOrder(order_id=1, fields=[])]
+            self.sort_orders = [SortOrder(order_id=0, fields=[])]

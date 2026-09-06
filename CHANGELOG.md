@@ -5,6 +5,124 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-06
+
+**datashard tables are now Apache Iceberg v2 tables on disk.** DuckDB's `iceberg` extension,
+pyiceberg, Spark and Trino read them natively - the lock-in is gone. **Existing tables must be
+migrated once with `datashard migrate <table>`, and there is no downgrade afterwards.**
+
+### Migration (required, one command per table)
+
+```
+datashard migrate /path/to/table            # or: python -m datashard migrate ...
+datashard migrate /path/to/table --dry-run  # report what would be rewritten, write nothing
+```
+
+Migration writes one new metadata version with Iceberg manifests for the existing snapshot
+chain; **data files are not rewritten or moved**. It is idempotent, takes the table lock, and
+finally renames the old root `metadata.version-hint.text` to `.migrated` so 0.9.x and earlier
+fail closed on the table instead of committing a divergent lineage. Verified against tables
+written by the released 0.7.2 and 0.9.1: every row and snapshot preserved, and the old client
+provably cannot write to a migrated table
+(`audit/evaluations/probe_v0100_migration_from_released_versions.py`).
+
+Opening an un-migrated table now raises `LegacyLayoutError` naming the command. Nothing is
+written when it does.
+
+### Added
+- **Iceberg v2 on-disk format (#84, #85, #87, #88).** Kebab-case `metadata/v{N}.metadata.json`
+  with `refs`, `snapshot-log`, `metadata-log` and Iceberg summaries; Avro manifests and manifest
+  lists carrying the spec's field-ids; column bounds in Iceberg single-value binary form; all
+  paths absolute URIs (`file:///...`, `s3://bucket/prefix/...`); `PARQUET:field_id` on every
+  column datashard writes, plus `schema.name-mapping.default` so files written without field ids
+  (including migrated ones) still resolve for foreign readers.
+- **`datashard migrate` and `datashard relocate` CLI (#89, #87).** `Table.relocate()` rewrites a
+  moved table's metadata so foreign readers work without `allow_moved_paths`; `Table.location`
+  exposes the URI they should be pointed at.
+- **Foreign-reader acceptance probe (#90):** `audit/evaluations/probe_v0100_foreign_readers.py`
+  compares full rows - not counts - between datashard, DuckDB `iceberg_scan` and pyiceberg after
+  create, appends, `delete_files`, manifest compaction, `expire_snapshots` + `garbage_collect`,
+  time travel, migration, a parquet file without field ids, and S3 through DuckDB's httpfs. It
+  carries a negative control that falsifies a bound and requires the foreign readers to return
+  the wrong rows, so a bounds-encoding regression cannot pass it silently.
+
+### Changed
+- **The commit point is now the exclusive creation of `metadata/v{N+1}.metadata.json`** (#86):
+  `If-None-Match: *` on S3, temp file + fsync + `os.link` locally. The version number is the
+  commit identity, so two writers can never produce the same version even with the metadata lock
+  removed - proved by a probe that disables the lock and races six processes, with a control run
+  showing the same race losing updates when the exclusive create is replaced by a plain write.
+  `last_commit_id` is gone, and `AmbiguousMetadataError` can no longer arise.
+- **`metadata/version-hint.text` is advisory** and holds a plain integer, as Iceberg's Hadoop
+  tables expect. It is written after the commit point with only-if-greater semantics; a hint that
+  lags a durable commit (a writer that died between the two writes) is healed by the next reader,
+  and a writer heals it through the commit conflict. A hint write failure after the commit point
+  no longer fails the commit - the rows are durable.
+- Manifests and manifest lists moved from `metadata/manifests/` to `metadata/` with Iceberg
+  naming (`snap-<id>-1-<uuid>.avro`, `<uuid>-m0.avro`); the old directory is still read and is
+  reclaimed by `garbage_collect()`.
+- Snapshot summaries use Iceberg's keys (`operation`, `added-records`, `total-records`, ...);
+  datashard's manifest-list integrity moved under `datashard.*` keys, and their absence now means
+  "unverified", never "corrupt", so a foreign writer's snapshot is readable.
+- Free-form `partition_values` passed to `append_*` are recorded as a datashard-only manifest
+  field. Real Iceberg partitioning (spec-driven, with pruning) ships in 0.11; a `partition_spec`
+  with fields is refused rather than silently ignored.
+- A table created without a schema now adopts the first append's schema into its metadata, so
+  foreign readers see the columns instead of an empty struct. If another writer persists a
+  different schema first, the commit fails before the commit point instead of committing a data
+  file the table's schema cannot describe.
+- **`uuid` and `fixed` columns are refused for NEW tables.** datashard writes a parquet string
+  for `uuid`, which pyiceberg rejects ("Cannot promote string to uuid"), and a bare `fixed` is
+  not a valid Iceberg type (it needs a length). Use `string` / `binary`: the parquet bytes are
+  identical, so the change is a no-op on disk. Existing tables with such columns keep working in
+  datashard, and `datashard migrate` reports them in `columns_foreign_readers_may_reject`.
+
+### Performance
+| Measurement | 0.9.1 | 0.10.0 |
+|---|---|---|
+| single-row append (S3 calls) | 16 | 16 |
+| 5-file scan (S3 calls) | 14 | 14 |
+| `current_snapshot()` (S3 calls) | 2 | 3 |
+| commit latency on OVH, 4 writers x 5 appends (p50) | 3.02 s | 2.54 s |
+
+The commit is one exclusive PUT instead of a metadata write followed by a read-modify-write of
+the version hint, which is where the OVH latency went. The one extra READ call is a HEAD for
+`v{N+1}`: it is what stops a lagging hint from hiding committed rows. The write path does not pay
+it - a commit conflict reveals the same thing - so append cost is unchanged. Measured with
+`audit/evaluations/probe_s3_request_count.py` and
+`audit/evaluations/probe_external_ovh_cas_commit_e2e.py` against OVH Object Storage
+(s3.uk.io.cloud.ovh.net), where each request costs roughly 190 ms.
+
+### Fixed
+- Garbage collection sweeps only datashard's own manifest objects (directly under `metadata/`,
+  plus the pre-0.10 `metadata/manifests/`). An operator's files parked elsewhere under
+  `metadata/` are left alone.
+- Column bounds of wide decimals are no longer lost or rounded. The encoder used
+  `Decimal.quantize()` / `scaleb()`, which honour the decimal context's 28 significant digits, so
+  every bound of a `decimal(38, s)` column beyond that width silently disappeared. Bounds are now
+  computed with exact integer arithmetic. Found in the pre-release adversarial pass.
+- A bound is never coerced. A value whose Python type does not match the column (a `Decimal` for a
+  `long`, a `str` for an `int` - reachable through the loose type inference of pre-0.8 legacy
+  bounds during migration) previously became a truncated bound, e.g. 1.5 recorded as a minimum of
+  1. Foreign readers prune on those bytes, so that would have made them skip matching rows; such
+  values now yield no bound at all. Found in the pre-release adversarial pass.
+- A pre-0.10 table carrying a decorative partition spec now migrates (the spec is dropped and
+  reported, since pre-0.10 data files were never partitioned by it) instead of failing.
+- The local commit point falls back to an exclusive open on filesystems without hard links,
+  with a warning that the fallback is atomic but not crash-safe.
+
+### Known limitations
+- **datashard must be the only writer** of a table until the REST catalog client (1.0). pyiceberg
+  and Spark commit with their own metadata naming and do not maintain `version-hint.text`, so
+  their commits are invisible to datashard and to DuckDB-by-directory, and their files would be
+  reclaimed by `garbage_collect()`. Reading from any engine is fully supported.
+- A table written by a merge-on-read engine (positional or equality delete files) is **refused**
+  rather than read with the deletes ignored. Applying them ships in 1.0.
+- Foreign readers can lag one version for a few seconds after a writer crashes between the commit
+  point and the hint write, until any datashard reader or writer heals the hint.
+- Iceberg's complex types (struct, list, map) remain unsupported; datashard's schema validation
+  already refused them.
+
 ## [0.9.1] - 2026-09-06
 
 ### Fixed

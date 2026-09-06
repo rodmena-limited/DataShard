@@ -47,10 +47,21 @@ DataShard is a Python implementation of Apache Iceberg's core concepts, providin
 - **Exact numerics:** `decimal(P,S)` and `timestamptz` columns for financial data
 - **Pure Python:** No Java dependencies, easy setup
 - **pandas Integration:** Native DataFrame support
+- **Iceberg v2 format:** read by DuckDB, pyiceberg, Spark and Trino without an export
 
-DataShard implements Iceberg's *concepts* (snapshots, manifests, optimistic commits) with
-its own on-disk layout. Its tables are **not** readable by Apache Iceberg engines
-(Spark, Trino, pyiceberg, DuckDB's iceberg extension); read them with DataShard.
+Since 0.10.0 DataShard tables **are Apache Iceberg v2 tables on disk**: DuckDB's `iceberg`
+extension, pyiceberg, Spark and Trino read them directly, with no export step.
+
+```sql
+INSTALL iceberg; LOAD iceberg;
+SELECT symbol, sum(qty) FROM iceberg_scan('/lake/trades') GROUP BY 1;
+```
+
+Tables written by 0.9.x and earlier must be migrated once - `datashard migrate <table>` -
+and cannot be opened by older versions afterwards. See
+[docs: migration](https://datashard.readthedocs.io/en/latest/migration.html) and
+[docs: interoperability](https://datashard.readthedocs.io/en/latest/interoperability.html)
+for the limits (DataShard must remain the only *writer* until the catalog client in 1.0).
 
 ---
 
@@ -608,13 +619,17 @@ schema = Schema(
 DataShard implements:
 - Optimistic Concurrency Control (OCC) with automatic retry
 - Snapshot isolation for consistent reads; `scan(snapshot_id=...)` for time travel
-- Manifest-based metadata tracking (Iceberg's approach) using Avro, with the
-  length and sha256 of every manifest / manifest list recorded at commit and
-  verified on read
+- Apache Iceberg v2 metadata: Avro manifests and manifest lists with the spec's
+  field-ids, binary column bounds and absolute URIs, plus the length and sha256 of
+  every manifest recorded at commit and verified on read (under `datashard.*` keys,
+  so a foreign writer's snapshot reads as unverified rather than corrupt)
 - Parquet with page checksums (verified on the bytes a read touches;
   `verify_checksums="full"` re-hashes whole files)
-- ACID transaction semantics; the version-hint flip is the commit point
-- S3-native compare-and-swap locking and a compare-and-swap commit point
+- ACID transaction semantics; the commit point is the exclusive creation of
+  `metadata/v{N}.metadata.json` (S3 `If-None-Match`, local `os.link`), so the version
+  number is the commit identity and two writers can never produce the same version
+- `metadata/version-hint.text` is an advisory pointer that readers heal when it lags
+- S3-native compare-and-swap locking as a contention reducer
 - Fail-closed garbage collection: nothing written after GC started, nothing an
   in-flight transaction marked, and nothing behind an unreadable manifest is ever
   deleted; `garbage_collect()` also reclaims superseded metadata files

@@ -4,9 +4,9 @@ S3PollingLockProvider plus a plain-PUT commit point.
 
 Part 1 (lock level): two polling providers BOTH acquire when one PUT lands after the
 other's read-back verification - a few hundred ms of S3 latency on one request.
-Part 2 (commit level): given that interleaving plus a slow hint PUT on the first
-writer, two Table.append_records() calls both return True and one snapshot is lost
-(its data file becomes an orphan that GC will delete).
+Part 2 (commit level): given that interleaving plus a latency spike at the first
+writer's commit point, two Table.append_records() calls both return True and one
+snapshot is lost (its data file becomes an orphan that GC will delete).
 Control: the same orchestration with conditional writes ON loses nothing.
 Timing is injected through a proxy around B's boto3 client; every datashard code path
 is the real one.
@@ -97,14 +97,16 @@ def part2_commit_level(conditional):
     gate, headed, b_done = threading.Event(), threading.Event(), threading.Event()
     tB.metadata_manager.lock_provider.s3 = DelayedClient(tB.storage.s3, key, gate, headed)
     mmA = tA.metadata_manager
-    orig_hint = mmA._write_hint_at_commit_point
+    orig_commit_point = mmA._write_metadata_file_exclusive
 
-    def slow_hint(*a, **k):
-        gate.set()  # A passed its ownership fence; B's delayed lock PUT now lands
-        b_done.wait(20)  # A's hint PUT suffers a latency spike while B commits
-        return orig_hint(*a, **k)
+    def slow_commit_point(*a, **k):
+        gate.set()  # A reached its commit point; B's delayed lock PUT now lands
+        b_done.wait(20)  # A's commit-point PUT suffers a latency spike while B commits
+        return orig_commit_point(*a, **k)
 
-    mmA._write_hint_at_commit_point = slow_hint
+    # Since 0.10 the commit point is the exclusive create of v{N+1}.metadata.json (#86),
+    # so that is what a latency spike must be injected into.
+    mmA._write_metadata_file_exclusive = slow_commit_point
     res = {}
 
     def run(tag, t):

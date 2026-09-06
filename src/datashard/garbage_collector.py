@@ -26,7 +26,7 @@ Safety model (bank-grade, fail closed):
 import json
 import logging
 import time
-from typing import Dict, Set
+from typing import Callable, Dict, Optional, Set
 
 from .data_structures import ManifestFile, Snapshot, TableMetadata
 from .file_manager import FileManager
@@ -185,14 +185,18 @@ class GarbageCollector:
             "data", reachable_data_files | protected_files, cutoff_ms
         )
 
-        # Manifests AND manifest lists live under the same prefix. In-flight
+        # Manifests AND manifest lists are the .avro files under metadata/ (and
+        # under metadata/manifests/ for tables written before 0.10). In-flight
         # protection applies here too: a commit in progress has written its
-        # manifests before the metadata that makes them reachable.
+        # manifests before the metadata that makes them reachable. Only .avro
+        # files are candidates here - the hint, the metadata versions and the
+        # inflight markers under the same prefix are handled elsewhere.
         all_reachable_manifests = reachable_manifests.union(reachable_manifest_lists)
         stats["manifest_files"] = self._gc_prefix(
-            self.file_manager.manifests_path,
+            self.file_manager.metadata_path,
             all_reachable_manifests | protected_files,
             cutoff_ms,
+            candidate=self._is_manifest_candidate,
         )
 
         # Superseded metadata files (v*.metadata.json outside the current version
@@ -201,6 +205,21 @@ class GarbageCollector:
 
         logger.info(f"Garbage collection complete. Deleted: {stats}")
         return stats
+
+    def _is_manifest_candidate(self, norm_path: str) -> bool:
+        """True only for OUR manifest / manifest-list objects.
+
+        Since 0.10 they sit DIRECTLY under metadata/ (Iceberg layout); tables
+        written before that keep them under metadata/manifests/. Everything else
+        below metadata/ - the version hint, metadata versions, inflight markers,
+        and anything an operator parked there such as metadata/manifests_archive/
+        - is not a candidate. Sweeping the whole metadata/ subtree by suffix once
+        deleted a sibling directory's archive (#63 class).
+        """
+        if not norm_path.endswith(".avro"):
+            return False
+        parent = norm_path.rpartition("/")[0]
+        return parent in (self.file_manager.metadata_path, self.file_manager.legacy_manifests_path)
 
     def _gc_metadata_files(self, metadata: TableMetadata, cutoff_ms: float) -> int:
         """Delete superseded metadata files older than the cutoff (#68).
@@ -236,7 +255,10 @@ class GarbageCollector:
         for entry in current.metadata_log:
             named = entry.get("metadata-file") if isinstance(entry, dict) else None
             if named:
-                keep.add(self._normalize_path(named))
+                try:
+                    keep.add(self._normalize_path(self.file_manager.to_relative(named)))
+                except ValueError:
+                    continue  # a foreign writer's file elsewhere: not under our metadata/
 
         try:
             listed = self.storage.list_files_with_mtime(meta_dir)
@@ -328,8 +350,15 @@ class GarbageCollector:
             return fallback
         return self._normalize_path(target)
 
-    def _gc_prefix(self, prefix: str, reachable_set: Set[str], cutoff_ms: float) -> int:
-        """Delete unreachable files under `prefix` last modified before cutoff_ms."""
+    def _gc_prefix(
+        self,
+        prefix: str,
+        reachable_set: Set[str],
+        cutoff_ms: float,
+        candidate: Optional[Callable[[str], bool]] = None,
+    ) -> int:
+        """Delete unreachable files under `prefix` last modified before cutoff_ms.
+        `candidate` restricts which listed paths are considered at all."""
         deleted_count = 0
 
         try:
@@ -352,6 +381,8 @@ class GarbageCollector:
                     f"the table root ({file_rel_path!r}). Reachability cannot be determined."
                 )
 
+            if candidate is not None and not candidate(norm_path):
+                continue
             if norm_path not in reachable_set:
                 # Potential orphan. Its age comes from the listing (#77) and is
                 # compared against the GC start clock.

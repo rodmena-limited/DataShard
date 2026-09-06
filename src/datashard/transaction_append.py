@@ -28,6 +28,7 @@ class _AppendMixin:
     _schema_cache: Optional[Schema]
     _schema_cache_set: bool
     _base_metadata_cache: Optional[TableMetadata]
+    _adopted_schema: Optional[Schema]
 
     if TYPE_CHECKING:  # provided by Transaction
 
@@ -198,7 +199,8 @@ class _AppendMixin:
         if self._schema_cache_set:
             return self._schema_cache
         result: Optional[Schema] = None
-        metadata = self.metadata_manager.refresh()
+        # Write-path read: no probe past the hint (the commit point detects a lag, #86)
+        metadata = self.metadata_manager.refresh(probe=False)
         self._base_metadata_cache = metadata
         if metadata and metadata.schemas:
             for s in metadata.schemas:
@@ -300,7 +302,13 @@ class _AppendMixin:
                 )
             return resolved
         persisted = self._validate_schema_against_table(schema)
-        return persisted if persisted is not None else schema
+        if persisted is None:
+            # A table created without a schema adopts the first append's schema in
+            # the same commit, so the metadata (and every foreign reader) knows its
+            # columns instead of showing an empty struct (#84).
+            self._adopted_schema = schema
+            return schema
+        return persisted
 
     @staticmethod
     def _new_data_file_path() -> str:

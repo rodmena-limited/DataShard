@@ -210,6 +210,12 @@ class _ScanMixin:
                     t = t.select(names)
                 aligned.append(t)
             tables = aligned
+            # Files written before 0.10 carry no PARQUET:field_id metadata; files
+            # written since do. Field metadata is not data - drop it before concat.
+            tables = [
+                pa.Table.from_arrays(t.columns, schema=pa.schema([f.remove_metadata() for f in t.schema]))
+                for t in tables
+            ]
         try:
             return pa.concat_tables(tables, promote_options="permissive")
         except TypeError:  # pyarrow < 14 has no promote_options

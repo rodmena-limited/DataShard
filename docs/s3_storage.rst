@@ -226,7 +226,7 @@ DataShard creates the following structure in S3:
        │   └── manifests/
        │       ├── manifest_1763162900796257.avro
        │       └── manifest_list_*.avro
-       └── metadata.version-hint.text
+       └── metadata/version-hint.text
 
 Architecture
 ============

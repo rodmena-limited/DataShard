@@ -71,9 +71,10 @@ def test_append_records_creates_non_empty_manifests():
         assert "manifest_path" in first_manifest, "Manifest should have manifest_path"
         assert "added_snapshot_id" in first_manifest, "Manifest should have added_snapshot_id"
 
-        # Validate manifest file exists
-        manifest_path = os.path.join(table_path, first_manifest["manifest_path"])
-        assert os.path.exists(manifest_path), f"Manifest file should exist at {manifest_path}"
+        # Validate manifest file exists (paths are absolute file:// URIs since 0.10)
+        manifest_path = first_manifest["manifest_path"]
+        assert manifest_path.startswith("file:///"), manifest_path
+        assert os.path.exists(manifest_path[len("file://"):]), f"Manifest file should exist at {manifest_path}"
 
 
 def test_manifest_reading_returns_data_files():
