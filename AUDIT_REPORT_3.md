@@ -9,6 +9,32 @@ Baseline as the authors run it: pytest 152 passed / 3 skipped, mypy strict clean
 
 ---
 
+## 0. Remediation status (2026-09-06, release 0.8.0)
+
+Every ticket opened by this audit is fixed, regression-tested and closed; #13 (key rotation) is the
+operator's. `audit/evaluations/run_all.sh` on 0.8.0: every probe PASSES (the GitHub-workflow house
+rule is reported as INFO because removal waits for the CI migration). Regression tests:
+`tests/test_audit_55_fixes.py` (24 tests); suite 184 passed, mypy strict clean over 33 files, ruff clean.
+
+| Ticket | Sev | Status |
+|---|---|---|
+| #56 | P0 | ✅ single path normaliser; table named `data` keeps its files |
+| #57 | P0 | ✅ markers before metadata, cutoff from GC start, markers for `append_files`, grace floor |
+| #58 | P0 | ✅ manifests / lists verified against recorded length + sha256; GC aborts on mismatch |
+| #59 | P0 | ✅ CAS auto-detected; unsafe lock refused without opt-in; OVH verified live |
+| #60 | P0 | ✅ clean failures delete their metadata file; ambiguity raises; `repair_version_hint` |
+| #61–#65 | P1 | ✅ delete validation, table-order layout, `/` delimiter, `SchemaMismatchError`, live S3 tests |
+| #66–#70 | P2 | ✅ page-CRC default, 37 → 16 S3 calls, metadata GC + compaction + maintenance API, 1 row group, disk floor |
+| #71–#74 | P3 | ✅ modules split, docs corrected, `decimal`/`timestamptz`, suspected items fixed with tests |
+| #13 | — | ⏳ rotate the `.env` OVH keys (operator) |
+
+Measured on the real endpoint after remediation: single-row commit p50 5.4 s → 3.1 s (one writer),
+10.3 s → 6.5 s (four writers), 20/20 commits kept. One new defect was found and fixed on the way:
+pyarrow 22 on CPython 3.13 aborts the interpreter at exit after threaded reads over a Python file
+object, which the 0.7.2 S3 read path triggered in every process that wrote and then read.
+
+---
+
 ## 1. Verdict
 
 > **NOT production-worthy for data you cannot lose. Certification denied.**

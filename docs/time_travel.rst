@@ -92,6 +92,26 @@ Accessing Specific Snapshots
    if specific_snapshot:
        print(f"Found snapshot: {specific_snapshot.snapshot_id}")
 
+Reading Historical Data
+-----------------------
+
+Every read API accepts ``snapshot_id``; without it the current snapshot is read.
+
+.. code-block:: python
+
+   snapshots = table.snapshots()                      # oldest first
+   as_of = snapshots[0]["snapshot_id"]
+
+   rows = table.scan(snapshot_id=as_of)               # the table as it was then
+   df = table.to_pandas(snapshot_id=as_of, filter={"status": "failed"})
+   n = table.row_count(snapshot_id=as_of)
+   for batch in table.scan_batches(snapshot_id=as_of):
+       ...
+
+An unknown or expired snapshot raises ``ValueError``. Snapshots stay readable until
+they are expired (``table.expire_snapshots(...)``) and their files are reclaimed by
+``table.garbage_collect()``; plan retention around how far back you need to read.
+
 Time Travel Operations
 ----------------------
 

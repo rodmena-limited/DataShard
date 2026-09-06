@@ -31,6 +31,21 @@ Benefits
 
 ✅ **Scalable**: Auto-scaling workers can write without coordination
 
+Locking and Conditional Writes
+==============================
+
+Commits are serialised with an S3-native lock, and the commit point itself is a
+conditional PUT (compare-and-swap on the version hint). DataShard probes the
+endpoint once at start-up with a conditional PUT and uses that mode when the
+provider honours ``If-None-Match`` / ``If-Match`` - AWS S3, MinIO, OVH Object
+Storage and most others do. Leave ``DATASHARD_S3_USE_CONDITIONAL_WRITES`` unset.
+
+If the provider ignores preconditions, DataShard refuses to start instead of
+falling back to the best-effort polling lock: under that lock two concurrent
+writers can both report success and one snapshot is silently lost. For a table
+with a single writer you may set ``DATASHARD_S3_ALLOW_UNSAFE_LOCK=1`` to accept
+the risk explicitly.
+
 Configuration
 =============
 

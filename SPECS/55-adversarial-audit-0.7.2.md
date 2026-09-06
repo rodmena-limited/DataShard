@@ -43,3 +43,9 @@ labelled SUSPECTED; probes persisted under `audit/evaluations/`.
 
 PASS = the claim holds (correct behaviour observed). FAIL = defect reproduced. After
 remediation every probe must PASS; a probe that FAILs again reopens its finding.
+
+## Outcome (2026-09-06)
+
+Certification of 0.7.2 denied; 19 tickets (#56–#74) opened with EARS specs, all fixed and closed
+the same day, released as 0.8.0. Probe harness: 21 of 22 probes failed on 0.7.2, all pass on 0.8.0.
+Report: `../AUDIT_REPORT_3.md`.

@@ -35,17 +35,22 @@ DataShard is a Python implementation of Apache Iceberg's core concepts, providin
 ### Key Features
 
 - **ACID Transactions:** Operations fully complete or fully rollback
-- **Time Travel:** Query data as it existed at any point in time
+- **Time Travel:** Read the table as of any retained snapshot (`scan(snapshot_id=...)`)
 - **Safe Concurrency:** Multiple processes can write without corruption
 - **Optimistic Concurrency Control (OCC):** Automatic conflict resolution
-- **S3-Compatible Storage:** AWS S3, MinIO, DigitalOcean Spaces support
+- **S3-Compatible Storage:** AWS S3, MinIO, OVH Object Storage, DigitalOcean Spaces
 - **Distributed Workflows:** Run workers across different machines with shared S3 storage
-- **Predicate Pushdown:** Filter at parquet level for 90%+ I/O reduction (NEW in v0.3.3)
-- **Partition Pruning:** Skip files based on column statistics (NEW in v0.3.3)
-- **Parallel Reading:** Multi-threaded scan for 2-4x speedup (NEW in v0.3.3)
-- **Streaming API:** Memory-efficient iteration over large tables (NEW in v0.3.3)
+- **Predicate Pushdown and file pruning:** filters run inside parquet; files are skipped from column min/max statistics
+- **Parallel Reading:** Multi-threaded scan across files
+- **Streaming API:** Memory-efficient iteration over large tables
+- **Integrity:** parquet page checksums verified on every read; manifests and metadata verified against the length/sha256 recorded at commit
+- **Exact numerics:** `decimal(P,S)` and `timestamptz` columns for financial data
 - **Pure Python:** No Java dependencies, easy setup
 - **pandas Integration:** Native DataFrame support
+
+DataShard implements Iceberg's *concepts* (snapshots, manifests, optimistic commits) with
+its own on-disk layout. Its tables are **not** readable by Apache Iceberg engines
+(Spark, Trino, pyiceberg, DuckDB's iceberg extension); read them with DataShard.
 
 ---
 
@@ -136,11 +141,14 @@ records = [
 success = table.append_records(records, schema)
 
 # 4. Query current data
+rows = table.scan(filter={"event": "login"}, columns=["user_id", "timestamp"])
 snapshot = table.current_snapshot()
 print(f"Snapshot ID: {snapshot.snapshot_id}")
 
-# 5. Time travel to previous state
-old_snapshot = table.snapshot_by_id(previous_snapshot_id)
+# 5. Time travel: read the table as it was at an earlier snapshot
+for s in table.snapshots():
+    print(s["snapshot_id"], s["timestamp"], s["operation"])
+old_rows = table.scan(snapshot_id=previous_snapshot_id)
 ```
 
 ---
@@ -208,28 +216,10 @@ task_logs.append_records([{
 
 # Query logs with pandas (from any machine)
 from datashard import load_table
-from datashard.file_manager import FileManager
 
 table = load_table("/shared/storage/task_logs")
-snapshot = table.current_snapshot()
-file_manager = FileManager(table.table_path, table.metadata_manager)
-
-# Read manifest list
-manifest_list_path = os.path.join(table.table_path, snapshot.manifest_list)
-manifests = file_manager.read_manifest_list_file(manifest_list_path)
-
-# Read all data files
-data_frames = []
-for manifest_file in manifests:
-    manifest_path = os.path.join(table.table_path, manifest_file.manifest_path)
-    data_files = file_manager.read_manifest_file(manifest_path)
-
-    for data_file in data_files:
-        parquet_path = os.path.join(table.table_path, data_file.file_path.lstrip('/'))
-        df = pd.read_parquet(parquet_path)
-        data_frames.append(df)
-
-logs_df = pd.concat(data_frames, ignore_index=True)
+logs_df = table.to_pandas()                                   # whole table
+failed_df = table.to_pandas(filter={"status": "failed"})      # pushdown + file pruning
 
 # Analyze logs
 failed_tasks = logs_df[logs_df['status'] == 'failed']
@@ -302,6 +292,20 @@ export DATASHARD_S3_BUCKET=my-datashard-bucket
 export DATASHARD_S3_REGION=us-east-1
 export DATASHARD_S3_PREFIX=optional/prefix/  # Optional: namespace within bucket
 ```
+
+### Locking on S3
+
+Commits are serialised with an S3-native lock and the commit point itself is a
+conditional PUT (compare-and-swap on the version hint), so two writers can never
+both believe they committed. On start-up DataShard probes the endpoint once with a
+conditional PUT and uses that mode when the provider honours it - AWS S3, MinIO,
+OVH Object Storage and most others do. Leave `DATASHARD_S3_USE_CONDITIONAL_WRITES`
+unset.
+
+If the provider ignores preconditions DataShard **refuses to start** rather than
+fall back to the best-effort polling lock, because under that lock a concurrent
+commit can be silently lost. Only for a table with a single writer you may set
+`DATASHARD_S3_ALLOW_UNSAFE_LOCK=1` to accept the risk.
 
 ### Usage Example: Distributed Workflow Logging
 
@@ -400,13 +404,22 @@ export DATASHARD_S3_REGION=us-east-1
 
 ### Local vs S3 Performance
 
-| Operation | Local Filesystem | S3 (same region) |
-|-----------|-----------------|------------------|
-| Write (1000 records) | ~1ms | ~50ms |
-| Read (50k records) | ~20ms | ~100ms |
-| Concurrent writes | ✅ Safe | ✅ Safe |
+Every commit is a fixed handful of sequential object-store round trips (data file,
+two manifest objects, metadata file, lock, compare-and-swap version hint), so S3
+latency - not bandwidth - sets the commit rate. Measured with the 0.8.0 release
+(single-row appends; see CHANGELOG for the OVH figures):
+
+| Operation | Local Filesystem | S3 (moto, loopback) |
+|-----------|-----------------|---------------------|
+| Single-row append: S3 API calls | - | 16 |
+| Single-row append latency | ~4 ms | ~70 ms |
+| 8 writers x 25 appends, no lost commit | 72 commits/s | - |
+| Scan of 5 files: S3 API calls | - | 13 |
+| Concurrent writes | ✅ Safe | ✅ Safe (compare-and-swap) |
 | Cross-machine access | ❌ Needs NFS | ✅ Native |
-| Durability | Single disk | 11 9's |
+
+Batch rows per append (thousands, not one): the per-commit cost is fixed, the data
+transfer is cheap. `audit/evaluations/probe_s3_request_count.py` reproduces the call counts.
 
 **Recommendation:** Use local storage for single-machine workloads, S3 for distributed workflows.
 
@@ -570,11 +583,22 @@ schema = Schema(
 
 DataShard implements:
 - Optimistic Concurrency Control (OCC) with automatic retry
-- Snapshot isolation for consistent reads
-- Manifest-based metadata tracking (Iceberg's approach) using Avro
-- Parquet format for efficient columnar storage
-- ACID transaction semantics
-- S3-native distributed locking for cloud storage
+- Snapshot isolation for consistent reads; `scan(snapshot_id=...)` for time travel
+- Manifest-based metadata tracking (Iceberg's approach) using Avro, with the
+  length and sha256 of every manifest / manifest list recorded at commit and
+  verified on read
+- Parquet with page checksums (verified on the bytes a read touches;
+  `verify_checksums="full"` re-hashes whole files)
+- ACID transaction semantics; the version-hint flip is the commit point
+- S3-native compare-and-swap locking and a compare-and-swap commit point
+- Fail-closed garbage collection: nothing written after GC started, nothing an
+  in-flight transaction marked, and nothing behind an unreadable manifest is ever
+  deleted; `garbage_collect()` also reclaims superseded metadata files
+- Maintenance API: `expire_snapshots(retain_last=...)`, `compact_manifests()`
+  (automatic at 64 manifests), `set_properties()`
+
+Data types: `boolean, int, long, float, double, decimal(P,S), date, time, timestamp,
+timestamptz, string, uuid, fixed, binary`; data files are always parquet.
 
 ---
 
@@ -601,6 +625,7 @@ DataShard implements:
 - Complex queries (use a query engine like DuckDB)
 - Petabyte-scale data (use Apache Iceberg with Spark)
 - Distributed query processing (use Presto/Trino)
+- Interoperability with Apache Iceberg engines: the on-disk layout is DataShard's own
 
 ---
 

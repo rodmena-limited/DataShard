@@ -69,10 +69,8 @@ class FileManager:
         self.data_path = "data"
         self.metadata_path = "metadata"
         self.manifests_path = "metadata/manifests"
-
-        # Ensure directories exist
-        self.storage.makedirs(self.data_path, exist_ok=True)
-        self.storage.makedirs(self.manifests_path, exist_ok=True)
+        # Directories are created by MetadataManager.initialize_table(); a mere
+        # open must not create anything (#72). Writes create parents on demand.
 
         # Initialize data file manager
         self.data_file_manager = DataFileManager(self, storage)

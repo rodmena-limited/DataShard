@@ -92,6 +92,19 @@ Any service implementing the S3 API should work:
 
 ---
 
+## Locking and Conditional Writes
+
+Commits are serialised with an S3-native lock, and the commit point is a conditional
+PUT (compare-and-swap on the version hint). DataShard probes the endpoint once at
+start-up and uses that mode when the provider honours `If-None-Match` / `If-Match`
+(AWS S3, MinIO, OVH Object Storage and most others do). Leave
+`DATASHARD_S3_USE_CONDITIONAL_WRITES` unset.
+
+If the provider ignores preconditions DataShard refuses to start rather than fall
+back to the best-effort polling lock, under which a concurrent commit can be
+silently lost. For a single-writer table you may set
+`DATASHARD_S3_ALLOW_UNSAFE_LOCK=1` to accept the risk.
+
 ## Configuration
 
 ### Environment Variables

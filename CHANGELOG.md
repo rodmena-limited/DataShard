@@ -5,6 +5,118 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-06
+
+Remediation of adversarial audit #55 (`AUDIT_REPORT_3.md`): five reproduced data-loss /
+lost-commit paths, five correctness defects, the performance profile, and the house-rule
+debt. Every finding has a probe under `audit/evaluations/` (21 of 22 failed on 0.7.2, all
+pass now) and a regression test in `tests/test_audit_55_fixes.py`.
+
+### Fixed - data loss / lost commits
+
+- **GC deleted every live file of a table whose path is a string prefix of `data` /
+  `metadata`** (a table literally called `data`): `_normalize_path` stripped `table_path`
+  as a plain prefix. Paths are normalised by one rule on both sides now (#56).
+- **GC deleted files committed while it was running**: markers are loaded before the
+  metadata is read, the age cutoff is measured from the GC start instant, caller files
+  passed to `append_files()` get in-flight markers too, and a grace period under 5 minutes
+  needs `allow_short_grace=True` (#57).
+- **A manifest truncated on an Avro block boundary was read as a shorter list** - partial
+  scans, wrong `row_count()`, and GC deleting the files that fell off. Manifests are now
+  verified against the `manifest_length` and a new sha256 recorded in the manifest list;
+  the manifest list against the length/sha256 recorded in the snapshot summary. Any
+  mismatch raises `CorruptDataError` and aborts GC (#58).
+- **The polling S3 lock could admit two holders, losing a commit that had returned
+  `True`.** The S3 backend now probes the endpoint with conditional PUTs and uses the
+  compare-and-swap lock and commit point when they are honoured (AWS S3, MinIO, OVH Object
+  Storage - verified live against `s3.uk.io.cloud.ovh.net`); an endpoint that ignores
+  preconditions, or `DATASHARD_S3_USE_CONDITIONAL_WRITES=false`, is **refused** unless
+  `DATASHARD_S3_ALLOW_UNSAFE_LOCK=1` (#59).
+- **Version-hint recovery could resurrect a never-committed metadata file** left by a
+  crashed or out-raced writer. A clean commit failure now deletes its own metadata file;
+  a recovery with several files at the top version raises `AmbiguousMetadataError`;
+  `Table.repair_version_hint(name)` resolves it explicitly (#60).
+
+### Fixed - correctness
+
+- `delete_files()` raises `FileNotFoundError` for a path no snapshot references and matches
+  paths with or without a leading `/`; it never commits an empty `delete` snapshot (#61).
+- A schema with the table's fields in a different order was accepted and bricked every
+  scan (`ArrowInvalid` on concat). Files are written in the table's persisted field order,
+  the arrow-schema cache is keyed by field fingerprint, and scans align column order (#62).
+- S3 `list_files('data')` also listed `data_export/...`, so GC deleted sibling-prefix
+  objects; listings use a `/` delimiter (#63).
+- `create_table()` on an existing table with a **different** schema raises
+  `SchemaMismatchError` (`if_exists="ignore"` keeps the old behaviour with a warning) (#64).
+- The S3 integration tests asserted `exists("metadata")`, failed against every S3 server
+  and never ran in CI. They now run against a per-session moto server (or the configured
+  `DATASHARD_S3_*` endpoint), assert behaviour, and delete their prefixes (#65).
+- A percentage disk guard refused all writes at 95 % used with 400 GB free; the guard is
+  now an absolute floor: `max(2 x write, DATASHARD_MIN_FREE_BYTES [1 GiB])` (#70).
+- **Interpreter abort at exit** (`terminate called without an active exception`) after any
+  process that wrote and read parquet: pyarrow 22's threaded readers over a Python file
+  object on CPython 3.13. Local reads now hand pyarrow the path; S3 reads go through the
+  range reader single-threaded per file (parallelism comes from `scan(parallel=...)`).
+
+### Changed - performance
+
+- **Integrity mode**: `verify_checksums` is `"page"` by default - parquet page CRCs on the
+  bytes a read touches - instead of a whole-file sha256 that downloaded every byte of
+  every file for any projection. `"full"` keeps the old behaviour, `"off"` disables it (#66).
+- **S3 round trips**: single-row append 37 -> 16 calls, 5-file scan 27 -> 13,
+  `current_snapshot()` 4 -> 2; missing objects fail in milliseconds (404s are no longer
+  retried for 3 s); data files are hashed before upload and stored through boto3 (pyarrow's
+  S3 client is gone); the range reader learns the object size from a cached suffix-range
+  read. OVH, single-row appends: 5.4 s -> 3.1 s p50 with one writer, 10.3 s -> 6.5 s p50
+  with four. The remaining cost is ~16 sequential round trips at OVH's ~190 ms each: batch
+  rows per commit, and use `scan(parallel=True)` for multi-file reads (#67).
+- **Metadata growth**: `garbage_collect()` reclaims superseded `v*.metadata.json` files
+  (current + `write.metadata.previous-versions-max`, now 10, kept) and `.tmp` leftovers;
+  manifests compact automatically at `datashard.manifest.compaction-threshold` (64) so scan
+  I/O stays bounded (300 tiny commits: 905 -> 51 storage calls); new
+  `Table.set_properties()`, `Table.properties()`, `Table.expire_snapshots(older_than_ms,
+  retain_last)` (5-day default) and `Table.compact_manifests()` (#68).
+- **Write path**: one Arrow conversion and one row group per million rows (a 50k-row append
+  was 50 row groups); `append_pandas()` uses `from_pandas` (was 6-11x slower via
+  `to_dict('records')`); empty appends queue nothing (#69).
+
+### Added
+
+- Time-travel reads: `scan`, `to_pandas`, `scan_batches`, `iter_records`, `iter_pandas` and
+  `row_count` accept `snapshot_id=` (#72).
+- `decimal(P,S)` (exact `Decimal` values and bounds) and `timestamptz` (UTC) column types (#73).
+- `TableMetadata.last_commit_id`, compared by the OCC check so two metadata-only commits in
+  the same millisecond cannot both pass; a lost OCC attempt deletes the manifests it wrote;
+  local writes loop until complete and verify the size (#74).
+- `audit/evaluations/`: the live-probe harness (`run_all.sh`; external probes behind
+  `AUDIT_ALLOW_EXTERNAL=1`).
+
+### Changed - other
+
+- Every module is under 500 lines: `transaction.py` split into `transaction.py`,
+  `transaction_append.py`, `transaction_commit.py`, `table.py`, `table_scan.py`;
+  `storage_backend.py` into `storage_backend.py`, `s3_backend.py`, `s3_range_file.py`; plus
+  `data_io.py`, `arrow_types.py`, `exceptions.py`, `metadata_serde.py`, `version_hint.py`,
+  `bounds.py`, `manifest_codec.py`, `lock_provider_polling.py`. Old import paths still
+  resolve (#71).
+- `load_table()` no longer creates `data/`, `metadata/` when the table does not exist;
+  `__version__` is read from `pyproject.toml` in a development checkout (#72).
+- Docs: time travel documents `snapshot_id=` reads; Avro/ORC removed as data-file formats;
+  S3 locking documented; README states that tables are not readable by Iceberg engines and
+  carries measured numbers instead of "~50 ms" (#72).
+- `garbage_collect()` returns a fourth counter, `metadata_files`.
+
+### Upgrade notes
+
+- Set nothing for locking on S3 (auto-detect). If you had
+  `DATASHARD_S3_USE_CONDITIONAL_WRITES=false`, remove it; keeping it now requires
+  `DATASHARD_S3_ALLOW_UNSAFE_LOCK=1` and accepts possible lost commits.
+- Tables written by 0.7.x read unchanged; manifests and snapshots written before 0.8.0 have
+  no recorded sha256 (length is still checked) and their data files carry no page CRCs
+  (page verification passes them through; use `verify_checksums="full"` for the old check).
+- `garbage_collect(grace_period_ms=<5 min>)` now needs `allow_short_grace=True`.
+- `delete_files()` of an unknown path and `create_table()` with a conflicting schema raise.
+
 ## [0.7.2] - 2026-08-12
 
 S3 reads now work on providers pyarrow cannot talk to (#54).

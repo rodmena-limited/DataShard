@@ -7,17 +7,7 @@ snapshotting, and safe concurrent access.
 Supports both local filesystem and S3-compatible storage (AWS S3, MinIO, etc.)
 """
 
-# Single source of truth for the version is pyproject.toml; resolve it from
-# package metadata so __version__ can never drift from the released version.
-try:
-    from importlib.metadata import PackageNotFoundError, version
-
-    try:
-        __version__ = version("datashard")
-    except PackageNotFoundError:
-        __version__ = "0.7.2"
-except ImportError:  # pragma: no cover - Python < 3.8
-    __version__ = "0.7.2"
+from ._version import __version__
 
 __author__ = "RODMENA LIMITED"
 

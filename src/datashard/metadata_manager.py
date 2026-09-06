@@ -51,9 +51,8 @@ class MetadataManager(_VersionHintMixin):
         # Distributed lock for multi-process/multi-host safety
         # PHASE 2: Added distributed locking (FileLock for local, S3 Lock for cloud)
         self.lock_provider = self.storage.create_lock(".locks/metadata.lock", timeout=30.0)
-
-        # Ensure metadata directory exists
-        self.storage.makedirs(self.metadata_path, exist_ok=True)
+        # Directories are created by initialize_table(), not here: opening a table
+        # that does not exist (load_table on a typo) must leave no trace (#72).
 
     def initialize_table(self, metadata: TableMetadata) -> TableMetadata:
         """Initialize a new table with the given metadata.
@@ -76,6 +75,10 @@ class MetadataManager(_VersionHintMixin):
                         f"Table at {self.table_path} is already initialized; "
                         f"refusing to overwrite its metadata"
                     )
+
+                # The table's directory layout is created here, at initialisation.
+                for directory in (self.metadata_path, f"{self.metadata_path}/manifests", "data"):
+                    self.storage.makedirs(directory, exist_ok=True)
 
                 # Set initial values
                 if metadata.current_snapshot_id is None:

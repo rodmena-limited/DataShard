@@ -3,59 +3,21 @@ Performance Optimization
 
 This section covers best practices and techniques for optimizing datashard performance.
 
-File Format Selection
----------------------
+File Format
+-----------
 
-Choosing the Right Format
-^^^^^^^^^^^^^^^^^^^^^^^^^
+Data files are always Parquet (columnar, lz4-compressed, page checksums on).
+``FileFormat.AVRO`` and ``FileFormat.ORC`` exist in the enum for Iceberg parity, but
+``DataFileWriter`` and ``write_data_file`` refuse them. Parquet gives:
 
-datashard supports multiple file formats, each with different performance characteristics:
+- column projection: ``scan(columns=[...])`` reads only those columns' byte ranges
+- predicate pushdown: ``scan(filter={...})`` evaluates inside the parquet reader,
+  and files whose min/max statistics exclude the predicate are skipped entirely
+- one row group per million rows per append (a 50k-row append is one row group)
 
-Parquet
-"""""""
-
-- Best for analytical workloads with complex queries
-- Excellent compression ratios
-- Columnar storage enables efficient scans of specific columns
-- Supports predicate pushdown for faster filtering
-
-.. code-block:: python
-
-   from datashard import FileFormat, DataFile
-
-   # Parquet is typically the best choice for most use cases
-   parquet_file = DataFile(
-       file_path="data.parquet",
-       file_format=FileFormat.PARQUET,
-       partition_values={},
-       record_count=1000,
-       file_size_in_bytes=50000
-   )
-
-Avro
-""""
-
-- Good for schema evolution scenarios
-- Efficient for append-heavy workloads
-- Good compression with complex nested types
-- Schema stored with data, self-describing
-
-.. code-block:: python
-
-   avro_file = DataFile(
-       file_path="data.avro",
-       file_format=FileFormat.AVRO,
-       partition_values={},
-       record_count=1000,
-       file_size_in_bytes=45000
-   )
-
-ORC
-"""
-
-- Optimized for read-heavy workloads
-- Good compression and predicate pushdown
-- Built-in ACID transaction support in Hadoop ecosystems
+Integrity modes (``verify_checksums``): ``"page"`` (default) verifies parquet page
+CRCs on the bytes a read touches; ``"full"`` re-hashes whole files against the
+sha256 recorded at write time (downloads every byte); ``"off"`` disables checks.
 
 Partitioning Strategies
 -----------------------
