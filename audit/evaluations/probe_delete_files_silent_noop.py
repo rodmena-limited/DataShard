@@ -38,16 +38,18 @@ except Exception as e:  # noqa: BLE001
     H.report("delete-of-unknown-path-is-rejected", True, f"raised {type(e).__name__}: {str(e)[:100]}")
 
 arrow_schema = t.file_manager.data_file_manager.create_arrow_schema(schema)
-fp = os.path.join(path, "data", "ext.parquet")
-pq.write_table(pa.table({"id": [7], "name": ["ext"], "value": [7.0]}, schema=arrow_schema), fp)
-df = DataFile(
-    file_path="data/ext.parquet",
-    file_format=FileFormat.PARQUET,
-    partition_values={},
-    record_count=1,
-    file_size_in_bytes=os.path.getsize(fp),
-)
-t.append_data([df])
+dfs = []
+for n in ("ext", "ext2"):
+    fp = os.path.join(path, "data", f"{n}.parquet")
+    pq.write_table(pa.table({"id": [7], "name": [n], "value": [7.0]}, schema=arrow_schema), fp)
+    dfs.append(DataFile(
+        file_path=f"data/{n}.parquet",  # appended WITHOUT a leading slash
+        file_format=FileFormat.PARQUET,
+        partition_values={},
+        record_count=1,
+        file_size_in_bytes=os.path.getsize(fp),
+    ))
+t.append_data(dfs)
 rows1 = t.row_count()
 with t.new_transaction() as tx:
     tx.delete_files(["/data/ext.parquet"])  # same file, Iceberg-style leading slash
@@ -59,8 +61,8 @@ H.report(
     f"commit returned {ok}; rows {rows1}->{rows2} (expected {rows1 - 1})",
 )
 with t.new_transaction() as tx:
-    tx.delete_files(["data/ext.parquet"])
+    tx.delete_files(["data/ext2.parquet"])  # exact string form
     tx.commit()
 rows3 = t.row_count()
-H.report("delete-with-exact-path-removes-file (control)", rows3 == rows1 - 1, f"rows now {rows3}")
+H.report("delete-with-exact-path-removes-file (control)", rows3 == rows1 - 2, f"rows now {rows3} (expected {rows1 - 2})")
 H.finish()

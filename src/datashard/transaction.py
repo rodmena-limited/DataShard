@@ -217,22 +217,28 @@ class Transaction:
             sig.add((f.get("name"), type_key, bool(f.get("required", False))))
         return sig
 
-    def _validate_schema_against_table(self, schema: Schema) -> None:
+    def _validate_schema_against_table(self, schema: Schema) -> Optional[Schema]:
         """Reject appends whose schema diverges from the table's persisted schema.
 
         A divergent append would write parquet files whose schema differs from
         the rest of the table, making every subsequent full scan fail on
         concat - effectively bricking reads for the whole table.
+
+        Returns the table's persisted schema (None for a legacy table without
+        one). Callers write files with THAT schema, so the on-disk column order
+        always follows the table even when the caller listed the same fields in
+        a different order (#62).
         """
         table_schema = self._resolve_table_schema()
         if table_schema is None:
-            return  # No persisted schema (legacy table): nothing to enforce
+            return None  # No persisted schema (legacy table): nothing to enforce
         if self._schema_signature(schema) != self._schema_signature(table_schema):
             raise ValueError(
                 "Provided schema does not match the table's persisted schema. "
                 "Appending with a divergent schema would make table scans fail. "
                 f"Table fields: {table_schema.fields}; provided fields: {schema.fields}"
             )
+        return table_schema
 
     def append_data(
         self,
@@ -259,7 +265,9 @@ class Transaction:
                     "all record fields."
                 )
         else:
-            self._validate_schema_against_table(schema)
+            persisted = self._validate_schema_against_table(schema)
+            if persisted is not None:
+                schema = persisted  # the file's column order follows the table (#62)
 
         # Create a data file with the records using UUID for uniqueness
         file_id = uuid.uuid4().hex[:16]  # Use 16 chars of UUID hex
@@ -535,9 +543,14 @@ class Transaction:
                     f"would silently drop all prior table data from the new snapshot."
                 ) from e
 
-        # 2. Process deletes (rewrite affected manifests)
+        # 2. Process deletes (rewrite affected manifests). Paths are matched in
+        # table-relative form on both sides, and every requested path must be
+        # found: a delete that matches nothing must not commit a no-op
+        # snapshot and report success (#61).
         final_manifests: List[ManifestFile] = []
         if deleted_paths:
+            wanted = {p.replace("\\", "/").lstrip("/") for p in deleted_paths}
+            matched: Set[str] = set()
             for manifest in existing_manifests:
                 manifest_path = manifest.manifest_path
                 if manifest_path.startswith("/"):
@@ -555,11 +568,13 @@ class Transaction:
                         f"Failed to read manifest {manifest.manifest_path} during delete operation"
                     ) from e
 
-                surviving_files = [
-                    f for f in data_files
-                    if f.file_path not in deleted_paths
-                    and f.file_path.lstrip("/") not in deleted_paths
-                ]
+                surviving_files = []
+                for f in data_files:
+                    rel = f.file_path.replace("\\", "/").lstrip("/")
+                    if rel in wanted:
+                        matched.add(rel)
+                    else:
+                        surviving_files.append(f)
 
                 if len(surviving_files) == len(data_files):
                     # No changes, keep manifest
@@ -578,6 +593,13 @@ class Transaction:
                     new_manifest.partition_spec_id = manifest.partition_spec_id
                     final_manifests.append(new_manifest)
                 # else: all files deleted -> drop this manifest
+            missing = wanted - matched
+            if missing:
+                raise FileNotFoundError(
+                    f"delete_files: {sorted(missing)} are not part of the current snapshot "
+                    f"(paths are matched table-relative, with or without a leading '/'). "
+                    f"Nothing was deleted and no snapshot was created."
+                )
         else:
             final_manifests = list(existing_manifests)
 
@@ -782,6 +804,8 @@ class Table:
         from .storage_backend import create_storage_backend
 
         self.table_path = table_path
+        # True when THIS constructor initialised the table (False = it existed).
+        self.created = False
 
         # Create storage backend
         self.storage = create_storage_backend(table_path)
@@ -820,6 +844,7 @@ class Table:
 
         try:
             self.metadata_manager.initialize_table(initial_metadata)
+            self.created = True
         except TableExistsError:
             # A concurrent creator won the race - their metadata is authoritative.
             logger.info(f"Table {self.table_path} was concurrently initialized; using existing metadata")
@@ -1047,7 +1072,29 @@ class Table:
         else:
             tables = [read_one(df) for df in data_files]
 
-        return pa.concat_tables(tables)
+        return self._concat_aligned(tables, pa)
+
+    @staticmethod
+    def _concat_aligned(tables: List[Any], pa: Any) -> Any:
+        """Concatenate per-file tables, aligning column ORDER to the first table.
+
+        Files written by 0.7.2 and earlier could carry the table's fields in the
+        caller's order (#62); pa.concat_tables treats that as a different schema.
+        Same-named columns are reordered, then types are unified permissively
+        where pyarrow supports it.
+        """
+        if len(tables) > 1:
+            names = tables[0].column_names
+            aligned = [tables[0]]
+            for t in tables[1:]:
+                if t.column_names != names and set(t.column_names) == set(names):
+                    t = t.select(names)
+                aligned.append(t)
+            tables = aligned
+        try:
+            return pa.concat_tables(tables, promote_options="permissive")
+        except TypeError:  # pyarrow < 14 has no promote_options
+            return pa.concat_tables(tables)
 
     def scan(
         self,

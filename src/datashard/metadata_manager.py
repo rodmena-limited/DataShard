@@ -32,6 +32,13 @@ class TableExistsError(Exception):
     pass
 
 
+class SchemaMismatchError(TableExistsError):
+    """Raised by create_table() when the table already exists with a different
+    persisted schema than the one requested (#64)."""
+
+    pass
+
+
 class AmbiguousMetadataError(Exception):
     """Raised when the version hint is missing and several metadata files share the
     highest version, so the committed state cannot be told apart from a failed

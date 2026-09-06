@@ -1,245 +1,105 @@
 """
-Integration tests for S3-compatible storage backend (MinIO, AWS S3, OVH)
+Integration tests for the S3-compatible storage backend.
 
-These tests require S3 credentials to be set via environment variables:
-- DATASHARD_STORAGE_TYPE=s3
-- DATASHARD_S3_ENDPOINT=<your S3 endpoint>
-- DATASHARD_S3_ACCESS_KEY=<your access key>
-- DATASHARD_S3_SECRET_KEY=<your secret key>
-- DATASHARD_S3_BUCKET=<your bucket>
-- DATASHARD_S3_REGION=<your region>
-- DATASHARD_S3_USE_CONDITIONAL_WRITES=false (for OVH and other non-AWS providers)
+They run against a moto_server started by the `s3_env` fixture, or against the
+provider configured through DATASHARD_S3_* (AWS S3, MinIO, OVH, ...). Every
+table they create is deleted on teardown (#65).
 """
-
-import os
-import uuid
-
 import pytest
 
 from datashard import Schema, create_table, load_table
 
-# Store original env vars at module load time
-_ORIGINAL_S3_ENV = {
-    "DATASHARD_STORAGE_TYPE": os.getenv("DATASHARD_STORAGE_TYPE"),
-    "DATASHARD_S3_ENDPOINT": os.getenv("DATASHARD_S3_ENDPOINT"),
-    "DATASHARD_S3_ACCESS_KEY": os.getenv("DATASHARD_S3_ACCESS_KEY"),
-    "DATASHARD_S3_SECRET_KEY": os.getenv("DATASHARD_S3_SECRET_KEY"),
-    "DATASHARD_S3_BUCKET": os.getenv("DATASHARD_S3_BUCKET"),
-    "DATASHARD_S3_REGION": os.getenv("DATASHARD_S3_REGION"),
-    "DATASHARD_S3_USE_CONDITIONAL_WRITES": os.getenv("DATASHARD_S3_USE_CONDITIONAL_WRITES"),
-}
-
-
-def _setup_s3_env():
-    """Setup S3 env vars from saved original values."""
-    for key, value in _ORIGINAL_S3_ENV.items():
-        if value is not None:
-            os.environ[key] = value
-    # Ensure storage type is s3
-    os.environ["DATASHARD_STORAGE_TYPE"] = "s3"
-
-
-# Skip all tests if S3 credentials are not configured
-def _s3_configured():
-    return bool(_ORIGINAL_S3_ENV.get("DATASHARD_S3_BUCKET"))
-
-
-pytestmark = pytest.mark.skipif(
-    not _s3_configured(),
-    reason="S3 credentials not configured (set DATASHARD_S3_* env vars)"
+SCHEMA = Schema(
+    schema_id=1,
+    fields=[
+        {"id": 1, "name": "id", "type": "long", "required": True},
+        {"id": 2, "name": "message", "type": "string", "required": False},
+        {"id": 3, "name": "count", "type": "long", "required": False},
+    ],
 )
 
 
-def test_s3_storage_create_table():
-    """Test creating a table with S3 storage backend"""
-    _setup_s3_env()
-
-    # Create unique table name
-    table_name = f"test_table_{uuid.uuid4().hex[:8]}"
-
-    try:
-        # Create schema
-        schema = Schema(
-            schema_id=1,
-            fields=[
-                {"id": 1, "name": "id", "type": "long", "required": True},
-                {"id": 2, "name": "name", "type": "string", "required": False},
-                {"id": 3, "name": "value", "type": "double", "required": False},
-            ],
-        )
-
-        # Create table on S3
-        table = create_table(table_name, schema)
-        assert table is not None
-        assert table.storage.__class__.__name__ == "S3StorageBackend"
-        print(f"✅ Created S3 table: {table_name}")
-
-        # Verify metadata exists
-        assert table.storage.exists("metadata")
-        print("✅ Metadata directory exists on S3")
-
-    finally:
-        # Cleanup env vars
-        for key in [
-            "DATASHARD_STORAGE_TYPE",
-            "DATASHARD_S3_ENDPOINT",
-            "DATASHARD_S3_ACCESS_KEY",
-            "DATASHARD_S3_SECRET_KEY",
-            "DATASHARD_S3_BUCKET",
-            "DATASHARD_S3_REGION",
-            "DATASHARD_S3_USE_CONDITIONAL_WRITES",
-        ]:
-            if key in os.environ:
-                del os.environ[key]
+def test_s3_storage_create_table(s3_env):
+    name = s3_env.table_name()
+    table = create_table(name, SCHEMA)
+    assert type(table.storage).__name__ == "S3StorageBackend"
+    assert table.created
+    assert table.current_snapshot() is None  # initialised, empty
+    # The hint and the v0 metadata are real objects under the table prefix.
+    assert table.storage.exists("metadata.version-hint.text")
+    assert any(k.endswith(".metadata.json") for k in s3_env.keys_under(name + "/metadata/"))
+    assert load_table(name).row_count() == 0
 
 
-def test_s3_storage_write_and_read():
-    """Test writing and reading data with S3 storage"""
-    _setup_s3_env()
+def test_s3_storage_write_and_read(s3_env):
+    name = s3_env.table_name()
+    table = create_table(name, SCHEMA)
+    records = [
+        {"id": 1, "message": "Hello S3", "count": 100},
+        {"id": 2, "message": "MinIO test", "count": 200},
+        {"id": 3, "message": "DataShard rocks", "count": 300},
+    ]
+    with table.transaction_manager.begin_transaction() as txn:
+        txn.append_data(records, SCHEMA)
 
-    # Create unique table name
-    table_name = f"test_table_{uuid.uuid4().hex[:8]}"
-
-    try:
-        # Create schema
-        schema = Schema(
-            schema_id=1,
-            fields=[
-                {"id": 1, "name": "id", "type": "long", "required": True},
-                {"id": 2, "name": "message", "type": "string", "required": False},
-                {"id": 3, "name": "count", "type": "long", "required": False},
-            ],
-        )
-
-        # Create table
-        table = create_table(table_name, schema)
-        print(f"✅ Created table: {table_name}")
-
-        # Write data
-        records = [
-            {"id": 1, "message": "Hello S3", "count": 100},
-            {"id": 2, "message": "MinIO test", "count": 200},
-            {"id": 3, "message": "DataShard rocks", "count": 300},
-        ]
-
-        with table.transaction_manager.begin_transaction() as txn:
-            txn.append_data(records, schema)
-
-        print(f"✅ Wrote {len(records)} records to S3")
-
-        # Read back
-        loaded = load_table(table_name)
-        snapshots = loaded.snapshot_manager.get_all_snapshots()
-        print(f"✅ Read table back, found {len(snapshots)} snapshot(s)")
-
-        # We should have at least 1 snapshot
-        assert len(snapshots) >= 1, f"Expected at least 1 snapshot, got {len(snapshots)}"
-
-        # Verify data files exist
-        if snapshots:
-            snapshot = snapshots[-1]  # Get latest snapshot
-            assert snapshot.manifest_list is not None
-            print(f"✅ Manifest list exists: {snapshot.manifest_list}")
-
-        # Check data path exists
-        assert loaded.storage.exists("data")
-        print("✅ Data directory exists on S3")
-
-    finally:
-        # Cleanup env vars
-        for key in [
-            "DATASHARD_STORAGE_TYPE",
-            "DATASHARD_S3_ENDPOINT",
-            "DATASHARD_S3_ACCESS_KEY",
-            "DATASHARD_S3_SECRET_KEY",
-            "DATASHARD_S3_BUCKET",
-            "DATASHARD_S3_REGION",
-            "DATASHARD_S3_USE_CONDITIONAL_WRITES",
-        ]:
-            if key in os.environ:
-                del os.environ[key]
+    loaded = load_table(name)
+    assert len(loaded.snapshots()) == 1
+    assert loaded.row_count() == 3
+    assert {r["id"]: r["count"] for r in loaded.scan()} == {1: 100, 2: 200, 3: 300}
+    assert loaded.scan(filter={"count": (">", 150)}, columns=["id"]) == [{"id": 2}, {"id": 3}]
+    for df in loaded._get_all_data_files():
+        assert loaded.storage.exists(df.file_path.lstrip("/"))
 
 
-def test_s3_multiple_transactions():
-    """Test multiple concurrent transactions with S3"""
-    _setup_s3_env()
-
-    # Create unique table name
-    table_name = f"test_table_{uuid.uuid4().hex[:8]}"
-
-    try:
-        # Create schema
-        schema = Schema(
-            schema_id=1,
-            fields=[
-                {"id": 1, "name": "batch_id", "type": "long", "required": True},
-                {"id": 2, "name": "item_id", "type": "long", "required": True},
-                {"id": 3, "name": "data", "type": "string", "required": False},
-            ],
-        )
-
-        # Create table
-        create_table(table_name, schema)
-        print(f"✅ Created table: {table_name}")
-
-        # Write multiple batches
-        for batch in range(3):
-            records = [
-                {"batch_id": batch, "item_id": i, "data": f"batch_{batch}_item_{i}"}
-                for i in range(5)
-            ]
-
-            # Reload table each time to ensure we see cumulative snapshots
-            loaded = load_table(table_name)
-            with loaded.transaction_manager.begin_transaction() as txn:
-                txn.append_data(records, schema)
-
-            print(f"✅ Wrote batch {batch} ({len(records)} records)")
-
-        # Verify all snapshots
-        loaded = load_table(table_name)
-        snapshots = loaded.snapshot_manager.get_all_snapshots()
-        print(f"✅ Found {len(snapshots)} snapshot(s)")
-
-        # We should have all 3 batches
-        assert len(snapshots) >= 3, f"Expected at least 3 snapshots, got {len(snapshots)}"
-
-    finally:
-        # Cleanup env vars
-        for key in [
-            "DATASHARD_STORAGE_TYPE",
-            "DATASHARD_S3_ENDPOINT",
-            "DATASHARD_S3_ACCESS_KEY",
-            "DATASHARD_S3_SECRET_KEY",
-            "DATASHARD_S3_BUCKET",
-            "DATASHARD_S3_REGION",
-            "DATASHARD_S3_USE_CONDITIONAL_WRITES",
-        ]:
-            if key in os.environ:
-                del os.environ[key]
+def test_s3_multiple_transactions(s3_env):
+    name = s3_env.table_name()
+    schema = Schema(
+        schema_id=1,
+        fields=[
+            {"id": 1, "name": "batch_id", "type": "long", "required": True},
+            {"id": 2, "name": "item_id", "type": "long", "required": True},
+            {"id": 3, "name": "data", "type": "string", "required": False},
+        ],
+    )
+    create_table(name, schema)
+    for batch in range(3):
+        loaded = load_table(name)  # a fresh reader sees the cumulative snapshots
+        with loaded.transaction_manager.begin_transaction() as txn:
+            txn.append_data(
+                [{"batch_id": batch, "item_id": i, "data": f"batch_{batch}_item_{i}"} for i in range(5)],
+                schema,
+            )
+    loaded = load_table(name)
+    assert len(loaded.snapshots()) == 3
+    assert loaded.row_count() == 15
+    assert len(loaded.scan(filter={"batch_id": 1})) == 5
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("DataShard v0.2.2 - S3 Integration Tests")
-    print("=" * 60)
-    print()
+def test_s3_conditional_writes_are_autodetected(s3_env):
+    table = create_table(s3_env.table_name(), SCHEMA)
+    assert table.storage.supports_cas, "moto / every supported provider honours If-None-Match"
 
-    print("Test 1: Create table on S3")
-    print("-" * 60)
-    test_s3_storage_create_table()
-    print()
 
-    print("Test 2: Write and read data from S3")
-    print("-" * 60)
-    test_s3_storage_write_and_read()
-    print()
+def test_s3_unsafe_polling_lock_is_refused_without_opt_in(s3_env, monkeypatch):
+    monkeypatch.setenv("DATASHARD_S3_USE_CONDITIONAL_WRITES", "false")
+    with pytest.raises(RuntimeError, match="LOST"):
+        create_table(s3_env.table_name(), SCHEMA)
 
-    print("Test 3: Multiple transactions on S3")
-    print("-" * 60)
-    test_s3_multiple_transactions()
-    print()
 
-    print("=" * 60)
-    print("✅ ALL S3 INTEGRATION TESTS PASSED")
-    print("=" * 60)
+def test_s3_unsafe_polling_lock_allowed_with_explicit_opt_in(s3_env, monkeypatch):
+    monkeypatch.setenv("DATASHARD_S3_USE_CONDITIONAL_WRITES", "false")
+    monkeypatch.setenv("DATASHARD_S3_ALLOW_UNSAFE_LOCK", "1")
+    table = create_table(s3_env.table_name(), SCHEMA)
+    assert not table.storage.supports_cas
+    table.append_records([{"id": 1, "message": "m", "count": 1}], SCHEMA)
+    assert load_table(table.table_path).row_count() == 1
+
+
+def test_s3_garbage_collect_keeps_live_data(s3_env):
+    name = s3_env.table_name()
+    table = create_table(name, SCHEMA)
+    for i in range(3):
+        table.append_records([{"id": i, "message": "m", "count": i}], SCHEMA)
+    stats = table.garbage_collect(grace_period_ms=0, allow_short_grace=True)
+    assert stats == {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
+    assert load_table(name).row_count() == 3

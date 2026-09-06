@@ -339,7 +339,9 @@ class DataFileManager:
     def __init__(self, file_manager: "FileManager", storage: "StorageBackend"):
         self.file_manager = file_manager
         self.storage = storage
-        self._arrow_schema_cache: Dict[int, pa.Schema] = {}
+        # Keyed by a fingerprint of the FIELDS (ids, names, types, required, order),
+        # never by schema_id alone: two schemas can share an id and differ (#62).
+        self._arrow_schema_cache: Dict[str, pa.Schema] = {}
         self._pyarrow_fs = self._get_arrow_filesystem()
 
     def _get_arrow_filesystem(self) -> Optional[Any]:
@@ -441,10 +443,18 @@ class DataFileManager:
         table_path = self.file_manager.table_path
         return os.path.join(table_path, path.lstrip("/"))
 
+    @staticmethod
+    def schema_fingerprint(iceberg_schema: Schema) -> str:
+        """Order-preserving identity of a schema's fields."""
+        import json
+
+        return json.dumps(iceberg_schema.fields, sort_keys=True, default=str)
+
     def create_arrow_schema(self, iceberg_schema: Schema) -> pa.Schema:
         """Convert Iceberg schema to PyArrow schema"""
-        if iceberg_schema.schema_id in self._arrow_schema_cache:
-            return self._arrow_schema_cache[iceberg_schema.schema_id]
+        cache_key = self.schema_fingerprint(iceberg_schema)
+        if cache_key in self._arrow_schema_cache:
+            return self._arrow_schema_cache[cache_key]
 
         import pyarrow as pa
 
@@ -463,7 +473,7 @@ class DataFileManager:
             fields.append(pa.field(field_name, arrow_type, nullable=is_nullable))
 
         schema = pa.schema(fields)
-        self._arrow_schema_cache[iceberg_schema.schema_id] = schema
+        self._arrow_schema_cache[cache_key] = schema
         return schema
 
     def _iceberg_type_to_arrow(self, iceberg_type: Union[str, Dict[str, Any]]) -> pa.DataType:

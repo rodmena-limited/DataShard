@@ -40,6 +40,7 @@ from .metadata_manager import (
     AmbiguousCommitError,
     AmbiguousMetadataError,
     ConcurrentModificationException,
+    SchemaMismatchError,
     TableExistsError,
 )
 from .transaction import Table, Transaction
@@ -65,6 +66,7 @@ __all__ = [
     "AmbiguousCommitError",
     "AmbiguousMetadataError",
     "TableExistsError",
+    "SchemaMismatchError",
     "CorruptDataError",
     "GarbageCollectionAborted",
     "__version__",
