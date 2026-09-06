@@ -76,10 +76,10 @@ def test_gc_aborts_when_listing_escapes_table_root(tmp_path, monkeypatch):
 
     from datashard.storage_backend import LocalStorageBackend
 
-    def fake_list_files(self, prefix):  # noqa: ARG001
-        return ["../elsewhere/data/x.parquet"]
+    def fake_listing(self, prefix):  # noqa: ARG001
+        return [("../elsewhere/data/x.parquet", 0.0)]
 
-    monkeypatch.setattr(LocalStorageBackend, "list_files", fake_list_files)
+    monkeypatch.setattr(LocalStorageBackend, "list_files_with_mtime", fake_listing)
     with pytest.raises(GarbageCollectionAborted):
         t.garbage_collect(grace_period_ms=0, allow_short_grace=True)
 

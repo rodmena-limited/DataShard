@@ -35,6 +35,24 @@ object, which the 0.7.2 S3 read path triggered in every process that wrote and t
 
 ---
 
+## 0a. Re-audit of the remediation (issuedb #75, release 0.8.1)
+
+The 0.8.0 fixes were treated as claims and attacked with nine new probes
+(`audit/evaluations/probe_v080_*`). Two defects, both in the new garbage-collector code, were
+CONFIRMED and fixed in 0.8.1:
+
+| Ticket | Sev | Finding | Fix |
+|---|---|---|---|
+| #77 | P1 (skewed hosts) | S3 GC compared server `LastModified` with the **client** clock; a host 2 h fast deleted a commit that landed during GC and left the table unreadable | GC start instant from the storage's clock (S3 `Date` header), skew warning, ages from the listing |
+| #76 | P2 | a commit landing during GC left the new version's `metadata_log` pointing at a reclaimed file | current version, log and retention depth re-read at reclaim time; version window always kept |
+
+Held under attack: 0.7.2-written tables (read, append, GC by 0.8.x; still readable by 0.7.2 afterwards),
+files without page CRCs, compaction across interleaved appends/deletes including time-travel reads,
+240 local and 60 moto-S3 commits under 8- and 4-process contention with compaction firing, parallel
+S3 scans, rollback of caller-provided files. Harness on 0.8.1: 31 probes, all PASS.
+
+---
+
 ## 1. Verdict
 
 > **NOT production-worthy for data you cannot lose. Certification denied.**

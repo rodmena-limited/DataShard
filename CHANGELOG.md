@@ -5,6 +5,33 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-09-06
+
+Re-audit of 0.8.0 (issuedb #75): the remediation itself was put under the same
+falsification pressure as the original code. Nine new probes (`audit/evaluations/probe_v080_*`);
+two defects found in the new garbage-collector code, both fixed here. Verified unchanged: 0.7.2
+tables read, append and garbage-collect under 0.8.x and remain readable by 0.7.2; compaction
+preserves current and historical file sets; 240 local and 60 S3 commits under multi-process
+contention with compaction firing lost nothing.
+
+### Fixed
+
+- **GC on S3 judged object age against the client clock.** A GC host running ahead of the
+  object store by more than the grace period deleted a commit that landed during the run
+  (its marker already removed, unreachable in GC's view) and left the table unreadable. GC
+  now takes its start instant from the storage's clock (S3: the HTTP `Date` header) and
+  warns when host and server disagree by more than 60 s (#77).
+- **GC could reclaim the metadata file the newest version's log references** when a
+  commit landed during the run: the log was taken from the view read at GC start. The
+  current version, its log and `write.metadata.previous-versions-max` are re-read at reclaim
+  time, and every metadata file inside that version window is kept regardless (#76).
+
+### Changed
+
+- GC takes object modification times from the listing (`LastModified` on S3, one stat during
+  the walk locally) instead of one HEAD/stat per candidate, so a sweep over many orphans costs
+  O(listing pages) (#77). New `StorageBackend.list_files_with_mtime()` and `clock_ms()`.
+
 ## [0.8.0] - 2026-09-06
 
 Remediation of adversarial audit #55 (`AUDIT_REPORT_3.md`): five reproduced data-loss /

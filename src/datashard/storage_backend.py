@@ -20,6 +20,7 @@ S3-compatible storage:
 import json
 import os
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -113,6 +114,25 @@ class StorageBackend(ABC):
     def get_modified_time(self, path: str) -> float:
         """Get file modification time as unix timestamp"""
         pass
+
+    def list_files_with_mtime(self, prefix: str) -> List[Tuple[str, float]]:
+        """(table-relative path, modification time) for every file under prefix.
+
+        Backends whose listing already carries timestamps override this so a
+        garbage-collection sweep costs O(listing pages), not one stat per object (#77).
+        """
+        return [(p, self.get_modified_time(p)) for p in self.list_files(prefix)]
+
+    def clock_ms(self) -> float:
+        """The clock modification times are measured on, in ms since the epoch.
+
+        Age decisions must compare like with like: for local files that is this
+        host's clock; an object store reports ITS clock, which S3StorageBackend
+        reads from a response header. A GC host running fast once deleted a commit
+        that landed during the run because it compared its own clock with the
+        server's LastModified (#77).
+        """
+        return time.time() * 1000
 
     @abstractmethod
     def create_lock(self, path: str, timeout: float = 30.0) -> "LockProvider":
@@ -365,6 +385,29 @@ class LocalStorageBackend(StorageBackend):
                 result.append(rel_path)
         return result
 
+    def list_files_with_mtime(self, prefix: str) -> List[Tuple[str, float]]:
+        """Walk once and stat each file in place (no second resolve per file, #77)."""
+        full_prefix = self._resolve_path(prefix)
+        if not os.path.exists(full_prefix):
+            return []
+        base_path = self._real_base_path()
+        result: List[Tuple[str, float]] = []
+        for root, _dirs, files in os.walk(full_prefix):
+            for file in files:
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, base_path)
+                if rel_path == os.pardir or rel_path.startswith(os.pardir + os.sep):
+                    raise ValueError(
+                        f"Security Error: listing under '{prefix}' produced a path outside "
+                        f"the table root: '{rel_path}' (resolved '{full_path}', base '{base_path}')"
+                    )
+                try:
+                    mtime = os.path.getmtime(full_path)
+                except FileNotFoundError:
+                    continue  # removed between walk and stat (a concurrent GC or rollback)
+                result.append((rel_path, mtime))
+        return result
+
     def delete_file(self, path: str) -> None:
         full_path = self._resolve_path(path)
         if os.path.exists(full_path):
@@ -389,83 +432,10 @@ class LocalStorageBackend(StorageBackend):
 
 
 def create_storage_backend(table_path: str) -> StorageBackend:
-    """
-    Create storage backend based on environment configuration.
+    """Create the storage backend selected by the environment (see backend_factory)."""
+    from .backend_factory import create_storage_backend as _factory
 
-    Environment variables:
-        DATASHARD_STORAGE_TYPE: "local" (default) or "s3"
-
-        For S3:
-            DATASHARD_S3_ENDPOINT: S3 endpoint URL (optional, for MinIO/custom endpoints)
-            DATASHARD_S3_ACCESS_KEY: AWS access key
-            DATASHARD_S3_SECRET_KEY: AWS secret key
-            DATASHARD_S3_BUCKET: S3 bucket name
-            DATASHARD_S3_REGION: AWS region (default: us-east-1)
-            DATASHARD_S3_PREFIX: Optional prefix for all objects (default: "")
-            DATASHARD_S3_USE_CONDITIONAL_WRITES: unset (default) = probe the
-                provider once and use CAS locking when it honours conditional PUTs
-                (AWS S3, OVH Object Storage, MinIO and most others do); "true" forces
-                CAS; "false" selects the best-effort polling lock, which REQUIRES
-                DATASHARD_S3_ALLOW_UNSAFE_LOCK=1 because it can lose commits (#59).
-
-    Args:
-        table_path: Table location (local path or S3-style identifier)
-
-    Returns:
-        StorageBackend instance
-    """
-    storage_type = os.getenv("DATASHARD_STORAGE_TYPE", "local").lower()
-
-    if storage_type == "s3":
-        # S3 configuration
-        bucket = os.getenv("DATASHARD_S3_BUCKET")
-        if not bucket:
-            raise ValueError("DATASHARD_S3_BUCKET environment variable is required for S3 storage")
-
-        endpoint_url = os.getenv("DATASHARD_S3_ENDPOINT")
-        access_key = os.getenv("DATASHARD_S3_ACCESS_KEY")
-        secret_key = os.getenv("DATASHARD_S3_SECRET_KEY")
-        region = os.getenv("DATASHARD_S3_REGION", "us-east-1")
-        env_prefix = os.getenv("DATASHARD_S3_PREFIX", "")
-        raw_cas = os.getenv("DATASHARD_S3_USE_CONDITIONAL_WRITES", "").strip().lower()
-        use_conditional_writes: Optional[bool] = (
-            None if raw_cas == "" else raw_cas in ("true", "1", "yes")
-        )
-        allow_unsafe_lock = os.getenv("DATASHARD_S3_ALLOW_UNSAFE_LOCK", "").strip().lower() in (
-            "true", "1", "yes",
-        )
-
-        # Combine environment prefix with table path for full S3 prefix
-        # table_path is the logical location of the table (e.g., "logs/workflow_logs")
-        table_prefix = table_path.strip("/")
-        if env_prefix and table_prefix:
-            full_prefix = f"{env_prefix.rstrip('/')}/{table_prefix}"
-        elif env_prefix:
-            full_prefix = env_prefix.rstrip("/")
-        elif table_prefix:
-            full_prefix = table_prefix
-        else:
-            full_prefix = ""
-
-        # Validate credentials - Optional, falls back to IAM/Env if missing
-        if not (access_key and secret_key):
-            logger.info("No explicit S3 credentials provided. Using default AWS credential chain (IAM Role, Env Vars, etc.)")
-
-        from .s3_backend import S3StorageBackend
-
-        return S3StorageBackend(
-            bucket=bucket,
-            endpoint_url=endpoint_url,
-            access_key=access_key,
-            secret_key=secret_key,
-            region=region,
-            prefix=full_prefix,
-            use_conditional_writes=use_conditional_writes,
-            allow_unsafe_lock=allow_unsafe_lock,
-        )
-    else:
-        # Local filesystem (default)
-        return LocalStorageBackend(table_path)
+    return _factory(table_path)
 
 
 _S3_NAMES = {"S3StorageBackend", "S3RangeFile", "S3FileStream", "UNSAFE_LOCK_MESSAGE", "BOTO3_AVAILABLE"}

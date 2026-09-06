@@ -8,6 +8,9 @@ Safety model (bank-grade, fail closed):
 - Every "older than" decision is relative to the instant GC STARTED (taken before
   the first storage read), never to "now" at deletion time. A file written after
   GC started can never look old enough to delete, however long GC runs (#57).
+  That instant is read from the STORAGE's clock (S3: the server's Date header),
+  because object timestamps are the server's; a GC host running fast once
+  deleted a commit that landed mid-run (#77).
 - In-flight markers are loaded BEFORE the table metadata is read, so a
   transaction that commits after the metadata read is still covered by the
   markers it held at that instant (#57). Markers protect files regardless of age
@@ -29,6 +32,10 @@ from .data_structures import ManifestFile, Snapshot, TableMetadata
 from .file_manager import FileManager
 from .metadata_manager import MetadataManager
 from .version_hint import _METADATA_FILE_RE
+
+# Client/server clock difference above which GC warns (age decisions still use the
+# storage clock; the warning is for the operator).
+CLOCK_SKEW_WARN_MS = 60 * 1000
 
 logger = logging.getLogger(__name__)
 
@@ -103,8 +110,15 @@ class GarbageCollector:
 
         stats = {"data_files": 0, "manifest_files": 0, "manifest_lists": 0, "metadata_files": 0}
 
-        # 0. The clock for every age decision is taken BEFORE any storage read.
-        gc_start_ms = time.time() * 1000
+        # 0. The clock for every age decision is taken BEFORE any storage read, from
+        # the storage's own clock (#77).
+        gc_start_ms = self.storage.clock_ms()
+        skew_ms = gc_start_ms - time.time() * 1000
+        if abs(skew_ms) > CLOCK_SKEW_WARN_MS:
+            logger.warning(
+                f"Clock skew of {skew_ms / 1000:+.0f} s between the storage server and this host; "
+                f"GC age decisions use the server clock"
+            )
 
         # 1. In-flight markers FIRST (#57): a commit that lands after the metadata
         # read below was necessarily in flight - and marked - at this instant.
@@ -191,42 +205,61 @@ class GarbageCollector:
     def _gc_metadata_files(self, metadata: TableMetadata, cutoff_ms: float) -> int:
         """Delete superseded metadata files older than the cutoff (#68).
 
-        Kept: the current metadata file, every file named in metadata_log (the
-        auditable chain, write.metadata.previous-versions-max deep), and anything
-        newer than the cutoff (a commit in flight). Everything else under
-        metadata/ that is a v*.metadata.json or a '.tmp.*' leftover is reclaimed.
-        Every commit used to leave a full metadata copy behind forever, which is
-        quadratic in the number of commits.
+        The current version, its metadata_log and the retention depth are re-read
+        HERE, at reclaim time: a commit that landed during reachability has moved
+        the hint on, and its log names the file that was current when GC started
+        (#76). Kept: every metadata file whose version is within
+        write.metadata.previous-versions-max of the current version (or ahead of
+        it), every file the current log names, and anything newer than the cutoff.
+        Everything else under metadata/ that is a v*.metadata.json or a '.tmp.*'
+        leftover is reclaimed. Every commit used to leave a full metadata copy
+        behind forever, which is quadratic in the number of commits.
         """
         meta_dir = self.metadata_manager.metadata_path
-        keep: Set[str] = set()
+        current = self.metadata_manager.refresh()  # fresh view, not the one from GC start
+        if current is None:
+            return 0
         info = self.metadata_manager._current_version_info()
-        if info is not None:
-            keep.add(f"{meta_dir}/{info[1]}")
-        for entry in metadata.metadata_log:
+        if info is None:
+            return 0
+        current_version, current_file = info
+        raw_max = current.properties.get(MetadataManager.PREVIOUS_VERSIONS_MAX_PROPERTY)
+        try:
+            keep_versions = (
+                int(raw_max) if raw_max is not None else MetadataManager.DEFAULT_PREVIOUS_VERSIONS_MAX
+            )
+        except (TypeError, ValueError):
+            keep_versions = MetadataManager.DEFAULT_PREVIOUS_VERSIONS_MAX
+        oldest_kept_version = current_version - max(keep_versions, 0)
+
+        keep: Set[str] = {f"{meta_dir}/{current_file}"}
+        for entry in current.metadata_log:
             named = entry.get("metadata-file") if isinstance(entry, dict) else None
             if named:
                 keep.add(self._normalize_path(named))
 
         try:
-            listed = self.storage.list_files(meta_dir)
+            listed = self.storage.list_files_with_mtime(meta_dir)
         except Exception as e:
             raise GarbageCollectionAborted(
                 f"Aborting GC: cannot list files under {meta_dir}: {e}"
             ) from e
 
         deleted = 0
-        for rel in listed:
+        for rel, mtime in listed:
             norm = self._normalize_path(rel)
             parent, _, base = norm.rpartition("/")
             if parent != meta_dir:
                 continue  # manifests/, inflight/ are handled elsewhere
-            if not (_METADATA_FILE_RE.match(base) or base.startswith(".tmp.")):
+            match = _METADATA_FILE_RE.match(base)
+            if not (match or base.startswith(".tmp.")):
                 continue
             if norm in keep:
                 continue
+            if match and int(match.group(1)) >= oldest_kept_version:
+                continue  # inside the retention window (or ahead of the current version)
             try:
-                if self.storage.get_modified_time(norm) * 1000 < cutoff_ms:
+                if mtime * 1000 < cutoff_ms:
                     logger.debug(f"Deleting superseded metadata file: {norm}")
                     self.storage.delete_file(norm)
                     deleted += 1
@@ -248,17 +281,13 @@ class GarbageCollector:
         cutoff = now_ms - inflight_timeout_ms
 
         try:
-            markers = self.storage.list_files(INFLIGHT_PATH)
+            markers = self.storage.list_files_with_mtime(INFLIGHT_PATH)
         except Exception:
             markers = []
 
-        for marker_path in markers:
+        for marker_path, mtime in markers:
             norm_marker = self._normalize_path(marker_path)
-            try:
-                age_ok = self.storage.get_modified_time(norm_marker) * 1000 >= cutoff
-            except Exception:
-                # Can't stat the marker: keep protection (fail closed)
-                age_ok = True
+            age_ok = mtime * 1000 >= cutoff
 
             basename = norm_marker.rsplit("/", 1)[-1]
             if not basename.endswith(".inflight"):
@@ -304,13 +333,13 @@ class GarbageCollector:
         deleted_count = 0
 
         try:
-            all_files = self.storage.list_files(prefix)
+            all_files = self.storage.list_files_with_mtime(prefix)
         except Exception as e:
             raise GarbageCollectionAborted(
                 f"Aborting GC: cannot list files under {prefix}: {e}"
             ) from e
 
-        for file_rel_path in all_files:
+        for file_rel_path, mtime in all_files:
             norm_path = self._normalize_path(file_rel_path)
 
             # Independent guard against the #45 class of bug: a listed path that
@@ -324,9 +353,10 @@ class GarbageCollector:
                 )
 
             if norm_path not in reachable_set:
-                # Potential orphan. Check age against the GC start clock.
+                # Potential orphan. Its age comes from the listing (#77) and is
+                # compared against the GC start clock.
                 try:
-                    if self.storage.get_modified_time(file_rel_path) * 1000 < cutoff_ms:
+                    if mtime * 1000 < cutoff_ms:
                         # Per-file detail at DEBUG: a sweep over a large table
                         # would otherwise emit one INFO line per object. The
                         # summary below stays at INFO.

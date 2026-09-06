@@ -26,10 +26,6 @@ except ImportError:
     BOTO3_AVAILABLE = False
 
 
-# Providers found to honour / ignore conditional PUTs, keyed by (endpoint, bucket).
-# One probe per process per bucket, not one per Table.
-_CAS_SUPPORT_CACHE: Dict[Tuple[Optional[str], str], bool] = {}
-
 UNSAFE_LOCK_MESSAGE = (
     "This S3 endpoint does not honour conditional writes (If-None-Match / If-Match), "
     "or DATASHARD_S3_USE_CONDITIONAL_WRITES=false was set. Without them datashard "
@@ -119,55 +115,10 @@ class S3StorageBackend(StorageBackend):
             )
 
     def _detect_conditional_writes(self) -> bool:
-        """Ask the provider, don't believe a comment (#59).
+        """Ask the provider whether it honours conditional PUTs (see s3_cas_probe, #59)."""
+        from .s3_cas_probe import detect_conditional_writes
 
-        Writes a small probe object, then re-PUTs it with If-None-Match:* and with a
-        stale If-Match. A provider that honours preconditions answers 412 to both;
-        one that silently overwrites (or rejects the header) is treated as having
-        NO conditional-write support - enabling CAS there would be unsafe. The
-        result is cached per (endpoint, bucket) for the process lifetime.
-        """
-        import uuid
-
-        cache_key = (self.endpoint_url, self.bucket)
-        if cache_key in _CAS_SUPPORT_CACHE:
-            return _CAS_SUPPORT_CACHE[cache_key]
-
-        key = self._get_s3_key(f".locks/.cas-probe-{uuid.uuid4().hex}")
-        supported = False
-        try:
-            self.s3.put_object(Bucket=self.bucket, Key=key, Body=b"probe")
-            try:
-                self.s3.put_object(Bucket=self.bucket, Key=key, Body=b"overwrite", IfNoneMatch="*")
-                none_match_honoured = False  # overwrote: precondition ignored
-            except ClientError as e:
-                code = e.response.get("Error", {}).get("Code", "")
-                none_match_honoured = code in ("PreconditionFailed", "412", "ConditionalRequestConflict")
-            try:
-                self.s3.put_object(
-                    Bucket=self.bucket, Key=key, Body=b"overwrite",
-                    IfMatch='"00000000000000000000000000000000"',
-                )
-                if_match_honoured = False
-            except ClientError as e:
-                code = e.response.get("Error", {}).get("Code", "")
-                if_match_honoured = code in ("PreconditionFailed", "412", "ConditionalRequestConflict")
-            supported = none_match_honoured and if_match_honoured
-        finally:
-            try:
-                self.s3.delete_object(Bucket=self.bucket, Key=key)
-            except Exception:  # noqa: BLE001 - best-effort cleanup of the probe object
-                pass
-
-        if supported:
-            logger.info(f"S3 endpoint {self.endpoint_url or 'aws'} honours conditional writes: using CAS locking")
-        else:
-            logger.error(
-                f"S3 endpoint {self.endpoint_url or 'aws'} does NOT honour conditional writes "
-                f"(If-None-Match / If-Match); only the unsafe polling lock is available"
-            )
-        _CAS_SUPPORT_CACHE[cache_key] = supported
-        return supported
+        return detect_conditional_writes(self.s3, self.bucket, self._get_s3_key, self.endpoint_url)
 
     def _get_s3_key(self, path: str) -> str:
         """Convert path to S3 key"""
@@ -447,6 +398,60 @@ class S3StorageBackend(StorageBackend):
                 raise
 
         return with_s3_retry(size_op, f"S3 size: {key}")
+
+    def list_files_with_mtime(self, prefix: str) -> List[Tuple[str, float]]:
+        """Listing with LastModified per key: no HEAD per object (#77)."""
+        from .s3_consistency import with_s3_retry
+
+        s3_prefix = self._get_s3_key(prefix).rstrip("/")
+        if s3_prefix:
+            s3_prefix += "/"
+
+        def list_op() -> List[Tuple[str, float]]:
+            result: List[Tuple[str, float]] = []
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=s3_prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    if self.prefix and key.startswith(self.prefix + "/"):
+                        rel_path = key[len(self.prefix) + 1 :]
+                    else:
+                        rel_path = key
+                    result.append((rel_path, float(obj["LastModified"].timestamp())))
+            return result
+
+        return with_s3_retry(list_op, f"S3 list+mtime: {s3_prefix}")
+
+    def clock_ms(self) -> float:
+        """The S3 server's clock, from the HTTP Date header of a HEAD request (#77).
+
+        Falls back to the local clock (with a warning) only if the provider sends
+        no Date header - HTTP/1.1 requires one, so that should not happen.
+        """
+        from email.utils import parsedate_to_datetime
+
+        from .s3_consistency import with_s3_retry
+
+        key = self._get_s3_key("metadata.version-hint.text")
+
+        def head_op() -> Dict[str, Any]:
+            try:
+                return dict(self.s3.head_object(Bucket=self.bucket, Key=key))
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey", "NotFound"):
+                    return dict(e.response)  # the headers travel with the error response
+                raise
+
+        resp = with_s3_retry(head_op, "S3 clock (HEAD)")
+        headers = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        date_header = headers.get("date") or headers.get("Date")
+        if date_header:
+            try:
+                return parsedate_to_datetime(date_header).timestamp() * 1000
+            except (TypeError, ValueError):
+                pass
+        logger.warning("S3 response carried no usable Date header; using the local clock for GC age decisions")
+        return super().clock_ms()
 
     def get_modified_time(self, path: str) -> float:
         """Object mtime, retried: GC compares it against the grace period, and
