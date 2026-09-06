@@ -215,6 +215,31 @@ class _ScanMixin:
         except TypeError:  # pyarrow < 14 has no promote_options
             return pa.concat_tables(tables)
 
+    def to_arrow(
+        self,
+        columns: Optional[List[str]] = None,
+        filter: Optional[Dict[str, Any]] = None,
+        parallel: Union[bool, int] = False,
+        verify_checksums: Optional[Union[bool, str]] = None,
+        snapshot_id: Optional[int] = None,
+    ) -> Any:
+        """Read the table as a pyarrow.Table - the interchange for DuckDB, Polars and
+        friends (#78). Same filter, integrity and snapshot semantics as scan(). An
+        empty result has zero rows and the table's (projected) schema.
+        """
+        import pyarrow as pa
+
+        combined = self._scan_table(columns, filter, parallel, verify_checksums, snapshot_id)
+        if combined is not None:
+            return combined
+        schema = self._get_current_schema()
+        if schema is None or not schema.fields:
+            return pa.schema([]).empty_table()
+        arrow_schema = self.file_manager.data_file_manager.create_arrow_schema(schema)
+        if columns is not None:
+            arrow_schema = pa.schema([arrow_schema.field(c) for c in columns])
+        return arrow_schema.empty_table()
+
     def scan(
         self,
         columns: Optional[List[str]] = None,

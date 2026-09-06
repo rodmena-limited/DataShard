@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .data_structures import DataFile, Schema, Snapshot, TableMetadata
+from .duckdb_bridge import _DuckDBMixin
 from .file_manager import FileManager
 from .logging_config import get_logger
 from .metadata_manager import MetadataManager
@@ -23,7 +24,7 @@ DEFAULT_SNAPSHOT_MAX_AGE_MS = 5 * 24 * 3600 * 1000
 
 
 
-class Table(_ScanMixin):
+class Table(_ScanMixin, _DuckDBMixin):
     """Main table interface with transaction support"""
 
     def __init__(
@@ -129,6 +130,13 @@ class Table(_ScanMixin):
         """Append pandas DataFrame to table (convenience method)"""
         with self.new_transaction() as tx:
             tx.append_pandas(df, schema)
+            result = tx.commit()
+            return bool(result)
+
+    def append_arrow(self, table: Any, schema: Optional["Schema"] = None) -> bool:
+        """Append a pyarrow.Table in one transaction (convenience method, #79)."""
+        with self.new_transaction() as tx:
+            tx.append_arrow(table, schema)
             result = tx.commit()
             return bool(result)
 

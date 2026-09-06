@@ -10,6 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .arrow_types import iceberg_type_to_arrow
+from .column_stats import compute_column_bounds
 from .data_io import PANDAS_AVAILABLE, DataFileReader, DataFileWriter, pd
 from .data_structures import DataFile, FileFormat, Schema
 from .integrity import IntegrityChecker
@@ -307,66 +308,56 @@ class DataFileManager:
         )
 
     def _compute_column_bounds(
+        self, table: pa.Table, iceberg_schema: Schema
+    ) -> Tuple[Optional[Dict[int, Any]], Optional[Dict[int, Any]]]:
+        """Min/max per column for file pruning (see column_stats)."""
+        return compute_column_bounds(table, iceberg_schema)
+
+    def write_arrow_file(
         self,
+        file_path: str,
         table: pa.Table,
         iceberg_schema: Schema,
-    ) -> Tuple[Optional[Dict[int, Any]], Optional[Dict[int, Any]]]:
-        """Compute min/max bounds for each column.
+        file_format: FileFormat = FileFormat.PARQUET,
+        partition_values: Optional[Dict[str, Any]] = None,
+    ) -> DataFile:
+        """Write an Arrow table as one data file and return its DataFile metadata (#79).
 
-        These bounds are used for partition pruning - allowing scan() to
-        skip files that cannot contain matching records.
-
-        Args:
-            table: PyArrow Table with the data
-            iceberg_schema: Iceberg schema for field ID mapping
-
-        Returns:
-            Tuple of (lower_bounds, upper_bounds) dicts mapping field ID to value
+        The table is conformed to the persisted schema: columns not in the schema
+        are an error (never silently dropped), optional columns that are absent are
+        filled with nulls, columns are reordered to the table's order and cast to
+        the table's Arrow types (so an int64 column lands in a `long` field and a
+        DuckDB result can be appended as is); required columns must be null-free.
         """
-        import pyarrow.compute as pc
-
-        lower_bounds: Dict[int, Any] = {}
-        upper_bounds: Dict[int, Any] = {}
-
-        for field_dict in iceberg_schema.fields:
-            field_id = field_dict.get("id")
-            field_name = field_dict.get("name")
-            field_type = field_dict.get("type", "string")
-
-            if field_id is None or field_name is None:
-                continue
-
-            if field_name not in table.column_names:
-                continue
-
-            # Skip complex types and binary - can't compute meaningful bounds
-            if field_type in ("binary", "fixed", "list", "map", "struct"):
-                continue
-
-            column = table.column(field_name)
-
-            try:
-                # Compute min/max using PyArrow compute
-                min_scalar = pc.min(column)
-                max_scalar = pc.max(column)
-
-                min_val = min_scalar.as_py()
-                max_val = max_scalar.as_py()
-
-                if min_val is not None:
-                    lower_bounds[field_id] = min_val
-                if max_val is not None:
-                    upper_bounds[field_id] = max_val
-            except pa.ArrowNotImplementedError:
-                # min/max is not defined for this column type: no bounds, hence
-                # no pruning for it (correct, just less selective).
-                logger.debug(
-                    f"No min/max support for column '{field_name}' "
-                    f"({column.type}); skipping bounds"
-                )
-                continue
-
-        return lower_bounds if lower_bounds else None, upper_bounds if upper_bounds else None
+        if file_format != FileFormat.PARQUET:
+            raise ValueError(f"Unsupported file format: {file_format}")
+        arrow_schema = self.create_arrow_schema(iceberg_schema)
+        unknown = set(table.column_names) - set(arrow_schema.names)
+        if unknown:
+            raise ValueError(
+                f"Table has columns not in the table schema: {sorted(unknown)}. "
+                f"Schema fields: {sorted(arrow_schema.names)}. Refusing to silently drop data."
+            )
+        for field in arrow_schema:
+            if field.name not in table.column_names:
+                table = table.append_column(field.name, pa.nulls(table.num_rows, type=field.type))
+        try:
+            table = table.select(arrow_schema.names).cast(arrow_schema)
+        except _SCHEMA_MISMATCH_ERRORS as e:
+            raise ValueError(f"Table is not compatible with the table schema: {e}") from e
+        self.validate_arrow_table_strict(table, iceberg_schema)
+        lower_bounds, upper_bounds = self._compute_column_bounds(table, iceberg_schema)
+        file_size, checksum = self._write_arrow_table(file_path, table)
+        return DataFile(
+            file_path=file_path,
+            file_format=file_format,
+            partition_values=partition_values or {},
+            record_count=table.num_rows,
+            file_size_in_bytes=file_size,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            checksum=checksum,
+        )
 
     def write_pandas_file(
         self,
@@ -378,17 +369,13 @@ class DataFileManager:
     ) -> DataFile:
         """Write a pandas DataFrame to a file and return DataFile metadata (requires pandas).
 
-        Native pa.Table.from_pandas conversion - no per-row dict round trip (#69).
-        Columns absent from the schema are an error (from_pandas would silently
-        drop them); required columns must be present and null-free.
+        Native pa.Table.from_pandas conversion - no per-row dict round trip (#69);
+        the rest is write_arrow_file's conformance and validation.
         """
         if not PANDAS_AVAILABLE:
             raise ImportError(
                 "pandas is not available. Install with: pip install datashard[pandas]"
             )
-        if file_format != FileFormat.PARQUET:
-            raise ValueError(f"Unsupported file format: {file_format}")
-
         allowed = {str(f["name"]) for f in iceberg_schema.fields}
         unknown = {str(c) for c in df.columns} - allowed
         if unknown:
@@ -401,20 +388,7 @@ class DataFileManager:
             table = pa.Table.from_pandas(df, schema=arrow_schema, preserve_index=False)
         except _SCHEMA_MISMATCH_ERRORS as e:
             raise ValueError(f"DataFrame is not compatible with the table schema: {e}") from e
-        self.validate_arrow_table_strict(table, iceberg_schema)
-        lower_bounds, upper_bounds = self._compute_column_bounds(table, iceberg_schema)
-        file_size, checksum = self._write_arrow_table(file_path, table)
-
-        return DataFile(
-            file_path=file_path,
-            file_format=file_format,
-            partition_values=partition_values or {},
-            record_count=table.num_rows,
-            file_size_in_bytes=file_size,
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
-            checksum=checksum,
-        )
+        return self.write_arrow_file(file_path, table, iceberg_schema, file_format, partition_values)
 
     def read_data_file(
         self,

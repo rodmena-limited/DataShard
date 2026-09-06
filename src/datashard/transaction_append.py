@@ -158,6 +158,40 @@ class _AppendMixin:
         )
         return self._queue_written_file(file_path, data_file)
 
+    def append_arrow(
+        self,
+        table: Any,
+        schema: Optional["Schema"] = None,
+        partition_values: Optional[Dict[str, Any]] = None,
+    ) -> "Transaction":
+        """Append a pyarrow.Table as one data file (#79).
+
+        The natural ingestion path for DuckDB / Polars / Arrow producers: no
+        per-row dict round trip. Columns are conformed to the table's schema (see
+        DataFileManager.write_arrow_file). An empty table queues nothing.
+        """
+        import pyarrow as pa
+
+        if not isinstance(table, pa.Table):
+            raise ValueError("Expected a pyarrow.Table")
+        if not self.is_active():
+            raise RuntimeError("Transaction is not active")
+        if table.num_rows == 0:
+            logger.warning("append_arrow: empty table - nothing queued (no data file, no snapshot)")
+            return cast("Transaction", self)
+
+        schema = self._schema_for_append(schema)
+        file_path = self._new_data_file_path()
+        self._register_inflight(file_path)
+        data_file = self.file_manager.data_file_manager.write_arrow_file(
+            file_path=file_path,
+            table=table,
+            iceberg_schema=schema,
+            file_format=FileFormat.PARQUET,
+            partition_values=partition_values or {},
+        )
+        return self._queue_written_file(file_path, data_file)
+
     def _resolve_table_schema(self) -> Optional[Schema]:
         """Resolve the table's persisted current schema, or None if the table
         has no usable (non-empty) schema. Cached for the transaction's lifetime."""
