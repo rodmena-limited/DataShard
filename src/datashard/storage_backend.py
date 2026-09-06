@@ -70,6 +70,13 @@ class StorageBackend(ABC):
         """Write bytes to file"""
         pass
 
+    def write_files(self, items: List[Tuple[str, bytes]]) -> None:
+        """Write several independent files; backends with latency per request do it
+        concurrently (#80). Every write completes (or raises) before this returns.
+        """
+        for path, content in items:
+            self.write_file(path, content)
+
     @abstractmethod
     def read_json(self, path: str) -> Dict[str, Any]:
         """Read JSON file"""

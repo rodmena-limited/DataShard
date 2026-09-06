@@ -127,6 +127,7 @@ class FileManager:
         existing_files: Optional[List[DataFile]] = None,
         sequence_number: Optional[int] = None,
         pre_write_hook: Optional[Callable[[str], None]] = None,
+        manifest_path: Optional[str] = None,
     ) -> ManifestFile:
         """Create a manifest file for the given data files.
 
@@ -150,9 +151,8 @@ class FileManager:
         # Unique manifest file name: timestamp + random suffix. Two concurrent
         # committers in the same microsecond must never collide - a shared name
         # would make one snapshot silently list the other's files.
-        timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
-        manifest_filename = f"manifest_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
-        manifest_path = f"{self.manifests_path}/{manifest_filename}"
+        if manifest_path is None:
+            manifest_path = self.new_manifest_path()
 
         snapshot_id_val = snapshot_id or int(datetime.now().timestamp() * 1000)
 
@@ -298,11 +298,24 @@ class FileManager:
             ]
         return data_files_from_json(content, manifest_path)
 
+    def new_manifest_path(self) -> str:
+        """Unique table-relative path for a manifest about to be written. Two concurrent
+        committers in the same microsecond must never collide - a shared name would make
+        one snapshot silently list the other's files."""
+        timestamp = int(datetime.now().timestamp() * 1000000)  # microseconds
+        return f"{self.manifests_path}/manifest_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
+
+    def new_manifest_list_path(self, snapshot_id: int) -> str:
+        """Unique table-relative path for a snapshot's manifest list."""
+        timestamp = int(datetime.now().timestamp() * 1000)
+        return f"{self.manifests_path}/manifest_list_{snapshot_id}_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
+
     def create_manifest_list(
         self,
         manifest_files: List[ManifestFile],
         snapshot_id: int,
         pre_write_hook: Optional[Callable[[str], None]] = None,
+        list_path: Optional[str] = None,
     ) -> ManifestListInfo:
         """Write the manifest list for a snapshot and return path, length and sha256.
 
@@ -312,9 +325,8 @@ class FileManager:
             pre_write_hook: Called with the list's table-relative path before it
                 is written (GC protection for a not-yet-reachable file).
         """
-        timestamp = int(datetime.now().timestamp() * 1000)
-        list_filename = f"manifest_list_{snapshot_id}_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
-        list_path = f"{self.manifests_path}/{list_filename}"
+        if list_path is None:
+            list_path = self.new_manifest_list_path(snapshot_id)
 
         records: List[Dict[str, Any]] = []
         for mf in manifest_files:

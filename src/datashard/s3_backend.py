@@ -218,6 +218,19 @@ class S3StorageBackend(StorageBackend):
         with_s3_retry(write_op, f"S3 write: {key}")
         logger.debug(f"Successfully wrote S3 file: {path}")
 
+    def write_files(self, items: List[Tuple[str, bytes]]) -> None:
+        """Independent PUTs issued concurrently; one commit's marker writes used to be
+        serial round trips of ~200 ms each on OVH (#80). Raises the first failure."""
+        if len(items) <= 1:
+            for path, content in items:
+                self.write_file(path, content)
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+            for _ in pool.map(lambda item: self.write_file(item[0], item[1]), items):
+                pass
+
     @property
     def supports_cas(self) -> bool:
         """CAS via conditional PUT (If-Match / If-None-Match) when the provider supports it."""

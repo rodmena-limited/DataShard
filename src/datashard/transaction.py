@@ -3,10 +3,8 @@ ACID transaction implementation for the Python Iceberg implementation
 """
 
 import copy
-import json
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -16,6 +14,7 @@ from .data_structures import (
     TableMetadata,
 )
 from .file_manager import FileManager
+from .inflight_markers import _INFLIGHT_PATH, _InflightMixin  # noqa: F401 - re-exported
 from .logging_config import get_logger
 from .metadata_manager import (
     AmbiguousCommitError,
@@ -28,9 +27,7 @@ from .transaction_commit import _CommitOpsMixin
 
 logger = get_logger(__name__)
 
-# Directory (relative to table root) for in-flight GC-protection markers.
-# Kept in sync with garbage_collector.INFLIGHT_PATH.
-_INFLIGHT_PATH = "metadata/inflight"
+
 
 @dataclass
 class _Plan:
@@ -44,7 +41,7 @@ class _Plan:
     compact: bool = False
 
 
-class Transaction(_AppendMixin, _CommitOpsMixin):
+class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
     """Represents a database transaction with ACID properties"""
 
     def __init__(
@@ -117,33 +114,6 @@ class Transaction(_AppendMixin, _CommitOpsMixin):
     def is_active(self) -> bool:
         """Check if transaction is active"""
         return self._is_active and not self._is_committed and not self._is_rolled_back
-
-    def _register_inflight(self, file_path: str) -> None:
-        """Write a GC-protection marker for a file this transaction is about to
-        write but that no snapshot references yet.
-
-        Used for data files AND for the manifests / manifest lists of a commit
-        in progress: without a marker, a concurrent garbage collection running
-        with a short grace period can delete a file between its write and the
-        metadata commit that makes it reachable. Marker write failures
-        propagate - a file is never written unprotected (fail closed).
-        """
-        rel_path = file_path.replace("\\", "/").lstrip("/")
-        if rel_path in self._marked_paths:
-            return  # already protected (append_data marks before writing, then queues)
-        marker_name = rel_path.rsplit("/", 1)[-1]
-        if marker_name in self._marker_names:
-            # Two caller-provided files with the same basename in different
-            # directories must not share (and overwrite) one marker.
-            marker_name = f"{marker_name}.{uuid.uuid4().hex[:8]}"
-        marker_path = f"{_INFLIGHT_PATH}/{marker_name}.inflight"
-        marker_payload = json.dumps({"file_path": rel_path}).encode("utf-8")
-        self.file_manager.storage.write_file(marker_path, marker_payload)
-        self._inflight_markers.append(marker_path)
-        self._marked_paths.add(rel_path)
-        self._marker_names.add(marker_name)
-        if rel_path.startswith(self.file_manager.manifests_path + "/"):
-            self._attempt_files.append(rel_path)
 
     def delete_files(self, file_paths: List[str]) -> "Transaction":
         """Queue files to delete from the table"""

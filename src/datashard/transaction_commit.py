@@ -31,6 +31,8 @@ class _CommitOpsMixin:
 
         def _register_inflight(self, file_path: str) -> None: ...
 
+        def _register_inflight_many(self, file_paths: List[str]) -> None: ...
+
     def _commit_file_ops(
         self,
         base_metadata: TableMetadata,
@@ -171,14 +173,21 @@ class _CommitOpsMixin:
                 return False  # nothing to compact, nothing else to commit
 
         # 3. Process appends (create new manifest). Existence was checked when the
-        # files were queued; a second HEAD per file here bought nothing (#67).
+        # files were queued; a second HEAD per file here bought nothing (#67). The
+        # manifest's and the manifest list's GC markers are registered together in
+        # one concurrent batch before either file is written (#80).
+        list_path = self.file_manager.new_manifest_list_path(snapshot_id)
+        append_manifest_path = self.file_manager.new_manifest_path() if append_files else None
+        self._register_inflight_many(
+            [p for p in (append_manifest_path, list_path) if p is not None]
+        )
         if append_files:
             new_append_manifest = self.file_manager.create_manifest_file(
                 append_files,
                 ManifestContent.DATA,
                 snapshot_id,
                 sequence_number=sequence_number,
-                pre_write_hook=self._register_inflight,
+                manifest_path=append_manifest_path,
             )
             final_manifests.append(new_append_manifest)
 
@@ -186,7 +195,7 @@ class _CommitOpsMixin:
         # length and sha256 go into the snapshot summary so a damaged list is
         # rejected on read instead of yielding a partial file set (#58).
         list_info = self.file_manager.create_manifest_list(
-            final_manifests, snapshot_id, pre_write_hook=self._register_inflight
+            final_manifests, snapshot_id, list_path=list_path
         )
 
         # 5. Commit the snapshot - with the SAME id stamped into the manifests.
