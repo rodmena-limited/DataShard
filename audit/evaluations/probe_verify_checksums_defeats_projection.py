@@ -42,8 +42,9 @@ orig_read = t.storage.read_file
 
 def counting_read(p):
     b = orig_read(p)
-    read_calls["n"] += 1
-    read_calls["bytes"] += len(b)
+    if p.lstrip("/").startswith("data/"):  # data files only; manifests/metadata are small container reads
+        read_calls["n"] += 1
+        read_calls["bytes"] += len(b)
     return b
 
 
@@ -81,7 +82,8 @@ H.report(
     read_calls["bytes"] == 0 and len(first) == 1000,
     f"first 1000-row batch forced {read_calls['n']} whole-file read(s) of {read_calls['bytes'] / 1e6:.1f} MB into memory",
 )
-# Positive control: the guard the cost buys.
+# Positive control: the guard the cost buys. Page-level verification covers the
+# bytes a read touches, so the control reads every column of the corrupted file.
 victim = os.path.join(path, t._get_all_data_files()[0].file_path.lstrip("/"))
 with open(victim, "r+b") as fh:
     fh.seek(os.path.getsize(victim) // 2)
@@ -89,7 +91,7 @@ with open(victim, "r+b") as fh:
     fh.seek(-1, 1)
     fh.write(bytes([b[0] ^ 0xFF]))
 try:
-    t.scan(columns=["id"])
+    t.scan()
     H.report("checksum-verification-detects-corruption (control)", False, "corrupted file scanned without error")
 except CorruptDataError as e:
     H.report("checksum-verification-detects-corruption (control)", True, str(e)[:80])

@@ -103,6 +103,11 @@ class StorageBackend(ABC):
         """Delete file"""
         pass
 
+    def delete_files(self, paths: List[str]) -> None:
+        """Delete several files; backends with a bulk primitive override this (#67)."""
+        for path in paths:
+            self.delete_file(path)
+
     @abstractmethod
     def makedirs(self, path: str, exist_ok: bool = True) -> None:
         """Create directory (no-op for S3)"""
@@ -562,8 +567,14 @@ class S3StorageBackend(StorageBackend):
         # Create S3 client
         session = boto3.session.Session()
 
-        s3_config = {
+        from botocore.config import Config
+
+        s3_config: Dict[str, Any] = {
             "region_name": region,
+            # botocore's own retries multiply datashard's with_s3_retry layer; one
+            # low-level retry for connection blips is enough (#74). The pool size
+            # serves parallel scans without 'connection pool is full' churn.
+            "config": Config(retries={"max_attempts": 2, "mode": "standard"}, max_pool_connections=32),
         }
 
         if endpoint_url:
@@ -882,6 +893,25 @@ class S3StorageBackend(StorageBackend):
             self.s3.delete_object(Bucket=self.bucket, Key=key)
 
         with_s3_retry(delete_op, f"S3 delete: {key}")
+
+    def delete_files(self, paths: List[str]) -> None:
+        """Bulk delete (DeleteObjects, 1000 keys per request), retried (#67)."""
+        from .s3_consistency import with_s3_retry
+
+        keys = [self._get_s3_key(p) for p in paths]
+        for i in range(0, len(keys), 1000):
+            chunk = keys[i : i + 1000]
+
+            def delete_op(chunk: List[str] = chunk) -> None:
+                resp = self.s3.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
+                )
+                errors = resp.get("Errors") or []
+                if errors:
+                    raise IOError(f"S3 DeleteObjects reported {len(errors)} error(s): {errors[:3]}")
+
+            with_s3_retry(delete_op, f"S3 bulk delete: {len(chunk)} keys")
 
     def makedirs(self, path: str, exist_ok: bool = True) -> None:
         """No-op for S3 - directories don't need to be created"""

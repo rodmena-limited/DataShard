@@ -149,6 +149,27 @@ def test_sibling_prefix_path_rejected(tmp_path):
 
 # ---------------------------------------------------------------- #42 checksums / #19 fail closed
 def test_corrupt_data_file_raises_on_scan(tmp_path):
+    """Default mode = parquet page CRCs: a flipped byte inside a data page is caught
+    on the bytes actually read (#66)."""
+    import glob
+    t = _table(tmp_path)
+    t.append_records([{"id": i, "name": "x" * 50} for i in range(2000)])
+    pq_file = glob.glob(str(tmp_path / "t" / "data" / "*.parquet"))[0]
+    size = os.path.getsize(pq_file)
+    with open(pq_file, "r+b") as f:
+        f.seek(size // 2)
+        b = f.read(1)
+        f.seek(size // 2)
+        f.write(bytes([b[0] ^ 0xFF]))
+    with pytest.raises(CorruptDataError):
+        t.scan()
+    with pytest.raises(CorruptDataError):
+        list(t.scan_batches(batch_size=100))
+
+
+def test_corrupt_header_detected_by_full_verification(tmp_path):
+    """Bytes outside data pages (the header magic) are only covered by the whole-file
+    sha256 of the explicit 'full' mode - which is why that mode still exists."""
     import glob
     t = _table(tmp_path)
     t.append_records([{"id": 1, "name": "x"}])
@@ -156,8 +177,10 @@ def test_corrupt_data_file_raises_on_scan(tmp_path):
     with open(pq_file, "r+b") as f:
         f.seek(0)
         f.write(b"\x00\x00\x00\x00")
-    with pytest.raises((CorruptDataError, Exception)):
-        t.scan()
+    with pytest.raises(CorruptDataError):
+        t.scan(verify_checksums="full")
+    with pytest.raises(CorruptDataError):
+        t.scan(verify_checksums=True)
 
 
 def test_scan_fails_closed_on_missing_manifest(tmp_path):

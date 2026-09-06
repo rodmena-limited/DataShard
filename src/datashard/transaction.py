@@ -63,6 +63,10 @@ class Transaction:
         # Table-relative paths already protected by a marker (one marker per path)
         self._marked_paths: Set[str] = set()
         self._marker_names: Set[str] = set()
+        # The table schema is read once per transaction (no schema evolution): every
+        # append_* used to re-read the metadata - 2-4 S3 round trips each (#67).
+        self._schema_cache: Optional[Schema] = None
+        self._schema_cache_set = False
 
         self._lock = threading.RLock()
 
@@ -83,6 +87,8 @@ class Transaction:
             self._inflight_markers = []
             self._marked_paths = set()
             self._marker_names = set()
+            self._schema_cache = None
+            self._schema_cache_set = False
 
             return self
 
@@ -100,12 +106,14 @@ class Transaction:
         """
         return self._queue_files(files, validate_schema=True)
 
-    def _queue_files(self, files: List[DataFile], validate_schema: bool) -> "Transaction":
-        """Shared tail of append_files / append_data.
+    def _queue_files(
+        self, files: List[DataFile], validate_schema: bool, trusted: bool = False
+    ) -> "Transaction":
+        """Shared tail of append_files / append_data / append_pandas.
 
-        validate_schema is False for files this transaction wrote itself with the
-        table's schema - re-reading their footer would cost a HEAD and two range
-        GETs per file on S3 for information we already have (#67).
+        `trusted` files were written by this transaction a moment ago: their
+        existence and schema are known, so the HEAD and footer reads are skipped
+        (#67). Caller-provided files get both checks.
         """
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
@@ -114,7 +122,7 @@ class Transaction:
         # This is a critical check in production systems
         table_schema = self._resolve_table_schema() if validate_schema else None
         for data_file in files:
-            if not self.file_manager.validate_file_exists(data_file.file_path):
+            if not trusted and not self.file_manager.validate_file_exists(data_file.file_path):
                 raise FileNotFoundError(f"Data file does not exist: {data_file.file_path}")
             if table_schema is not None:
                 self._validate_file_schema(data_file, table_schema)
@@ -175,6 +183,10 @@ class Transaction:
     ) -> "Transaction":
         """Append a pandas DataFrame to the table.
 
+        Converted with pyarrow's native from_pandas - no per-row dict round trip
+        (#69). Columns absent from the schema are an error; required columns must
+        be present and free of nulls. An empty frame queues nothing.
+
         Args:
             df: pandas DataFrame to append
             schema: Optional Schema. If None, uses the table's current schema.
@@ -189,23 +201,44 @@ class Transaction:
 
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Expected a pandas DataFrame")
+        if not self.is_active():
+            raise RuntimeError("Transaction is not active")
+        if len(df) == 0:
+            logger.warning("append_pandas: empty DataFrame - nothing queued (no data file, no snapshot)")
+            return self
 
-        records = df.to_dict("records")
-        return self.append_data(records, schema)
+        schema = self._schema_for_append(schema)
+        file_path = self._new_data_file_path()
+        self._register_inflight(file_path)
+        data_file = self.file_manager.data_file_manager.write_pandas_file(
+            file_path=file_path,
+            df=df,
+            iceberg_schema=schema,
+            file_format=FileFormat.PARQUET,
+            partition_values={},
+        )
+        return self._queue_written_file(file_path, data_file)
 
     def _resolve_table_schema(self) -> Optional[Schema]:
         """Resolve the table's persisted current schema, or None if the table
-        has no usable (non-empty) schema."""
+        has no usable (non-empty) schema. Cached for the transaction's lifetime."""
+        if self._schema_cache_set:
+            return self._schema_cache
+        result: Optional[Schema] = None
         metadata = self.metadata_manager.refresh()
         if metadata and metadata.schemas:
             for s in metadata.schemas:
                 if s.schema_id == metadata.current_schema_id and s.fields:
-                    return s
-            # Fallback: any non-empty schema
-            for s in metadata.schemas:
-                if s.fields:
-                    return s
-        return None
+                    result = s
+                    break
+            else:
+                # Fallback: any non-empty schema
+                for s in metadata.schemas:
+                    if s.fields:
+                        result = s
+                        break
+        self._schema_cache, self._schema_cache_set = result, True
+        return result
 
     @staticmethod
     def _schema_signature(schema: Schema) -> Set[Any]:
@@ -250,30 +283,17 @@ class Transaction:
 
         The schema is resolved from the table metadata when not provided; a
         table without a usable schema raises instead of silently writing
-        zero-column files.
+        zero-column files. Files are written in the TABLE's field order (#62).
+        An empty record list queues nothing - no empty data file, no snapshot (#69).
         """
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
+        if not records:
+            logger.warning("append_data: no records - nothing queued (no data file, no snapshot)")
+            return self
 
-        if schema is None:
-            schema = self._resolve_table_schema()
-            if schema is None:
-                raise ValueError(
-                    "No schema available: the table has no persisted schema and none was "
-                    "provided. Create the table with create_table(path, schema=...) or pass "
-                    "schema= explicitly - appending without a schema would silently discard "
-                    "all record fields."
-                )
-        else:
-            persisted = self._validate_schema_against_table(schema)
-            if persisted is not None:
-                schema = persisted  # the file's column order follows the table (#62)
-
-        # Create a data file with the records using UUID for uniqueness
-        file_id = uuid.uuid4().hex[:16]  # Use 16 chars of UUID hex
-        file_name = f"auto_{file_id}.parquet"
-        # Use relative path for storage backend (works for both local and S3)
-        file_path = f"data/{file_name}"
+        schema = self._schema_for_append(schema)
+        file_path = self._new_data_file_path()
 
         # Register a GC-protection marker BEFORE writing the data file: the file
         # is unreachable until commit, and without the marker a long-running
@@ -282,7 +302,6 @@ class Transaction:
         # (fail closed - never write unprotected files).
         self._register_inflight(file_path)
 
-        # Use the data file manager to write the data
         data_file = self.file_manager.data_file_manager.write_data_file(
             file_path=file_path,
             records=records,
@@ -290,21 +309,39 @@ class Transaction:
             file_format=FileFormat.PARQUET,
             partition_values=partition_values or {},
         )
+        return self._queue_written_file(file_path, data_file)
 
-        # Track written file for cleanup on rollback
+    def _schema_for_append(self, schema: Optional[Schema]) -> Schema:
+        """The schema a new data file is written with: the table's persisted one
+        (validated against the caller's when one is given), or the caller's for a
+        legacy table without a persisted schema."""
+        if schema is None:
+            resolved = self._resolve_table_schema()
+            if resolved is None:
+                raise ValueError(
+                    "No schema available: the table has no persisted schema and none was "
+                    "provided. Create the table with create_table(path, schema=...) or pass "
+                    "schema= explicitly - appending without a schema would silently discard "
+                    "all record fields."
+                )
+            return resolved
+        persisted = self._validate_schema_against_table(schema)
+        return persisted if persisted is not None else schema
+
+    @staticmethod
+    def _new_data_file_path() -> str:
+        """Table-relative path for a new data file (UUID-unique)."""
+        return f"data/auto_{uuid.uuid4().hex[:16]}.parquet"
+
+    def _queue_written_file(self, file_path: str, data_file: DataFile) -> "Transaction":
+        """Track a file this transaction wrote and queue it (Iceberg-style '/data/...' path)."""
         self._written_files.append(file_path)
-
-        # When using append_files, the file path in the DataFile object should be
-        # relative to the table for Iceberg-style path resolution
-        # Modify the file_path to be relative to the table (in Iceberg format)
-        relative_path = f"/data/{file_name}"
         updated_data_file = DataFile(
-            file_path=relative_path,
+            file_path="/" + file_path,
             file_format=data_file.file_format,
             partition_values=data_file.partition_values,
             record_count=data_file.record_count,
             file_size_in_bytes=data_file.file_size_in_bytes,
-            # Copy any other important fields
             column_sizes=data_file.column_sizes,
             value_counts=data_file.value_counts,
             null_value_counts=data_file.null_value_counts,
@@ -312,12 +349,8 @@ class Transaction:
             upper_bounds=data_file.upper_bounds,
             checksum=data_file.checksum,
         )
-
-        # Queue the newly created file for appending. We wrote it with the table's
-        # own schema a moment ago, so the footer check is skipped.
-        self._queue_files([updated_data_file], validate_schema=False)
-
-        return self
+        # Written with the table's own schema a moment ago: no HEAD, no footer read.
+        return self._queue_files([updated_data_file], validate_schema=False, trusted=True)
 
     def _register_inflight(self, file_path: str) -> None:
         """Write a GC-protection marker for a file this transaction is about to
@@ -603,9 +636,9 @@ class Transaction:
         else:
             final_manifests = list(existing_manifests)
 
-        # 3. Process appends (create new manifest)
+        # 3. Process appends (create new manifest). Existence was checked when the
+        # files were queued; a second HEAD per file here bought nothing (#67).
         if append_files:
-            self.file_manager.validate_data_files(append_files)
             new_append_manifest = self.file_manager.create_manifest_file(
                 append_files,
                 ManifestContent.DATA,
@@ -669,12 +702,7 @@ class Transaction:
 
         # Best-effort removal of GC-protection markers; a leftover marker only
         # extends protection and is swept by GC after the abandonment window.
-        for marker in self._inflight_markers:
-            try:
-                self.file_manager.storage.delete_file(marker)
-            except Exception:
-                pass
-        self._inflight_markers = []
+        self._delete_markers()
         self._written_files = []
         self._marked_paths = set()
         self._marker_names = set()
@@ -715,18 +743,22 @@ class Transaction:
             except Exception as e:
                 logger.warning(f"Failed to clean up file {file_path} during rollback: {e}")
 
-        for marker in self._inflight_markers:
-            try:
-                self.file_manager.storage.delete_file(marker)
-            except Exception:
-                pass
+        self._delete_markers()
 
         self._written_files = []
-        self._inflight_markers = []
         self._marked_paths = set()
         self._marker_names = set()
 
         return True
+
+    def _delete_markers(self) -> None:
+        """Best-effort bulk removal of this transaction's GC-protection markers (#67)."""
+        if self._inflight_markers:
+            try:
+                self.file_manager.storage.delete_files(list(self._inflight_markers))
+            except Exception as e:
+                logger.debug(f"Marker cleanup failed (GC sweeps leftovers): {e}")
+        self._inflight_markers = []
 
     def _deep_copy_metadata(self, metadata: TableMetadata) -> TableMetadata:
         """Create a deep copy of metadata for transaction isolation"""
@@ -963,26 +995,65 @@ class Table:
     # Read path
     # ------------------------------------------------------------------
 
+    _VERIFY_MODES = ("page", "full", "off")
+
+    @staticmethod
+    def _resolve_verify_mode(param: Any) -> str:
+        """Integrity mode for reads.
+
+        - "page" (default): parquet page CRCs, verified on the bytes a read
+          actually touches - projection and pushdown keep their I/O savings (#66).
+        - "full": the whole-file sha256 recorded at write time; downloads every
+          byte of every file. True and the legacy env values true/1/yes/on mean this.
+        - "off": no verification (False, or false/0/no/off).
+        The default comes from DATASHARD_VERIFY_CHECKSUMS.
+        """
+        if param is None:
+            param = os.getenv("DATASHARD_VERIFY_CHECKSUMS", "page")
+        if param is True:
+            return "full"
+        if param is False:
+            return "off"
+        mode = str(param).strip().lower()
+        mode = {
+            "1": "full", "true": "full", "yes": "full", "on": "full",
+            "0": "off", "false": "off", "no": "off", "none": "off",
+        }.get(mode, mode)
+        if mode not in Table._VERIFY_MODES:
+            raise ValueError(f"verify_checksums must be one of {Table._VERIFY_MODES}, True or False; got {param!r}")
+        return mode
+
     @staticmethod
     def _resolve_verify_checksums(param: Optional[bool]) -> bool:
-        """Resolve checksum-verification setting: explicit param wins, then the
-        DATASHARD_VERIFY_CHECKSUMS env var, default ON (bank-grade)."""
-        if param is not None:
-            return param
-        return os.getenv("DATASHARD_VERIFY_CHECKSUMS", "true").strip().lower() in (
-            "1", "true", "yes", "on",
+        """Compatibility shim: True when whole-file verification is selected."""
+        return Table._resolve_verify_mode(param) == "full"
+
+    @staticmethod
+    def _as_corruption(data_file: DataFile, exc: BaseException) -> Optional[Exception]:
+        """Map pyarrow's CRC / decompression failures to CorruptDataError."""
+        from .integrity import CorruptDataError
+
+        msg = str(exc).lower()
+        markers = (
+            "crc", "checksum", "corrupt", "decompress", "lz4", "thrift", "magic",
+            "footer", "truncated", "unexpected end", "file size is",
         )
+        if any(k in msg for k in markers):
+            return CorruptDataError(
+                f"Data file {data_file.file_path} failed integrity verification: {exc}"
+            )
+        return None
 
     def _read_datafile_table(
         self,
         data_file: DataFile,
         columns: Optional[List[str]],
         compute_expr: Any,
-        verify: bool,
+        verify: Any,
         pa: Any,
         pq: Any,
     ) -> Any:
-        """Read one data file as a pyarrow Table, optionally verifying its checksum.
+        """Read one data file as a pyarrow Table under the given integrity mode.
 
         Errors propagate: a data file that is referenced by the current snapshot
         but unreadable/corrupt is a table integrity failure, not something to
@@ -993,40 +1064,50 @@ class Table:
 
         from .integrity import CorruptDataError, IntegrityChecker
 
+        mode = verify if isinstance(verify, str) else self._resolve_verify_mode(verify)
         data_file_manager = self.file_manager.data_file_manager
 
-        if verify and data_file.checksum:
-            rel_path = data_file.file_path.lstrip("/")
-            raw = self.storage.read_file(rel_path)
-            if not IntegrityChecker.verify_checksum(raw, data_file.checksum):
-                raise CorruptDataError(
-                    f"Checksum mismatch for data file {data_file.file_path}: "
-                    f"stored data does not match the checksum recorded at write time"
-                )
-            # Read all columns, filter, THEN project: the filter may reference a
-            # column not in `columns` (predicate pushdown would read it; a manual
-            # post-projection filter would fail with "no match for FieldRef").
-            table = pq.read_table(BytesIO(raw))
-            if compute_expr is not None:
-                table = table.filter(compute_expr)
-            if columns is not None:
-                table = table.select(columns)
-            return table
+        try:
+            if mode == "full" and data_file.checksum:
+                rel_path = data_file.file_path.lstrip("/")
+                raw = self.storage.read_file(rel_path)
+                if not IntegrityChecker.verify_checksum(raw, data_file.checksum):
+                    raise CorruptDataError(
+                        f"Checksum mismatch for data file {data_file.file_path}: "
+                        f"stored data does not match the checksum recorded at write time"
+                    )
+                # Read all columns, filter, THEN project: the filter may reference
+                # a column not in `columns`.
+                table = pq.read_table(BytesIO(raw), use_threads=False)
+                if compute_expr is not None:
+                    table = table.filter(compute_expr)
+                if columns is not None:
+                    table = table.select(columns)
+                return table
 
-        # Read through OUR backend rather than pyarrow's S3 filesystem (#54).
-        with data_file_manager.open_parquet_source(data_file.file_path) as src:
-            if compute_expr is not None:
-                # pyarrow applies `filters` against all needed columns during the
-                # scan and returns only `columns`, so pushdown is correct here.
-                return pq.read_table(src, columns=columns, filters=compute_expr)
-            return pq.read_table(src, columns=columns)
+            with data_file_manager.parquet_source(data_file.file_path) as (src, threads):
+                kwargs: Dict[str, Any] = {
+                    "columns": columns,
+                    "use_threads": threads,
+                    "page_checksum_verification": mode != "off",
+                }
+                if compute_expr is not None:
+                    # pyarrow applies `filters` against all needed columns during
+                    # the scan and returns only `columns`, so pushdown is correct.
+                    kwargs["filters"] = compute_expr
+                return pq.read_table(src, **kwargs)
+        except (pa.ArrowException, OSError) as e:
+            corrupt = self._as_corruption(data_file, e)
+            if corrupt is not None:
+                raise corrupt from e
+            raise
 
     def _scan_table(
         self,
         columns: Optional[List[str]],
         filter_dict: Optional[Dict[str, Any]],
         parallel: Union[bool, int],
-        verify_checksums: Optional[bool],
+        verify_checksums: Optional[Union[bool, str]],
     ) -> Any:
         """Shared scan core: returns a pyarrow Table, or None for an empty table.
 
@@ -1060,10 +1141,10 @@ class Table:
         if not data_files:
             return None
 
-        verify = self._resolve_verify_checksums(verify_checksums)
+        mode = self._resolve_verify_mode(verify_checksums)
 
         def read_one(df: DataFile) -> Any:
-            return self._read_datafile_table(df, columns, compute_expr, verify, pa, pq)
+            return self._read_datafile_table(df, columns, compute_expr, mode, pa, pq)
 
         if parallel:
             n_workers = parallel if isinstance(parallel, int) else (os.cpu_count() or 4)
@@ -1101,7 +1182,7 @@ class Table:
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
         parallel: Union[bool, int] = False,
-        verify_checksums: Optional[bool] = None,
+        verify_checksums: Optional[Union[bool, str]] = None,
     ) -> List[Dict[str, Any]]:
         """Scan the table's CURRENT snapshot and return records.
 
@@ -1120,9 +1201,10 @@ class Table:
                 - False: Sequential reading (default)
                 - True: Use all CPU cores
                 - int: Use specified number of threads
-            verify_checksums: Verify each data file against its stored checksum
-                (raises CorruptDataError on mismatch). Defaults to the
-                DATASHARD_VERIFY_CHECKSUMS env var, which defaults to true.
+            verify_checksums: Integrity mode: "page" (default; parquet page CRCs on
+                the bytes actually read), "full" (whole-file sha256 recorded at
+                write time - downloads every byte) or "off". True/False select
+                full/off. Defaults to the DATASHARD_VERIFY_CHECKSUMS env var.
 
         Returns:
             List of dictionaries, each representing a record.
@@ -1143,7 +1225,7 @@ class Table:
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
         parallel: Union[bool, int] = False,
-        verify_checksums: Optional[bool] = None,
+        verify_checksums: Optional[Union[bool, str]] = None,
     ) -> Any:
         """Read the table's CURRENT snapshot as a pandas DataFrame.
 
@@ -1169,7 +1251,7 @@ class Table:
         batch_size: int = 10000,
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
-        verify_checksums: Optional[bool] = None,
+        verify_checksums: Optional[Union[bool, str]] = None,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Scan data in batches for memory-efficient processing.
 
@@ -1207,10 +1289,10 @@ class Table:
             return
 
         compute_expr = to_pyarrow_compute_expression(expressions) if expressions else None
-        verify = self._resolve_verify_checksums(verify_checksums)
+        mode = self._resolve_verify_mode(verify_checksums)
 
         yield from self._iter_file_batches(
-            data_files, batch_size, columns, compute_expr, verify, pa, pq
+            data_files, batch_size, columns, compute_expr, mode, pa, pq
         )
 
     def _iter_file_batches(
@@ -1219,53 +1301,62 @@ class Table:
         batch_size: int,
         columns: Optional[List[str]],
         compute_expr: Any,
-        verify: bool,
+        verify: Any,
         pa: Any,
         pq: Any,
     ) -> Iterator[List[Dict[str, Any]]]:
-        """Iterate over batches from data files. Read errors propagate."""
+        """Iterate over batches from data files. Read errors propagate.
+
+        In the default "page" mode a file is streamed and each page's CRC is
+        checked as it is read - nothing is materialised whole (#66). Only "full"
+        mode has to download a file completely to hash it.
+        """
         from io import BytesIO
 
         from .integrity import CorruptDataError, IntegrityChecker
 
+        mode = verify if isinstance(verify, str) else self._resolve_verify_mode(verify)
         data_file_manager = self.file_manager.data_file_manager
 
         # When filtering, read every column (the predicate may reference one not
         # in `columns`); project down to `columns` only after filtering.
         read_columns = None if compute_expr is not None else columns
 
-        for data_file in data_files:
-            if verify and data_file.checksum:
-                rel_path = data_file.file_path.lstrip("/")
-                raw = self.storage.read_file(rel_path)
-                if not IntegrityChecker.verify_checksum(raw, data_file.checksum):
-                    raise CorruptDataError(
-                        f"Checksum mismatch for data file {data_file.file_path}"
-                    )
-                pf = pq.ParquetFile(BytesIO(raw))
-            else:
-                pf = pq.ParquetFile(
-                    data_file_manager.open_parquet_source(data_file.file_path)
-                )
-
-            for batch in pf.iter_batches(batch_size=batch_size, columns=read_columns):
-                # Convert batch to table for filtering
+        def batches(pf: Any, threads: bool) -> Iterator[List[Dict[str, Any]]]:
+            for batch in pf.iter_batches(batch_size=batch_size, columns=read_columns, use_threads=threads):
                 table = pa.Table.from_batches([batch])
-
-                # Apply filter if needed
                 if compute_expr is not None:
                     table = table.filter(compute_expr)
                     if columns is not None:
                         table = table.select(columns)
-
                 if table.num_rows > 0:
                     yield table.to_pylist()
+
+        for data_file in data_files:
+            try:
+                if mode == "full" and data_file.checksum:
+                    rel_path = data_file.file_path.lstrip("/")
+                    raw = self.storage.read_file(rel_path)
+                    if not IntegrityChecker.verify_checksum(raw, data_file.checksum):
+                        raise CorruptDataError(
+                            f"Checksum mismatch for data file {data_file.file_path}"
+                        )
+                    yield from batches(pq.ParquetFile(BytesIO(raw)), False)
+                    continue
+                with data_file_manager.parquet_source(data_file.file_path) as (src, threads):
+                    pf = pq.ParquetFile(src, page_checksum_verification=mode != "off")
+                    yield from batches(pf, threads)
+            except (pa.ArrowException, OSError) as e:
+                corrupt = self._as_corruption(data_file, e)
+                if corrupt is not None:
+                    raise corrupt from e
+                raise
 
     def iter_records(
         self,
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
-        verify_checksums: Optional[bool] = None,
+        verify_checksums: Optional[Union[bool, str]] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Iterate over records one at a time.
 
@@ -1291,7 +1382,7 @@ class Table:
         chunksize: int = 50000,
         columns: Optional[List[str]] = None,
         filter: Optional[Dict[str, Any]] = None,
-        verify_checksums: Optional[bool] = None,
+        verify_checksums: Optional[Union[bool, str]] = None,
     ) -> Iterator[Any]:
         """Iterate over data as pandas DataFrame chunks.
 

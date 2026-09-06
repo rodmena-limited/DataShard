@@ -51,24 +51,37 @@ def get_disk_space(path: str) -> DiskSpace:
     )
 
 
+DEFAULT_MIN_FREE_BYTES = 1 << 30  # 1 GiB
+
+
 def check_disk_space(
     path: str,
     required_bytes: int,
     warn_threshold: float = 90.0,
     error_threshold: float = 95.0,
+    min_free_bytes: int | None = None,
 ) -> None:
-    """Check if sufficient disk space is available.
+    """Refuse a write only when the volume is genuinely short of space.
 
-    Args:
-        path: Path to check
-        required_bytes: Required free bytes
-        warn_threshold: Warning threshold (percent used)
-        error_threshold: Error threshold (percent used)
+    A write is refused when free bytes < max(2 x required_bytes, min_free_bytes);
+    min_free_bytes defaults to DATASHARD_MIN_FREE_BYTES or 1 GiB. The percentage
+    thresholds only WARN: a 95 %-full 10 TB volume still has 500 GB free, and
+    refusing every write there - including the commit-point hint - turned the
+    whole lake read-only (#70).
 
     Raises:
-        IOError: If insufficient space or disk is too full
+        IOError: If free space is below the absolute floor.
     """
+    if min_free_bytes is None:
+        raw = os.getenv("DATASHARD_MIN_FREE_BYTES", "").strip()
+        try:
+            min_free_bytes = int(raw) if raw else DEFAULT_MIN_FREE_BYTES
+        except ValueError:
+            logger.warning(f"Ignoring invalid DATASHARD_MIN_FREE_BYTES={raw!r}")
+            min_free_bytes = DEFAULT_MIN_FREE_BYTES
+
     space = get_disk_space(path)
+    needed = max(2 * required_bytes, min_free_bytes)
 
     logger.debug(
         f"Disk space check for {path}: "
@@ -76,20 +89,20 @@ def check_disk_space(
         f"({100 - space.percent_used:.1f}% available)"
     )
 
-    # Check if we have required space
-    if space.free < required_bytes:
+    if space.free < needed:
         msg = (
             f"Insufficient disk space: {space.free / (1024**3):.2f} GB free, "
-            f"need {required_bytes / (1024**3):.2f} GB"
+            f"need at least {needed / (1024**3):.2f} GB (2 x write size or the "
+            f"{min_free_bytes / (1024**3):.2f} GB floor)"
         )
         logger.error(msg)
         raise IOError(msg)
 
-    # Check if disk is getting too full
     if space.percent_used >= error_threshold:
-        msg = f"Disk critically full: {space.percent_used:.1f}% used (threshold: {error_threshold}%)"
-        logger.error(msg)
-        raise IOError(msg)
+        logger.warning(
+            f"Disk nearly full: {space.percent_used:.1f}% used "
+            f"({space.free / (1024**3):.2f} GB free); writes continue above the free-space floor"
+        )
     elif space.percent_used >= warn_threshold:
         logger.warning(
             f"Disk space low: {space.percent_used:.1f}% used (threshold: {warn_threshold}%)"
