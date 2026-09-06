@@ -8,19 +8,44 @@ import json
 import uuid
 from datetime import date, datetime, time as dt_time
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import fastavro
 
 from .avro_schemas import MANIFEST_ENTRY_SCHEMA, MANIFEST_FILE_SCHEMA
 from .data_operations import DataFileManager
-from .data_structures import DataFile, FileFormat, ManifestContent, ManifestFile
+from .data_structures import (
+    DataFile,
+    FileFormat,
+    ManifestContent,
+    ManifestFile,
+    Snapshot,
+)
+from .integrity import CorruptDataError, IntegrityChecker
 from .metadata_manager import MetadataManager
 from .storage_backend import StorageBackend
 
 # Iceberg manifest-entry statuses
 ENTRY_STATUS_EXISTING = 0
 ENTRY_STATUS_ADDED = 1
+
+# Snapshot summary keys recording the manifest list's size and sha256 at commit
+# time, so a truncated or overwritten list is rejected on read (#58).
+SUMMARY_LIST_LENGTH = "manifest-list-length"
+SUMMARY_LIST_SHA256 = "manifest-list-sha256"
+
+_AVRO_MAGIC = b"Obj\x01"
+
+
+class ManifestListInfo(NamedTuple):
+    """What a commit must record about the manifest list it wrote."""
+
+    path: str
+    length: int
+    checksum: str
+
+    def summary(self) -> Dict[str, str]:
+        return {SUMMARY_LIST_LENGTH: str(self.length), SUMMARY_LIST_SHA256: self.checksum}
 
 
 class FileManager:
@@ -270,81 +295,149 @@ class FileManager:
             min_sequence_number=(
                 min(entry_sequence_numbers) if entry_sequence_numbers else sequence_number
             ),
+            checksum=IntegrityChecker.compute_checksum(content),
         )
 
-    def read_manifest_file(self, manifest_path: str) -> List[DataFile]:
-        """Read and parse a manifest file to get data files"""
-        if not self.storage.exists(manifest_path):
-            raise FileNotFoundError(f"Manifest file does not exist: {manifest_path}")
+    # ------------------------------------------------------------------
+    # Integrity-checked container reads (#58)
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def snapshot_list_integrity(snapshot: Optional[Snapshot]) -> Tuple[Optional[int], Optional[str]]:
+        """(expected_length, expected_sha256) of a snapshot's manifest list, from its
+        summary. Both None for snapshots written before 0.8.0."""
+        if snapshot is None or not snapshot.summary:
+            return None, None
+        raw_len = snapshot.summary.get(SUMMARY_LIST_LENGTH)
         try:
-            # Try reading as Avro using streaming I/O
-            with self.storage.open_file(manifest_path) as stream:
-                reader = fastavro.reader(stream)
+            length = int(raw_len) if raw_len is not None else None
+        except (TypeError, ValueError):
+            length = None
+        return length, snapshot.summary.get(SUMMARY_LIST_SHA256) or None
 
-                data_files = []
-                for record_raw in reader:
-                    # Cast record to Dict[str, Any] to satisfy mypy
-                    # fastavro reader yields dicts
-                    record: Dict[str, Any] = record_raw  # type: ignore
+    @staticmethod
+    def _verify_container(
+        path: str,
+        content: bytes,
+        expected_length: Optional[int],
+        expected_checksum: Optional[str],
+        kind: str,
+    ) -> None:
+        if expected_length is not None and len(content) != expected_length:
+            raise CorruptDataError(
+                f"{kind} {path} is {len(content)} bytes but {expected_length} bytes were "
+                f"recorded at commit time - truncated or overwritten; refusing to read a "
+                f"partial file list"
+            )
+        if expected_checksum and not IntegrityChecker.verify_checksum(content, expected_checksum):
+            raise CorruptDataError(
+                f"{kind} {path} does not match the sha256 recorded at commit time"
+            )
 
-                    # Extract data_file field
-                    df_record: Dict[str, Any] = record["data_file"]
+    def _read_container(
+        self,
+        path: str,
+        expected_length: Optional[int],
+        expected_checksum: Optional[str],
+        kind: str,
+    ) -> bytes:
+        try:
+            content = self.storage.read_file(path)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"{kind} file does not exist: {path}") from e
+        self._verify_container(path, content, expected_length, expected_checksum, kind)
+        return content
 
-                    # Parse bounds: convert keys to int, decode typed values
-                    lower_bounds = df_record.get("lower_bounds")
-                    if lower_bounds:
-                        lower_bounds = {int(k): self._decode_bound(v) for k, v in lower_bounds.items()}
+    @staticmethod
+    def _avro_records(content: bytes, path: str, kind: str) -> List[Dict[str, Any]]:
+        """Decode every record of an Avro container, or raise CorruptDataError.
 
-                    upper_bounds = df_record.get("upper_bounds")
-                    if upper_bounds:
-                        upper_bounds = {int(k): self._decode_bound(v) for k, v in upper_bounds.items()}
+        fastavro stops cleanly when a file ends exactly on a block boundary, which
+        is why the length/sha256 check above exists; this catches everything else
+        (a block cut mid-way, a bad header, trailing garbage).
+        """
+        bio = BytesIO(content)
+        try:
+            records = [dict(r) for r in fastavro.reader(bio)]  # type: ignore[arg-type]
+        except Exception as e:
+            raise CorruptDataError(f"{kind} {path} is not a readable Avro container: {e}") from e
+        if bio.tell() != len(content):
+            raise CorruptDataError(
+                f"{kind} {path} has {len(content) - bio.tell()} unread trailing bytes"
+            )
+        return records
 
-                    # Stats maps: Avro string keys -> int field ids
-                    column_sizes = df_record.get("column_sizes")
-                    if column_sizes:
-                        column_sizes = {int(k): v for k, v in column_sizes.items()}
-                    value_counts = df_record.get("value_counts")
-                    if value_counts:
-                        value_counts = {int(k): v for k, v in value_counts.items()}
-                    null_value_counts = df_record.get("null_value_counts")
-                    if null_value_counts:
-                        null_value_counts = {int(k): v for k, v in null_value_counts.items()}
+    def read_manifest_file(
+        self,
+        manifest_path: str,
+        expected_length: Optional[int] = None,
+        expected_checksum: Optional[str] = None,
+    ) -> List[DataFile]:
+        """Read and parse a manifest file to get data files.
 
-                    data_file = DataFile(
-                        file_path=df_record["file_path"],
-                        file_format=FileFormat(df_record["file_format"]),
-                        partition_values=df_record["partition"]["values"],
-                        record_count=df_record["record_count"],
-                        file_size_in_bytes=df_record["file_size_in_bytes"],
-                        column_sizes=column_sizes,
-                        value_counts=value_counts,
-                        null_value_counts=null_value_counts,
-                        lower_bounds=lower_bounds,
-                        upper_bounds=upper_bounds,
-                        checksum=df_record.get("checksum"),
-                        added_snapshot_id=record.get("snapshot_id"),
-                        sequence_number=(
-                            record.get("file_sequence_number")
-                            if record.get("file_sequence_number") is not None
-                            else record.get("sequence_number")
-                        ),
-                    )
-                    data_files.append(data_file)
-                return data_files
+        Pass the manifest_length and checksum recorded in the manifest list: a
+        truncated or overwritten manifest is then rejected with CorruptDataError
+        instead of being read as a shorter list (#58). Without them only
+        structural Avro damage is detected.
+        """
+        content = self._read_container(manifest_path, expected_length, expected_checksum, "Manifest")
+        if content.startswith(_AVRO_MAGIC):
+            return [
+                self._data_file_from_avro(record)
+                for record in self._avro_records(content, manifest_path, "Manifest")
+            ]
+        return self._data_files_from_json(content, manifest_path)
 
-        except (ValueError, IndexError, StopIteration, OSError):
-            # Fallback: JSON
-            # If Avro parsing fails, we try reading as JSON (backward compatibility)
-            pass
+    def _data_file_from_avro(self, record: Dict[str, Any]) -> DataFile:
+        df_record: Dict[str, Any] = record["data_file"]
 
-        content = self.storage.read_file(manifest_path)
+        # Parse bounds: convert keys to int, decode typed values
+        lower_bounds = df_record.get("lower_bounds")
+        if lower_bounds:
+            lower_bounds = {int(k): self._decode_bound(v) for k, v in lower_bounds.items()}
+
+        upper_bounds = df_record.get("upper_bounds")
+        if upper_bounds:
+            upper_bounds = {int(k): self._decode_bound(v) for k, v in upper_bounds.items()}
+
+        # Stats maps: Avro string keys -> int field ids
+        column_sizes = df_record.get("column_sizes")
+        if column_sizes:
+            column_sizes = {int(k): v for k, v in column_sizes.items()}
+        value_counts = df_record.get("value_counts")
+        if value_counts:
+            value_counts = {int(k): v for k, v in value_counts.items()}
+        null_value_counts = df_record.get("null_value_counts")
+        if null_value_counts:
+            null_value_counts = {int(k): v for k, v in null_value_counts.items()}
+
+        return DataFile(
+            file_path=df_record["file_path"],
+            file_format=FileFormat(df_record["file_format"]),
+            partition_values=df_record["partition"]["values"],
+            record_count=df_record["record_count"],
+            file_size_in_bytes=df_record["file_size_in_bytes"],
+            column_sizes=column_sizes,
+            value_counts=value_counts,
+            null_value_counts=null_value_counts,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            checksum=df_record.get("checksum"),
+            added_snapshot_id=record.get("snapshot_id"),
+            sequence_number=(
+                record.get("file_sequence_number")
+                if record.get("file_sequence_number") is not None
+                else record.get("sequence_number")
+            ),
+        )
+
+    def _data_files_from_json(self, content: bytes, manifest_path: str) -> List[DataFile]:
+        """Legacy (pre-Avro) JSON manifests."""
         try:
             manifest_data = json.loads(content.decode("utf-8"))
-
             data_files = []
             for file_entry in manifest_data.get("files", []):
-                data_file = DataFile(
+                data_files.append(DataFile(
                     file_path=file_entry["file_path"],
                     file_format=FileFormat(file_entry["file_format"]),
                     partition_values=file_entry["partition_values"],
@@ -358,20 +451,20 @@ class FileManager:
                     checksum=file_entry.get("checksum"),
                     added_snapshot_id=file_entry.get("added_snapshot_id"),
                     sequence_number=file_entry.get("sequence_number"),
-                )
-                data_files.append(data_file)
+                ))
             return data_files
         except Exception as e:
-            # If JSON also fails, raise original error or generic error
-            raise ValueError(f"Could not parse manifest file {manifest_path} (tried Avro and JSON)") from e
+            raise CorruptDataError(
+                f"Could not parse manifest file {manifest_path} (neither Avro nor JSON)"
+            ) from e
 
-    def create_manifest_list_file(
+    def create_manifest_list(
         self,
         manifest_files: List[ManifestFile],
         snapshot_id: int,
         pre_write_hook: Optional[Callable[[str], None]] = None,
-    ) -> str:
-        """Create a manifest list file for a snapshot.
+    ) -> ManifestListInfo:
+        """Write the manifest list for a snapshot and return path, length and sha256.
 
         Args:
             manifest_files: All manifests active in the new snapshot.
@@ -383,13 +476,12 @@ class FileManager:
         list_filename = f"manifest_list_{snapshot_id}_{timestamp}_{uuid.uuid4().hex[:8]}.avro"
         list_path = f"{self.manifests_path}/{list_filename}"
 
-        # Prepare records for Avro
         records: List[Dict[str, Any]] = []
         for mf in manifest_files:
             # Ensure content is an integer (handle Enum)
             content_val = int(mf.content.value) if hasattr(mf.content, 'value') else int(mf.content)  # type: ignore
 
-            record: Dict[str, Any] = {
+            records.append({
                 "manifest_path": mf.manifest_path,
                 "manifest_length": mf.manifest_length,
                 "partition_spec_id": mf.partition_spec_id,
@@ -400,79 +492,85 @@ class FileManager:
                 "added_data_files_count": mf.added_data_files_count,
                 "existing_data_files_count": mf.existing_data_files_count,
                 "deleted_data_files_count": mf.deleted_data_files_count,
-                "partitions": [] # Simplified
-            }
-            records.append(record)
+                "partitions": [],  # Simplified
+                "checksum": mf.checksum,
+            })
 
-        # Write Avro to BytesIO
         bytes_io = BytesIO()
         fastavro.writer(bytes_io, MANIFEST_FILE_SCHEMA, records)
         content = bytes_io.getvalue()
 
-        # Write using storage backend (protect it from GC first, if asked)
         if pre_write_hook is not None:
             pre_write_hook(list_path)
         self.storage.write_file(list_path, content)
 
-        return list_path
+        return ManifestListInfo(
+            path=list_path, length=len(content), checksum=IntegrityChecker.compute_checksum(content)
+        )
 
-    def read_manifest_list_file(self, list_path: str) -> List[ManifestFile]:
-        """Read a manifest list file and return manifest files"""
-        if not self.storage.exists(list_path):
-            raise FileNotFoundError(f"Manifest list file does not exist: {list_path}")
+    def create_manifest_list_file(
+        self,
+        manifest_files: List[ManifestFile],
+        snapshot_id: int,
+        pre_write_hook: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """Compatibility wrapper around create_manifest_list: returns the path only."""
+        return self.create_manifest_list(manifest_files, snapshot_id, pre_write_hook).path
 
-        # Try reading as Avro using streaming I/O
-        try:
-            with self.storage.open_file(list_path) as stream:
-                reader = fastavro.reader(stream)
+    def read_manifest_list_file(
+        self,
+        list_path: str,
+        expected_length: Optional[int] = None,
+        expected_checksum: Optional[str] = None,
+    ) -> List[ManifestFile]:
+        """Read a manifest list and return its manifest files.
 
-                manifest_files = []
-                for record_raw in reader:
-                    # Cast to Dict[str, Any] to satisfy mypy
-                    record: Dict[str, Any] = record_raw  # type: ignore
-
-                    manifest_file = ManifestFile(
-                        manifest_path=record["manifest_path"],
-                        manifest_length=record["manifest_length"],
-                        partition_spec_id=record["partition_spec_id"],
-                        added_snapshot_id=record["added_snapshot_id"],
-                        added_data_files_count=record["added_data_files_count"],
-                        existing_data_files_count=record["existing_data_files_count"],
-                        deleted_data_files_count=record["deleted_data_files_count"],
-                        partitions=[],
-                        content=ManifestContent(record["content"]),
-                        sequence_number=record.get("sequence_number"),
-                        min_sequence_number=record.get("min_sequence_number")
-                    )
-                    manifest_files.append(manifest_file)
-                return manifest_files
-
-        except (ValueError, IndexError, StopIteration, OSError):
-            # Fallback: JSON
-            pass
-
-        content = self.storage.read_file(list_path)
-
+        Pass the length/sha256 recorded in the owning snapshot's summary (see
+        snapshot_list_integrity) so a damaged list is rejected, not read short (#58).
+        """
+        content = self._read_container(list_path, expected_length, expected_checksum, "Manifest list")
+        if content.startswith(_AVRO_MAGIC):
+            return [
+                self._manifest_from_avro(record)
+                for record in self._avro_records(content, list_path, "Manifest list")
+            ]
         try:
             list_data = json.loads(content.decode("utf-8"))
-
-            manifest_files = []
-            for manifest_entry in list_data.get("manifests", []):
-                manifest_file = ManifestFile(
-                    manifest_path=manifest_entry["manifest_path"],
-                    manifest_length=manifest_entry["manifest_length"],
-                    partition_spec_id=manifest_entry["partition_spec_id"],
-                    added_snapshot_id=manifest_entry["added_snapshot_id"],
-                    added_data_files_count=manifest_entry["added_data_files_count"],
-                    existing_data_files_count=manifest_entry["existing_data_files_count"],
-                    deleted_data_files_count=manifest_entry["deleted_data_files_count"],
-                    partitions=[],  # Would be populated from the manifest file itself
-                    content=ManifestContent(manifest_entry["content"]),
+            return [
+                ManifestFile(
+                    manifest_path=entry["manifest_path"],
+                    manifest_length=entry["manifest_length"],
+                    partition_spec_id=entry["partition_spec_id"],
+                    added_snapshot_id=entry["added_snapshot_id"],
+                    added_data_files_count=entry["added_data_files_count"],
+                    existing_data_files_count=entry["existing_data_files_count"],
+                    deleted_data_files_count=entry["deleted_data_files_count"],
+                    partitions=[],
+                    content=ManifestContent(entry["content"]),
                 )
-                manifest_files.append(manifest_file)
-            return manifest_files
+                for entry in list_data.get("manifests", [])
+            ]
         except Exception as e:
-            raise ValueError(f"Could not parse manifest list file {list_path}") from e
+            raise CorruptDataError(
+                f"Could not parse manifest list file {list_path} (neither Avro nor JSON)"
+            ) from e
+
+    @staticmethod
+    def _manifest_from_avro(record: Dict[str, Any]) -> ManifestFile:
+        return ManifestFile(
+            manifest_path=record["manifest_path"],
+            manifest_length=record["manifest_length"],
+            partition_spec_id=record["partition_spec_id"],
+            added_snapshot_id=record["added_snapshot_id"],
+            added_data_files_count=record["added_data_files_count"],
+            existing_data_files_count=record["existing_data_files_count"],
+            deleted_data_files_count=record["deleted_data_files_count"],
+            partitions=[],
+            content=ManifestContent(record["content"]),
+            sequence_number=record.get("sequence_number"),
+            min_sequence_number=record.get("min_sequence_number"),
+            checksum=record.get("checksum"),
+        )
 
     def cleanup_orphaned_files(self, valid_file_paths: List[str]) -> int:
         """Removed: unsafe legacy cleanup. Use Table.garbage_collect() instead.
@@ -504,10 +602,12 @@ class FileManager:
 
         for manifest in manifest_files:
             try:
-                data_files = self.read_manifest_file(manifest.manifest_path)
+                data_files = self.read_manifest_file(
+                    manifest.manifest_path,
+                    expected_length=manifest.manifest_length,
+                    expected_checksum=manifest.checksum,
+                )
                 report["valid_manifests"] += 1
-
-                from .integrity import IntegrityChecker
 
                 for data_file in data_files:
                     report["total_files"] += 1

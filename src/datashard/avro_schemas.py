@@ -57,6 +57,8 @@ MANIFEST_FILE_SCHEMA = {
         {"name": "added_data_files_count", "type": "int"},
         {"name": "existing_data_files_count", "type": "int"},
         {"name": "deleted_data_files_count", "type": "int"},
-        {"name": "partitions", "type": {"type": "array", "items": "string"}}
+        {"name": "partitions", "type": {"type": "array", "items": "string"}},
+        # sha256 of the manifest's bytes (#58); absent in lists written before 0.8.0
+        {"name": "checksum", "type": ["null", "string"], "default": None}
     ]
 }

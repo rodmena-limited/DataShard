@@ -163,6 +163,9 @@ class ManifestFile:
     content: ManifestContent = ManifestContent.DATA
     sequence_number: Optional[int] = None
     min_sequence_number: Optional[int] = None
+    # sha256 of the manifest file's bytes, recorded in the manifest list so a
+    # truncated or overwritten manifest is rejected instead of read short (#58).
+    checksum: Optional[str] = None
 
 
 @dataclass

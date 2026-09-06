@@ -2,14 +2,22 @@
 Garbage collection for orphaned data and metadata files.
 
 Safety model (bank-grade, fail closed):
-- If ANY reachable manifest list or manifest cannot be read, collection ABORTS
-  without deleting anything. An unreadable manifest means reachability is
-  unknown - deleting on incomplete knowledge deletes live data.
-- Files newer than the grace period are never deleted.
-- Data files registered by in-flight transactions (marker files under
-  metadata/inflight/) are protected regardless of age, until their marker
-  exceeds the abandonment timeout. This protects long-running batch loads
-  whose files exist before the commit that makes them reachable.
+- If ANY reachable manifest list or manifest cannot be read, or fails the length /
+  sha256 check recorded at commit time (#58), collection ABORTS without deleting
+  anything. Unknown reachability means nothing is deleted.
+- Every "older than" decision is relative to the instant GC STARTED (taken before
+  the first storage read), never to "now" at deletion time. A file written after
+  GC started can never look old enough to delete, however long GC runs (#57).
+- In-flight markers are loaded BEFORE the table metadata is read, so a
+  transaction that commits after the metadata read is still covered by the
+  markers it held at that instant (#57). Markers protect files regardless of age
+  until they exceed the abandonment timeout.
+- Manifest paths and storage listings are normalised by ONE rule (drop the
+  leading slash). table_path is never stripped as a string prefix: doing so
+  mis-normalised every path of a table whose name is itself a prefix of
+  "data"/"metadata" and deleted the whole table (#56).
+- The grace period must exceed the longest transaction plus the longest GC run;
+  values below MIN_GRACE_PERIOD_MS are refused unless allow_short_grace=True.
 """
 
 import json
@@ -17,6 +25,7 @@ import logging
 import time
 from typing import Dict, Set
 
+from .data_structures import ManifestFile, Snapshot
 from .file_manager import FileManager
 from .metadata_manager import MetadataManager
 
@@ -29,6 +38,9 @@ INFLIGHT_PATH = "metadata/inflight"
 # become normal GC candidates. Must comfortably exceed any legitimate
 # transaction duration.
 DEFAULT_INFLIGHT_TIMEOUT_MS = 24 * 3600 * 1000
+
+# Shortest grace period accepted without an explicit opt-in (#57).
+MIN_GRACE_PERIOD_MS = 5 * 60 * 1000
 
 
 class GarbageCollectionAborted(RuntimeError):
@@ -55,70 +67,91 @@ class GarbageCollector:
         self,
         grace_period_ms: int = 3600000,
         inflight_timeout_ms: int = DEFAULT_INFLIGHT_TIMEOUT_MS,
+        allow_short_grace: bool = False,
     ) -> Dict[str, int]:
         """
-        Delete files that are not referenced by any valid snapshot and are older than grace_period.
+        Delete files that are not referenced by any valid snapshot and are older than
+        grace_period_ms, measured from the instant this call started.
 
         Args:
             grace_period_ms: Minimum age of orphaned files to delete (milliseconds).
-                             Default: 1 hour.
+                Default: 1 hour. Must exceed the longest transaction plus the
+                longest GC run on this table.
             inflight_timeout_ms: Age after which an in-flight transaction marker
-                             is considered abandoned. Default: 24 hours.
+                is considered abandoned. Default: 24 hours.
+            allow_short_grace: Accept a grace period below MIN_GRACE_PERIOD_MS.
+                Only safe on a table with no concurrent writers (tests).
 
         Returns:
             Dict with counts of deleted files by type.
 
         Raises:
+            ValueError: grace_period_ms negative, or too short without opt-in.
             GarbageCollectionAborted: If any reachable manifest (list) could not
-                be read - nothing is deleted in that case (fail closed).
+                be read or verified - nothing is deleted in that case (fail closed).
         """
+        if grace_period_ms < 0:
+            raise ValueError("grace_period_ms must be >= 0")
+        if grace_period_ms < MIN_GRACE_PERIOD_MS and not allow_short_grace:
+            raise ValueError(
+                f"grace_period_ms={grace_period_ms} is below the minimum {MIN_GRACE_PERIOD_MS} ms. "
+                f"A grace period shorter than the longest transaction plus the longest GC run can "
+                f"delete live data (#57). Pass allow_short_grace=True only on a table with no "
+                f"concurrent writers."
+            )
+
         stats = {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
 
-        # 1. Refresh metadata to get latest view
+        # 0. The clock for every age decision is taken BEFORE any storage read.
+        gc_start_ms = time.time() * 1000
+
+        # 1. In-flight markers FIRST (#57): a commit that lands after the metadata
+        # read below was necessarily in flight - and marked - at this instant.
+        protected_files = self._load_inflight_protection(inflight_timeout_ms, gc_start_ms)
+
+        # 2. Table metadata: the reachability view.
         metadata = self.metadata_manager.refresh()
         if not metadata:
             return stats
 
         logger.info(f"Starting garbage collection for {self.table_path}")
+        if protected_files:
+            logger.info(f"Protecting {len(protected_files)} in-flight files from GC")
 
-        # 2. Identify all reachable files. ANY failure here aborts the whole
-        # collection: deleting based on incomplete reachability deletes live data.
+        # 3. Reachability. ANY failure here aborts the whole collection: deleting
+        # based on incomplete reachability deletes live data.
         reachable_data_files: Set[str] = set()
         reachable_manifests: Set[str] = set()
         reachable_manifest_lists: Set[str] = set()
 
-        # Add manifest lists from all snapshots
+        lists_by_path: Dict[str, Snapshot] = {}
         for snapshot in metadata.snapshots:
-            m_list_path = snapshot.manifest_list
-            if m_list_path:
-                reachable_manifest_lists.add(self._normalize_path(m_list_path))
+            if snapshot.manifest_list:
+                lists_by_path.setdefault(self._normalize_path(snapshot.manifest_list), snapshot)
+        reachable_manifest_lists.update(lists_by_path)
 
-        # Process manifest lists to find manifests and data files
-        for m_list_path in reachable_manifest_lists:
+        manifests_by_path: Dict[str, ManifestFile] = {}
+        for m_list_path, snapshot in lists_by_path.items():
+            exp_len, exp_sum = FileManager.snapshot_list_integrity(snapshot)
             try:
-                if not self.storage.exists(m_list_path):
-                    raise FileNotFoundError(
-                        f"Snapshot references missing manifest list: {m_list_path}"
-                    )
-                manifests = self.file_manager.read_manifest_list_file(m_list_path)
+                manifests = self.file_manager.read_manifest_list_file(
+                    m_list_path, expected_length=exp_len, expected_checksum=exp_sum
+                )
             except Exception as e:
                 raise GarbageCollectionAborted(
                     f"Aborting GC: cannot read reachable manifest list {m_list_path}: {e}. "
                     f"Nothing was deleted."
                 ) from e
             for m in manifests:
-                m_path = m.manifest_path
-                if m_path:
-                    reachable_manifests.add(self._normalize_path(m_path))
+                if m.manifest_path:
+                    manifests_by_path.setdefault(self._normalize_path(m.manifest_path), m)
+        reachable_manifests.update(manifests_by_path)
 
-        # Process manifests to find data files
-        for m_path in reachable_manifests:
+        for m_path, m in manifests_by_path.items():
             try:
-                if not self.storage.exists(m_path):
-                    raise FileNotFoundError(
-                        f"Manifest list references missing manifest: {m_path}"
-                    )
-                data_files = self.file_manager.read_manifest_file(m_path)
+                data_files = self.file_manager.read_manifest_file(
+                    m_path, expected_length=m.manifest_length, expected_checksum=m.checksum
+                )
             except Exception as e:
                 raise GarbageCollectionAborted(
                     f"Aborting GC: cannot read reachable manifest {m_path}: {e}. "
@@ -130,33 +163,27 @@ class GarbageCollector:
         logger.info(f"Found reachable: {len(reachable_manifest_lists)} manifest lists, "
                     f"{len(reachable_manifests)} manifests, {len(reachable_data_files)} data files")
 
-        # 3. Load in-flight protection markers (and sweep abandoned ones)
-        protected_files = self._load_inflight_protection(inflight_timeout_ms)
-        if protected_files:
-            logger.info(f"Protecting {len(protected_files)} in-flight files from GC")
+        # 4. List storage and delete orphans older than the cutoff.
+        cutoff_ms = gc_start_ms - grace_period_ms
 
-        # 4. List all files in storage and delete orphans
-
-        # GC Data Files
         stats["data_files"] = self._gc_prefix(
-            "data", reachable_data_files | protected_files, grace_period_ms
+            "data", reachable_data_files | protected_files, cutoff_ms
         )
 
-        # GC Manifests (files in the real manifests directory that are NOT
-        # reachable). In-flight protection applies here too: a commit in
-        # progress has written its manifests before the metadata that makes
-        # them reachable.
+        # Manifests AND manifest lists live under the same prefix. In-flight
+        # protection applies here too: a commit in progress has written its
+        # manifests before the metadata that makes them reachable.
         all_reachable_manifests = reachable_manifests.union(reachable_manifest_lists)
         stats["manifest_files"] = self._gc_prefix(
             self.file_manager.manifests_path,
             all_reachable_manifests | protected_files,
-            grace_period_ms,
+            cutoff_ms,
         )
 
         logger.info(f"Garbage collection complete. Deleted: {stats}")
         return stats
 
-    def _load_inflight_protection(self, inflight_timeout_ms: int) -> Set[str]:
+    def _load_inflight_protection(self, inflight_timeout_ms: int, now_ms: float) -> Set[str]:
         """Collect paths protected by fresh in-flight markers.
 
         Protection covers every file a transaction has written but not yet made
@@ -165,7 +192,7 @@ class GarbageCollector:
         files fall back to normal orphan handling.
         """
         protected: Set[str] = set()
-        cutoff = (time.time() * 1000) - inflight_timeout_ms
+        cutoff = now_ms - inflight_timeout_ms
 
         try:
             markers = self.storage.list_files(INFLIGHT_PATH)
@@ -219,10 +246,9 @@ class GarbageCollector:
             return fallback
         return self._normalize_path(target)
 
-    def _gc_prefix(self, prefix: str, reachable_set: Set[str], grace_period_ms: int) -> int:
-        """Garbage collect files in a specific prefix."""
+    def _gc_prefix(self, prefix: str, reachable_set: Set[str], cutoff_ms: float) -> int:
+        """Delete unreachable files under `prefix` last modified before cutoff_ms."""
         deleted_count = 0
-        cutoff_time = (time.time() * 1000) - grace_period_ms
 
         try:
             all_files = self.storage.list_files(prefix)
@@ -238,16 +264,16 @@ class GarbageCollector:
             # escapes the table root can never be matched against the reachable
             # set, so every live file would look like an orphan. Abort rather
             # than delete on a path we cannot classify (fail closed).
-            if norm_path == ".." or norm_path.startswith("../"):
+            if not norm_path or norm_path == ".." or norm_path.startswith("../") or "/../" in norm_path:
                 raise GarbageCollectionAborted(
                     f"Aborting GC: storage listing under '{prefix}' returned a path outside "
                     f"the table root ({file_rel_path!r}). Reachability cannot be determined."
                 )
 
             if norm_path not in reachable_set:
-                # Potential orphan. Check age.
+                # Potential orphan. Check age against the GC start clock.
                 try:
-                    if self.storage.get_modified_time(file_rel_path) * 1000 < cutoff_time:
+                    if self.storage.get_modified_time(file_rel_path) * 1000 < cutoff_ms:
                         # Per-file detail at DEBUG: a sweep over a large table
                         # would otherwise emit one INFO line per object. The
                         # summary below stays at INFO.
@@ -263,8 +289,13 @@ class GarbageCollector:
             logger.info(f"Deleted {deleted_count} orphan file(s) under {prefix}")
         return deleted_count
 
-    def _normalize_path(self, path: str) -> str:
-        """Normalize path to be relative to table root and strip leading slashes."""
-        if path.startswith(self.table_path):
-            path = path[len(self.table_path):]
-        return path.lstrip("/")
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Table-relative form of a manifest entry or a storage listing.
+
+        Both sources are already table-relative ('/data/x' Iceberg-style, or
+        'data/x' from list_files); the ONLY transformation is dropping the leading
+        slash and unifying separators. table_path is deliberately NOT stripped as
+        a string prefix (#56).
+        """
+        return path.replace("\\", "/").lstrip("/")

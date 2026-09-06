@@ -55,6 +55,23 @@ def is_permanent_s3_error(exc: BaseException) -> bool:
     return code in PERMANENT_S3_ERROR_CODES
 
 
+# S3 has been strongly consistent (read-after-write for new objects AND overwrites)
+# since December 2020, and every S3-compatible provider datashard targets is too.
+# A missing object is therefore a definitive answer: retrying it five times with
+# backoff only turned every "not found" into a 3-second stall (#67).
+NOT_FOUND_S3_ERROR_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+
+
+def is_not_found_error(exc: BaseException) -> bool:
+    """True for a missing object: FileNotFoundError or an S3 404 / NoSuchKey."""
+    if isinstance(exc, FileNotFoundError):
+        return True
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    return response.get("Error", {}).get("Code", "") in NOT_FOUND_S3_ERROR_CODES
+
+
 class S3ConsistencyHandler:
     """Handles S3 eventual consistency with retry logic."""
 
@@ -137,10 +154,10 @@ class S3ConsistencyHandler:
                     # retries changes the answer.
                     logger.error(f"{operation_name} failed permanently: {e}")
                     raise
+                if is_not_found_error(e):
+                    # Strongly consistent store: missing is missing (#67).
+                    raise
                 if attempt < self.max_retries:
-                    # Check for ClientError 404/NoSuchKey - if we are reading, we might want to fail fast?
-                    # But due to eventual consistency, a 404 might be temporary.
-                    # So we stick to retrying.
                     logger.warning(
                         f"{operation_name} failed: {e}, retrying in {delay:.2f}s..."
                     )

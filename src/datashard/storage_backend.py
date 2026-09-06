@@ -762,7 +762,11 @@ class S3StorageBackend(StorageBackend):
         """
         from .s3_consistency import with_s3_retry
 
-        s3_prefix = self._get_s3_key(prefix)
+        # Directory semantics: '<table>/data' must list '<table>/data/...' only,
+        # never the sibling '<table>/data_export/...' (#63: GC deleted those).
+        s3_prefix = self._get_s3_key(prefix).rstrip("/")
+        if s3_prefix:
+            s3_prefix += "/"
 
         def list_op() -> List[str]:
             result = []

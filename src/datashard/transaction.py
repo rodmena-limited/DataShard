@@ -60,6 +60,9 @@ class Transaction:
         self._written_files: List[str] = []
         # GC-protection markers written for those files
         self._inflight_markers: List[str] = []
+        # Table-relative paths already protected by a marker (one marker per path)
+        self._marked_paths: Set[str] = set()
+        self._marker_names: Set[str] = set()
 
         self._lock = threading.RLock()
 
@@ -78,6 +81,8 @@ class Transaction:
             self._operations = []
             self._written_files = []
             self._inflight_markers = []
+            self._marked_paths = set()
+            self._marker_names = set()
 
             return self
 
@@ -93,17 +98,30 @@ class Transaction:
         _validate_file_schema for why divergence is rejected here rather than
         discovered at scan time.
         """
+        return self._queue_files(files, validate_schema=True)
+
+    def _queue_files(self, files: List[DataFile], validate_schema: bool) -> "Transaction":
+        """Shared tail of append_files / append_data.
+
+        validate_schema is False for files this transaction wrote itself with the
+        table's schema - re-reading their footer would cost a HEAD and two range
+        GETs per file on S3 for information we already have (#67).
+        """
         if not self.is_active():
             raise RuntimeError("Transaction is not active")
 
         # Validate that the files exist in the file system
         # This is a critical check in production systems
-        table_schema = self._resolve_table_schema()
+        table_schema = self._resolve_table_schema() if validate_schema else None
         for data_file in files:
             if not self.file_manager.validate_file_exists(data_file.file_path):
                 raise FileNotFoundError(f"Data file does not exist: {data_file.file_path}")
             if table_schema is not None:
                 self._validate_file_schema(data_file, table_schema)
+            # Caller-provided files are unreachable until commit, exactly like the
+            # files append_data writes: protect them from GC for the transaction's
+            # lifetime (#57). Idempotent per path.
+            self._register_inflight(data_file.file_path)
 
         self._operations.append({"type": "append_files", "files": files})
 
@@ -287,8 +305,9 @@ class Transaction:
             checksum=data_file.checksum,
         )
 
-        # Queue the newly created file for appending
-        self.append_files([updated_data_file])
+        # Queue the newly created file for appending. We wrote it with the table's
+        # own schema a moment ago, so the footer check is skipped.
+        self._queue_files([updated_data_file], validate_schema=False)
 
         return self
 
@@ -302,11 +321,20 @@ class Transaction:
         metadata commit that makes it reachable. Marker write failures
         propagate - a file is never written unprotected (fail closed).
         """
-        marker_name = file_path.rsplit("/", 1)[-1]
+        rel_path = file_path.replace("\\", "/").lstrip("/")
+        if rel_path in self._marked_paths:
+            return  # already protected (append_data marks before writing, then queues)
+        marker_name = rel_path.rsplit("/", 1)[-1]
+        if marker_name in self._marker_names:
+            # Two caller-provided files with the same basename in different
+            # directories must not share (and overwrite) one marker.
+            marker_name = f"{marker_name}.{uuid.uuid4().hex[:8]}"
         marker_path = f"{_INFLIGHT_PATH}/{marker_name}.inflight"
-        marker_payload = json.dumps({"file_path": file_path.lstrip("/")}).encode("utf-8")
+        marker_payload = json.dumps({"file_path": rel_path}).encode("utf-8")
         self.file_manager.storage.write_file(marker_path, marker_payload)
         self._inflight_markers.append(marker_path)
+        self._marked_paths.add(rel_path)
+        self._marker_names.add(marker_name)
 
     def delete_files(self, file_paths: List[str]) -> "Transaction":
         """Queue files to delete from the table"""
@@ -495,8 +523,11 @@ class Transaction:
             path = base_snapshot.manifest_list
             if path.startswith("/"):
                 path = path.lstrip("/")
+            exp_len, exp_sum = FileManager.snapshot_list_integrity(base_snapshot)
             try:
-                existing_manifests = self.file_manager.read_manifest_list_file(path)
+                existing_manifests = self.file_manager.read_manifest_list_file(
+                    path, expected_length=exp_len, expected_checksum=exp_sum
+                )
             except Exception as e:
                 raise RuntimeError(
                     f"Cannot read base snapshot manifest list "
@@ -513,7 +544,11 @@ class Transaction:
                     manifest_path = manifest_path.lstrip("/")
 
                 try:
-                    data_files = self.file_manager.read_manifest_file(manifest_path)
+                    data_files = self.file_manager.read_manifest_file(
+                        manifest_path,
+                        expected_length=manifest.manifest_length,
+                        expected_checksum=manifest.checksum,
+                    )
                 except Exception as e:
                     # If we can't read a manifest, we can't safely filter it.
                     raise RuntimeError(
@@ -558,14 +593,17 @@ class Transaction:
             )
             final_manifests.append(new_append_manifest)
 
-        # 4. Create the manifest list (ALL active manifests for the table)
-        manifest_list_path = self.file_manager.create_manifest_list_file(
+        # 4. Create the manifest list (ALL active manifests for the table). Its
+        # length and sha256 go into the snapshot summary so a damaged list is
+        # rejected on read instead of yielding a partial file set (#58).
+        list_info = self.file_manager.create_manifest_list(
             final_manifests, snapshot_id, pre_write_hook=self._register_inflight
         )
 
         # 5. Commit the snapshot - with the SAME id stamped into the manifests.
         self.snapshot_manager.create_snapshot(
-            manifest_list_path=manifest_list_path,
+            manifest_list_path=list_info.path,
+            summary=list_info.summary(),
             operation="append" if append_files else "delete",
             parent_snapshot_id=(
                 base_metadata.current_snapshot_id
@@ -616,6 +654,8 @@ class Transaction:
                 pass
         self._inflight_markers = []
         self._written_files = []
+        self._marked_paths = set()
+        self._marker_names = set()
 
     def rollback(self) -> bool:
         """Rollback the transaction"""
@@ -661,6 +701,8 @@ class Transaction:
 
         self._written_files = []
         self._inflight_markers = []
+        self._marked_paths = set()
+        self._marker_names = set()
 
         return True
 
@@ -850,22 +892,29 @@ class Table:
         metadata = self.metadata_manager.refresh()
         return metadata is not None
 
-    def garbage_collect(self, grace_period_ms: int = 3600000) -> Dict[str, int]:
+    def garbage_collect(
+        self, grace_period_ms: int = 3600000, allow_short_grace: bool = False
+    ) -> Dict[str, int]:
         """Delete orphaned files not referenced by any snapshot.
 
-        Fail closed: if any reachable manifest cannot be read, GC aborts
-        (GarbageCollectionAborted) without deleting anything. Files belonging
-        to in-flight transactions are protected via markers regardless of age.
+        Fail closed: if any reachable manifest cannot be read or verified, GC
+        aborts (GarbageCollectionAborted) without deleting anything. Files
+        belonging to in-flight transactions are protected via markers regardless
+        of age, and nothing written after GC started is ever deleted.
 
         Args:
-            grace_period_ms: Only delete orphaned files older than this age (default 1 hour).
+            grace_period_ms: Only delete orphaned files older than this age,
+                measured from the start of the call (default 1 hour). Must exceed
+                the longest transaction plus the longest GC run on this table.
+            allow_short_grace: Accept a grace period below 5 minutes. Only safe
+                when no other writer can be active.
 
         Returns:
             Dict with counts of deleted files by type.
         """
         from .garbage_collector import GarbageCollector
         gc = GarbageCollector(self.table_path, self.metadata_manager, self.file_manager)
-        return gc.collect(grace_period_ms)
+        return gc.collect(grace_period_ms, allow_short_grace=allow_short_grace)
 
     def row_count(self) -> int:
         """Get total row count from parquet metadata without scanning data.
@@ -1247,13 +1296,19 @@ class Table:
         if manifest_list_path.startswith("/"):
             manifest_list_path = manifest_list_path.lstrip("/")
 
-        if not self.storage.exists(manifest_list_path):
+        # Reads are integrity-checked against the length/sha256 recorded at commit
+        # (#58); a missing object raises FileNotFoundError from the read itself, so
+        # no separate exists() round trip is needed (#67).
+        exp_len, exp_sum = FileManager.snapshot_list_integrity(snapshot)
+        try:
+            manifest_files = self.file_manager.read_manifest_list_file(
+                manifest_list_path, expected_length=exp_len, expected_checksum=exp_sum
+            )
+        except FileNotFoundError as e:
             raise RuntimeError(
                 f"Current snapshot {snapshot.snapshot_id} references missing manifest "
                 f"list '{snapshot.manifest_list}' - table metadata is inconsistent"
-            )
-
-        manifest_files = self.file_manager.read_manifest_list_file(manifest_list_path)
+            ) from e
 
         all_data_files = []
         seen_paths = set()
@@ -1265,13 +1320,17 @@ class Table:
             if manifest_path.startswith("/"):
                 manifest_path = manifest_path.lstrip("/")
 
-            if not self.storage.exists(manifest_path):
+            try:
+                manifest_data_files = self.file_manager.read_manifest_file(
+                    manifest_path,
+                    expected_length=manifest_ref.manifest_length,
+                    expected_checksum=manifest_ref.checksum,
+                )
+            except FileNotFoundError as e:
                 raise RuntimeError(
                     f"Manifest list references missing manifest '{manifest_ref.manifest_path}' "
                     f"- table metadata is inconsistent"
-                )
-
-            manifest_data_files = self.file_manager.read_manifest_file(manifest_path)
+                ) from e
 
             for data_file in manifest_data_files:
                 # Normalize before de-duplicating: the same file can appear as

@@ -152,7 +152,7 @@ def test_gc_protects_in_flight_manifests(tmp_path):
         '{"file_path": "metadata/manifests/manifest_pending_1.avro"}'
     )
 
-    stats = t.garbage_collect(grace_period_ms=0)
+    stats = t.garbage_collect(grace_period_ms=0, allow_short_grace=True)
     assert pending.exists(), "in-flight manifest was deleted by GC"
     assert stats["manifest_files"] == 0
 

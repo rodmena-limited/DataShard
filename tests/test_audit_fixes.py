@@ -181,14 +181,14 @@ def test_gc_fails_closed_on_unreadable_manifest(tmp_path):
         f.seek(0)
         f.write(b"garbage-not-avro")
     with pytest.raises(GarbageCollectionAborted):
-        t.garbage_collect(grace_period_ms=0)
+        t.garbage_collect(grace_period_ms=0, allow_short_grace=True)
 
 
 def test_gc_reports_reachable_files_not_deleted(tmp_path):
     t = _table(tmp_path)
     for i in range(3):
         t.append_records([{"id": i, "name": "n"}])
-    stats = t.garbage_collect(grace_period_ms=0)
+    stats = t.garbage_collect(grace_period_ms=0, allow_short_grace=True)
     # All manifests/data are reachable (no expiry) -> nothing deleted, table intact
     assert stats["data_files"] == 0
     assert t.row_count() == 3

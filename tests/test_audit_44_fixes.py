@@ -41,7 +41,7 @@ def test_gc_via_symlinked_root_keeps_live_data(tmp_path):
     os.symlink(str(real), str(link))
 
     linked = ds.load_table(str(link))
-    stats = linked.garbage_collect(grace_period_ms=0)
+    stats = linked.garbage_collect(grace_period_ms=0, allow_short_grace=True)
 
     assert stats == {"data_files": 0, "manifest_files": 0, "manifest_lists": 0}
     # The table is still readable through both the symlink and the real path.
@@ -81,7 +81,7 @@ def test_gc_aborts_when_listing_escapes_table_root(tmp_path, monkeypatch):
 
     monkeypatch.setattr(LocalStorageBackend, "list_files", fake_list_files)
     with pytest.raises(GarbageCollectionAborted):
-        t.garbage_collect(grace_period_ms=0)
+        t.garbage_collect(grace_period_ms=0, allow_short_grace=True)
 
 
 # ------------------------------------------------------------- #46 not_in NULL
