@@ -36,6 +36,23 @@ or from Python:
 For a table on S3, set the usual ``DATASHARD_S3_*`` environment variables first; the command
 uses the same backend as the library.
 
+Make room first
+---------------
+
+Migration writes the new metadata **alongside** the old, and the old is reclaimed only
+by a later ``garbage_collect()``. The table therefore peaks at its current size plus
+the new metadata before it shrinks — on one production table, **+46 %**.
+
+The dry run measures that figure exactly, by encoding the very bytes it would write::
+
+    $ datashard migrate /lake/trades --dry-run
+    {"status": "dry-run", ..., "metadata_bytes_now": 2456123904,
+     "metadata_bytes_added": 1129447424, "peak_bytes": 3585571328}
+
+``peak_bytes`` is the headroom the volume needs. Check it against ``df`` before
+migrating a large table, and run ``garbage_collect()`` afterwards to give the old
+metadata back.
+
 What it does
 ------------
 
@@ -49,6 +66,12 @@ What it does
   drops them otherwise. A dropped bound costs pruning; a wrong one would cost correctness.
 * Commits one new metadata version through the normal commit point, under the table lock.
 * Renames the old root hint to ``metadata.version-hint.text.migrated``.
+
+The report it returns is documented on :func:`datashard.migrate_table`; the keys are
+``status``, ``table``, ``location``, ``from``, ``to``, ``snapshots``, ``manifests``,
+``data_files``, ``metadata_bytes_now``, ``metadata_bytes_added``, ``peak_bytes``,
+``dropped_partition_fields`` and ``columns_foreign_readers_may_reject``. Note that
+``data_files`` counts manifest *entries* rewritten — no parquet file is touched.
 
 It is idempotent: running it on a migrated table reports ``already-migrated`` and changes
 nothing.

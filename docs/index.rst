@@ -19,6 +19,7 @@ Welcome to the official documentation for **datashard**, a Python implementation
    schemas
    time_travel
    duckdb
+   operating
    interoperability
    migration
    concurrency

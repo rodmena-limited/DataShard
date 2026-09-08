@@ -101,6 +101,11 @@ Struct, list and map columns are not supported (datashard's schema validation re
 Limits you must know about
 --------------------------
 
+**The local and S3 backends take different read paths** (see :ref:`operating
+<commit-cost>`, "Local and S3 are two implementations"), so a claim verified on one is
+not automatically true of the other.
+
+
 **datashard must be the only writer.** pyiceberg and Spark commit with their own metadata
 file naming and do not maintain ``version-hint.text``. Their commits are therefore invisible
 to datashard and to DuckDB-by-directory, and the files they add are not reachable from

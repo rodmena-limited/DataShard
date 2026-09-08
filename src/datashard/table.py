@@ -14,6 +14,7 @@ from .logging_config import get_logger
 from .metadata_manager import MetadataManager
 from .snapshot_manager import SnapshotManager
 from .table_scan import _ScanMixin
+from .table_verify import _VerifyMixin
 from .transaction import Transaction
 from .transaction_manager import TransactionManager
 
@@ -25,7 +26,7 @@ DEFAULT_SNAPSHOT_MAX_AGE_MS = 5 * 24 * 3600 * 1000
 
 
 
-class Table(_ScanMixin, _DuckDBMixin):
+class Table(_ScanMixin, _DuckDBMixin, _VerifyMixin):
     """Main table interface with transaction support"""
 
     def __init__(
@@ -189,20 +190,42 @@ class Table(_ScanMixin, _DuckDBMixin):
             return bool(tx.commit())
 
     def expire_snapshots(
-        self, older_than_ms: Optional[int] = None, retain_last: Optional[int] = None
+        self,
+        older_than_ms: Optional[int] = None,
+        retain_last: Optional[int] = None,
+        compact_manifests: bool = True,
     ) -> int:
-        """Expire snapshots and return how many were removed.
+        """Drop old snapshots from the table metadata, and collapse the manifest chain.
 
-        With no arguments, snapshots older than DEFAULT_SNAPSHOT_MAX_AGE_MS (5 days)
-        are expired. The current snapshot and the `retain_last` most recent ones are
-        always kept. Files owned only by expired snapshots are reclaimed by the next
-        garbage_collect() once they exceed its grace period.
+        This is the FIRST of two steps, and on its own it frees no disk space. It
+        shortens the metadata document (which every later commit rewrites in full, so
+        this is what stops metadata growing with the square of the commit count) and
+        makes the files those snapshots owned unreachable. **The bytes come back only
+        when :meth:`garbage_collect` runs afterwards**, and not before its grace period
+        has passed - see that method.
+
+        With no arguments, snapshots older than 5 days are expired. The current
+        snapshot and the `retain_last` most recent ones are always kept.
+
+        Args:
+            older_than_ms: expire snapshots committed before this epoch-ms timestamp.
+            retain_last: always keep this many most recent snapshots.
+            compact_manifests: also rewrite the surviving manifests into one, in the
+                SAME commit (default). Pruning snapshots without this leaves the
+                manifest chain behind, which is most of what a long-running table
+                accumulates. Pass False to keep the two operations separate.
+
+        Returns:
+            How many snapshots were REMOVED from the metadata (not files deleted, and
+            not bytes freed).
         """
         if older_than_ms is None and retain_last is None:
             older_than_ms = int(time.time() * 1000) - DEFAULT_SNAPSHOT_MAX_AGE_MS
         before = len(self.snapshots())
         with self.new_transaction() as tx:
             tx.expire_snapshots(older_than_ms=older_than_ms, retain_last=retain_last)
+            if compact_manifests:
+                tx.compact_manifests()
             tx.commit()
         return before - len(self.snapshots())
 
@@ -237,39 +260,56 @@ class Table(_ScanMixin, _DuckDBMixin):
     def garbage_collect(
         self, grace_period_ms: int = 3600000, allow_short_grace: bool = False
     ) -> Dict[str, int]:
-        """Delete orphaned files not referenced by any snapshot.
+        """Delete files no snapshot references any more. **This is what frees bytes.**
 
-        Fail closed: if any reachable manifest cannot be read or verified, GC
-        aborts (GarbageCollectionAborted) without deleting anything. Files
-        belonging to in-flight transactions are protected via markers regardless
-        of age, and nothing written after GC started is ever deleted.
+        The second of the two maintenance steps: :meth:`expire_snapshots` makes files
+        unreachable, and this deletes them. Running only the first frees nothing, and
+        running only the second frees nothing either while every snapshot is retained.
+
+        A candidate's age is its **modification time on the storage** (the object
+        store's own clock on S3), compared against the moment this call started. So a
+        table that was just copied, restored or unpacked has fresh mtimes on every
+        file and nothing in it can be collected until `grace_period_ms` has passed,
+        however old its data logically is. That is not GC failing; it is the guard that
+        stops a concurrent writer's in-flight files being deleted.
+
+        Fail closed: if any reachable manifest cannot be read or verified, GC aborts
+        with GarbageCollectionAborted without deleting anything. Files belonging to
+        in-flight transactions are protected by markers regardless of age, and nothing
+        written after GC started is ever deleted.
 
         Args:
-            grace_period_ms: Only delete orphaned files older than this age,
-                measured from the start of the call (default 1 hour). Must exceed
-                the longest transaction plus the longest GC run on this table.
-            allow_short_grace: Accept a grace period below 5 minutes. Only safe
-                when no other writer can be active.
+            grace_period_ms: Only delete orphaned files older than this (default
+                1 hour). Must exceed the longest transaction plus the longest GC run
+                on this table.
+            allow_short_grace: Accept a grace period below 5 minutes. Only safe when
+                no other writer can be active.
 
         Returns:
-            Dict with counts of deleted files by type.
+            Counts of the files deleted, by kind: data_files, manifest_files,
+            manifest_lists, metadata_files.
         """
         from .garbage_collector import GarbageCollector
         gc = GarbageCollector(self.table_path, self.metadata_manager, self.file_manager)
         return gc.collect(grace_period_ms, allow_short_grace=allow_short_grace)
 
     def row_count(self, snapshot_id: Optional[int] = None) -> int:
-        """Get total row count from manifest metadata without scanning data.
+        """Total rows in a snapshot, read from the manifests without touching the data.
 
-        This is a fast O(manifest_files) operation that reads only metadata,
-        not the actual parquet data files. Use this for count-only queries
-        instead of len(table.scan()).
+        Fast - O(manifest files), no parquet reads - so prefer it to `len(scan())`
+        for a count.
+
+        **This is NOT a health check.** It answers from metadata alone, so it keeps
+        returning the right number for a table whose data files cannot be read at all;
+        a monitor built on it reports green while the table is unusable (that is
+        exactly what happened during #93). Use :meth:`verify` when the question is
+        "can this table be read".
 
         Args:
             snapshot_id: Count as of a historical snapshot (default: current).
 
         Returns:
-            Total number of rows across all data files in the snapshot.
+            Total number of rows the snapshot's manifests account for.
         """
         data_files = self._get_all_data_files(snapshot_id=snapshot_id)
         return sum(df.record_count for df in data_files)

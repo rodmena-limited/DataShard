@@ -62,6 +62,15 @@ class MetadataManager(_VersionHintMixin):
     PREVIOUS_VERSIONS_MAX_PROPERTY = "write.metadata.previous-versions-max"
     DEFAULT_PREVIOUS_VERSIONS_MAX = 10
 
+    # Every commit rewrites the WHOLE metadata document, and that document lists every
+    # snapshot - so a table's total metadata bytes grow with the SQUARE of its commit
+    # count. One production lake reached 3.47 GB of metadata carrying 9.5 MB of data
+    # (365:1) at 3,027 single-row commits, with nothing in the library saying so (#94).
+    # The warning fires on the document actually written, which is the cost as it is
+    # paid, and then only once per doubling so a busy table is not spammed.
+    METADATA_WARN_BYTES_PROPERTY = "datashard.metadata.warn-bytes"
+    DEFAULT_METADATA_WARN_BYTES = 1 << 20  # 1 MiB
+
     def __init__(self, table_path: str, storage: "StorageBackend"):
         self.table_path = table_path
         self.storage = storage
@@ -74,6 +83,8 @@ class MetadataManager(_VersionHintMixin):
         # only for a moved table (paths under either resolve).
         self.recorded_location: Optional[str] = None
         self._warned_moved = False
+        # Size of the metadata document at the last size warning (0 = never warned)
+        self._warned_metadata_bytes = 0
         # Distributed lock (flock locally, CAS lease on S3): contention reducer
         # only - correctness rests on the exclusive create of v{N}.metadata.json.
         self.lock_provider = self.storage.create_lock(".locks/metadata.lock", timeout=30.0)
@@ -293,7 +304,38 @@ class MetadataManager(_VersionHintMixin):
         import json
 
         content = json.dumps(self._metadata_to_dict(metadata), indent=2).encode("utf-8")
+        self._warn_if_metadata_is_expensive(content, metadata)
         self.storage.create_exclusive(f"{self.metadata_path}/{metadata_file_name(version)}", content)
+
+    def _warn_if_metadata_is_expensive(self, content: bytes, metadata: TableMetadata) -> None:
+        """Say out loud what a large metadata document costs, and how to stop paying it.
+
+        Silent until the document passes datashard.metadata.warn-bytes (1 MiB by
+        default; 0 disables), then again only when it has DOUBLED, so a table that
+        commits every few seconds gets a handful of lines rather than a flood.
+        """
+        raw = metadata.properties.get(self.METADATA_WARN_BYTES_PROPERTY)
+        try:
+            threshold = int(raw) if raw is not None else self.DEFAULT_METADATA_WARN_BYTES
+        except (TypeError, ValueError):
+            threshold = self.DEFAULT_METADATA_WARN_BYTES
+        size = len(content)
+        if threshold <= 0 or size < threshold or size < self._warned_metadata_bytes * 2:
+            return
+        self._warned_metadata_bytes = size
+        readable = (
+            f"{size / (1 << 20):.1f} MiB" if size >= (1 << 20) else f"{size / 1024:.0f} KiB"
+        )
+        logger.warning(
+            f"{self.table_path}: the table metadata document is now {readable} across "
+            f"{len(metadata.snapshots)} snapshots, and EVERY commit writes a fresh copy of it - so the "
+            f"metadata this table accumulates grows with the SQUARE of the number of commits. "
+            f"Batch rows into one transaction (`with table.new_transaction() as tx: tx.append_records(...)`) "
+            f"instead of one commit per row, and run "
+            f"`table.expire_snapshots(retain_last=N)` then `table.garbage_collect()` to prune the chain "
+            f"and reclaim the superseded files. Set the {self.METADATA_WARN_BYTES_PROPERTY!r} table "
+            f"property to change or silence this threshold."
+        )
 
     def _write_metadata_file(self, path: str, metadata: TableMetadata) -> None:
         """Unconditional write (tests / tooling); commits use the exclusive form."""

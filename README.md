@@ -36,6 +36,7 @@ DataShard is a Python implementation of Apache Iceberg's core concepts, providin
 
 - **ACID Transactions:** Operations fully complete or fully rollback
 - **Time Travel:** Read the table as of any retained snapshot (`scan(snapshot_id=...)`)
+- **Health check that reads:** `verify()` opens every file a snapshot references and reports what it found (`row_count()` answers from metadata alone, so it cannot tell you a table is readable)
 - **Safe Concurrency:** Multiple processes can write without corruption
 - **Optimistic Concurrency Control (OCC):** Automatic conflict resolution
 - **S3-Compatible Storage:** AWS S3, MinIO, OVH Object Storage, DigitalOcean Spaces
@@ -62,6 +63,32 @@ and cannot be opened by older versions afterwards. See
 [docs: migration](https://datashard.readthedocs.io/en/latest/migration.html) and
 [docs: interoperability](https://datashard.readthedocs.io/en/latest/interoperability.html)
 for the limits (DataShard must remain the only *writer* until the catalog client in 1.0).
+
+### Before you write a recorder: batch your appends
+
+**One append is one commit, and one commit rewrites the table's whole metadata
+document** - which lists every snapshot, so the metadata a table accumulates grows with
+the **square** of the commit count. A production recorder appending one row at a time
+reached 3.5 GB of metadata carrying 9.5 MB of data. Batch instead:
+
+```python
+# one commit per row - avoid for high-frequency writes
+for row in stream:
+    table.append_records([row], schema)
+
+# one commit per batch - same rows, ~1% of the metadata, bigger parquet files
+table.append_records(buffer, schema)          # or, for several ops in one snapshot:
+with table.new_transaction() as tx:
+    tx.append_records(batch_a, schema)
+    tx.append_records(batch_b, schema)
+    tx.commit()
+```
+
+DataShard warns from 0.10.2 when a table's metadata document passes 1 MiB. Keep a
+long-running table small with `expire_snapshots(retain_last=N)` (shortens the history
+and collapses the manifest chain) followed by `garbage_collect()` (the step that
+actually frees bytes). Full cost model and a maintenance recipe:
+[docs: operating a table](https://datashard.readthedocs.io/en/latest/operating.html).
 
 ---
 
@@ -633,8 +660,10 @@ DataShard implements:
 - Fail-closed garbage collection: nothing written after GC started, nothing an
   in-flight transaction marked, and nothing behind an unreadable manifest is ever
   deleted; `garbage_collect()` also reclaims superseded metadata files
-- Maintenance API: `expire_snapshots(retain_last=...)`, `compact_manifests()`
-  (automatic at 64 manifests), `set_properties()`
+- Maintenance API: `expire_snapshots(retain_last=...)` (shortens the metadata chain
+  and folds manifest compaction into the same commit), `garbage_collect()` (the step
+  that frees bytes; a file's age is its storage mtime), `compact_manifests()`
+  (automatic at 64 manifests), `verify()`, `set_properties()`
 
 Data types: `boolean, int, long, float, double, decimal(P,S), date, time, timestamp,
 timestamptz, string, uuid, fixed, binary`; data files are always parquet.

@@ -5,6 +5,67 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-09-08
+
+Everything here comes from a production review by crypto-trader, who has run datashard since
+late August as the tape store for a live market-making system: one local lake, 299 symbol-day
+tables, 7.8 GB, 8 streams, a commit every 28 s per stream-symbol. Their finding, in one line:
+the library never says what a commit costs, and 6.2 GB of their 7.8 GB store was metadata.
+
+### Added
+- **datashard now says when metadata is getting expensive.** One append is one commit, and one
+  commit rewrites the whole metadata document - which lists every snapshot, so a table's total
+  metadata grows with the **square** of its commit count. On the reporting lake that was 3.5 GB
+  of metadata carrying 9.5 MB of data (365:1) after 3,027 single-row commits. When the document
+  passes 1 MiB a WARNING now names its size, the snapshot count, the cost model and the two
+  remedies, and repeats only when the size doubles. The threshold is the
+  `datashard.metadata.warn-bytes` table property; `0` silences it.
+- **`Table.verify()`** - a health check that actually reads. `row_count()` answers from metadata,
+  so it keeps reporting a healthy count for a table whose files cannot be read at all (exactly
+  what happened during #93: a monitor built on it read green while the table was unusable).
+  `verify()` opens every data file the snapshot references through the same path a scan uses and
+  returns `{ok, snapshots, data_files, checked_files, rows, rows_read, deep, errors}`. It never
+  raises for a broken table - the report is the answer - so it drops into a health endpoint.
+  `deep=True` re-hashes every file; `limit=n` samples.
+- **`migrate_table(dry_run=True)` now reports the headroom migration needs**:
+  `metadata_bytes_now`, `metadata_bytes_added` and `peak_bytes`. Migration writes the new
+  metadata alongside the old, so a table transiently grows - by 46 % on one production table -
+  and that is a hazard on a full volume for a one-way operation. The figure is measured, not
+  estimated: a dry run encodes the very bytes it would write.
+
+### Measured
+
+1,000 rows into one table, three ways (local disk, one row = 1.0 KB of parquet):
+
+| | data | metadata | ratio |
+|---|---|---|---|
+| one commit per row | 0.96 MB | 412.96 MB | 428:1 |
+| batched 100 rows per commit | 0.02 MB | 0.13 MB | 6:1 |
+| one commit per row, then `expire_snapshots(retain_last=10)` + `garbage_collect()` | 0.96 MB | 8.67 MB | 9:1 |
+
+Batching is worth ~3,000x the metadata here, and the maintenance pair reclaims 98 % of what an
+un-batched table has already accumulated - with every row still present and `verify()` green.
+The reporting lake measured 365:1 on the same shape of workload.
+
+### Changed
+- **`expire_snapshots()` folds manifest compaction into the same commit** (`compact_manifests=True`
+  by default). Pruning snapshots without it left the manifest chain behind, which is most of what
+  a long-running table accumulates. Pass `compact_manifests=False` for the old behaviour.
+- Documentation the review asked for, in the places that would have prevented the surprise:
+  - a new **operating guide** (`docs/operating.rst`) with the commit cost model, a batching
+    recipe, the expire → garbage-collect two-step, `verify()`, and what filter pruning does;
+  - the README now leads with "batch your appends" before anyone writes a recorder;
+  - `expire_snapshots()` documents that it frees **no** bytes and what its return value counts;
+  - `garbage_collect()` documents that it is the step that frees bytes, and that a file's age is
+    its **storage mtime** - so a table you just copied cannot be collected until the grace period
+    passes, which reads as "GC is broken" and is not;
+  - `row_count()` says it is metadata-only and points at `verify()`;
+  - `migrate_table()` documents every key of its report dict;
+  - the docs state that the local and S3 backends take **different read paths**, so "works on S3"
+    and "works locally" are separate claims;
+  - the docs state that filters stay **correct** without partition pruning (parquet row-group
+    statistics do the work), so nobody rewrites a query layer waiting for 0.11.
+
 ## [0.10.1] - 2026-09-08
 
 ### Fixed

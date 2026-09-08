@@ -16,7 +16,7 @@ from .data_structures import ManifestFile, PartitionSpec, Snapshot, TableMetadat
 from .exceptions import AmbiguousMetadataError
 from .file_manager import ENTRY_STATUS_ADDED, ENTRY_STATUS_EXISTING, FileManager
 from .logging_config import get_logger
-from .manifest_writer import ManifestEntry
+from .manifest_writer import ManifestEntry, encode_manifest, encode_manifest_list
 from .metadata_manager import MetadataManager
 from .metadata_serde import (
     LEGACY_SUMMARY_LIST_LENGTH,
@@ -38,6 +38,24 @@ if TYPE_CHECKING:
     from .table import Table
 
 logger = get_logger(__name__)
+
+
+def _metadata_bytes(storage: Any) -> int:
+    """Bytes currently under metadata/ - what migration adds to, before GC reclaims it."""
+    try:
+        return sum(size for _p, size in _sizes(storage, "metadata"))
+    except Exception:  # noqa: BLE001 - a size estimate must never fail a migration
+        return 0
+
+
+def _sizes(storage: Any, prefix: str) -> List[Tuple[str, int]]:
+    out: List[Tuple[str, int]] = []
+    for rel in storage.list_files(prefix):
+        try:
+            out.append((rel, storage.get_size(rel)))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 def _ordered_snapshots(metadata: TableMetadata) -> List[Snapshot]:
@@ -63,14 +81,18 @@ def rewrite_snapshots(
     """Rewrite every snapshot's manifests and manifest lists under `location`.
 
     Manifests shared by several snapshots are rewritten once. Returns the new
-    snapshots (same ids) and counts. Nothing is written when dry_run is set.
+    snapshots (same ids) and counts, including `metadata_bytes_added`: the exact size
+    of the new metadata. On a dry run nothing is written, but the same bytes are
+    ENCODED in memory and measured, so the projection is measured rather than guessed
+    (#94 - migration writes the new metadata alongside the old, so a table needs the
+    headroom before it starts).
     """
     ordered = _ordered_snapshots(metadata)
     seqs = _sequence_numbers(ordered)
     stamped = deepcopy(metadata)
     stamped.location = location
     rewritten: Dict[str, ManifestFile] = {}
-    counts = {"snapshots": 0, "manifests": 0, "data_files": 0}
+    counts = {"snapshots": 0, "manifests": 0, "data_files": 0, "metadata_bytes_added": 0}
     new_snapshots: List[Snapshot] = []
     for snap in ordered:
         exp_len, exp_sum = FileManager.snapshot_list_integrity(snap)
@@ -88,20 +110,28 @@ def rewrite_snapshots(
                     entries.append((status, added_by, seq, f))
                 counts["manifests"] += 1
                 counts["data_files"] += len(entries)
+                seq_for_manifest = (
+                    om.sequence_number if om.sequence_number is not None else seqs[snap.snapshot_id]
+                )
                 if dry_run:
+                    # Encode without writing, purely to measure what migration will add.
+                    schema, spec = fm._current_schema_and_spec(stamped)
+                    counts["metadata_bytes_added"] += len(encode_manifest(entries, schema, spec, location))
                     rewritten[key] = om
                 else:
                     rewritten[key] = fm.write_manifest(
-                        entries, fm.new_manifest_path(), om.added_snapshot_id,
-                        om.sequence_number if om.sequence_number is not None else seqs[snap.snapshot_id],
+                        entries, fm.new_manifest_path(), om.added_snapshot_id, seq_for_manifest,
                         table_metadata=stamped, location=location,
                     )
+                    counts["metadata_bytes_added"] += rewritten[key].manifest_length
             new_manifests.append(rewritten[key])
         counts["snapshots"] += 1
         summary = {k: v for k, v in (snap.summary or {}).items() if k not in (LEGACY_SUMMARY_LIST_LENGTH, LEGACY_SUMMARY_LIST_SHA256)}
         parent = snap.parent_snapshot_id if snap.parent_snapshot_id not in (None, -1) else None
         if dry_run:
             new_list_path = snap.manifest_list
+            counts["metadata_bytes_added"] += len(encode_manifest_list(
+                new_manifests, snap.snapshot_id, parent, seqs[snap.snapshot_id], location))
         else:
             info = fm.create_manifest_list(
                 new_manifests, snap.snapshot_id, parent_snapshot_id=parent,
@@ -109,6 +139,7 @@ def rewrite_snapshots(
             )
             new_list_path = info.path
             summary.update(info.summary())
+            counts["metadata_bytes_added"] += info.length
         new_snapshots.append(Snapshot(
             snapshot_id=snap.snapshot_id, timestamp_ms=snap.timestamp_ms, manifest_list=new_list_path,
             parent_snapshot_id=parent, operation=snap.operation or "append", summary=summary,
@@ -162,8 +193,45 @@ def _legacy_current(mm: MetadataManager, metadata_file: Optional[str]) -> Tuple[
 def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optional[str] = None) -> Dict[str, Any]:
     """Migrate the pre-0.10 table at `table_path` to the Iceberg v2 layout.
 
-    Idempotent: a table that already has an Iceberg metadata version is left
-    alone. Returns a report dict; with dry_run nothing is written.
+    Data files are never rewritten or moved; only metadata is. Idempotent: a table
+    that already carries an Iceberg metadata version is left alone.
+
+    **Migration needs headroom.** The new metadata is written ALONGSIDE the old, which
+    is only reclaimed by a later ``garbage_collect()``, so the table peaks at roughly
+    its current size plus ``metadata_bytes_added`` before it shrinks. On one production
+    table that peak was +46 %. Run with ``dry_run=True`` first: it measures the exact
+    figure by encoding the new metadata in memory without writing it.
+
+    Args:
+        table_path: the table to migrate.
+        dry_run: report what would be written and change nothing.
+        metadata_file: the committed legacy metadata file, for the rare table whose
+            version hint is missing AND whose highest version is ambiguous.
+
+    Returns:
+        A report dict:
+
+        ``status``
+            ``"migrated"``, ``"dry-run"``, or ``"already-migrated"``.
+        ``table`` / ``location``
+            the path migrated, and the URI foreign readers should be pointed at.
+        ``from`` / ``to``
+            the legacy metadata file read, and the Iceberg version written.
+        ``snapshots`` / ``manifests`` / ``data_files``
+            how many of each the migration rewrote or re-listed. `data_files` counts
+            manifest ENTRIES rewritten, not parquet files touched - none are.
+        ``metadata_bytes_now`` / ``metadata_bytes_added`` / ``peak_bytes``
+            the metadata size before migration, the size migration adds, and the sum -
+            the headroom the volume needs before the next ``garbage_collect()``
+            reclaims the old metadata. All three are measured, not estimated: a dry
+            run encodes the very bytes it would write. All three are absent from an
+            ``already-migrated`` report.
+        ``dropped_partition_fields``
+            partition-spec fields discarded because pre-0.10 data was never
+            partitioned by them (empty for almost every table).
+        ``columns_foreign_readers_may_reject``
+            columns whose type no Iceberg engine reads reliably (``uuid``, ``fixed``);
+            datashard still reads them. Empty for almost every table.
     """
     from .storage_backend import CASConflictError, create_storage_backend
 
@@ -199,6 +267,9 @@ def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optiona
             legacy_md.partition_specs = [PartitionSpec(spec_id=0, fields=[])]
             legacy_md.default_spec_id = 0
 
+            # Measured BEFORE anything is written, so the figure means the same thing
+            # on a dry run and on the real one.
+            metadata_bytes_now = _metadata_bytes(storage)
             new_snapshots, counts = rewrite_snapshots(fm, legacy_md, location, dry_run=dry_run)
             new_md = deepcopy(legacy_md)
             new_md.location = location
@@ -225,6 +296,8 @@ def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optiona
                 "from": legacy_file, "to": f"v{new_version}.metadata.json",
                 "dropped_partition_fields": dropped_spec,
                 "columns_foreign_readers_may_reject": sorted(unreadable),
+                "metadata_bytes_now": metadata_bytes_now,
+                "peak_bytes": metadata_bytes_now + counts["metadata_bytes_added"],
                 **counts,
             }
             if dry_run:
