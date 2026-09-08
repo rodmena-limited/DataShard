@@ -51,4 +51,14 @@ append; 4 snapshots in 31 s — and works.
 - Both directions re-run against the real OVH bucket.
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.10.4 (2026-09-08):** https://pypi.org/project/datashard/0.10.4/ · tag v0.10.4.
+
+Exercised: 277 unit tests (4 new); 36/36 probes; and the reported failure re-run end to end against
+the **served** wheel on the real OVH bucket — a stale lock planted exactly as a killed migration
+would leave one, then `migrate_table`, which completed in 71 s where 0.10.3 raised TimeoutError,
+followed by `verify()` green. Both directions of the lease guard were re-run on that bucket before
+and after the fix. The test prefixes were deleted afterwards; no `datashard-*` objects remain.
+
+Not exercised: a provider other than OVH for the lock path, and the polling (non-CAS) lock, which
+remains opt-in and best-effort.
