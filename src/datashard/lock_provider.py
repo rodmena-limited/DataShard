@@ -76,19 +76,31 @@ class LocalLockProvider(LockProvider):
 class S3LockProviderBase(LockProvider):
     """Base class for S3-based distributed locks."""
 
+    # How far past the lease an acquire waits before giving up. A lock can only be
+    # taken over once it is OLDER than the lease, so a deadline inside the lease can
+    # never break an abandoned one (#96).
+    TAKEOVER_MARGIN_SECONDS = 15
+
     def __init__(
         self,
         s3_client: Any,
         bucket: str,
         key: str,
         timeout: float = 30.0,
-        lease_seconds: int = 60
+        lease_seconds: int = 60,
+        takeover_margin_seconds: Optional[float] = None,
     ):
         self.s3 = s3_client
         self.bucket = bucket
         self.key = key
         self.timeout = timeout
         self.lease_seconds = lease_seconds
+        # How far PAST the lease an acquire waits before giving up. A lock can only be
+        # taken over once it is older than the lease, so a deadline inside the lease can
+        # never break an abandoned one (#96). Overridable so tests can use a short lease.
+        self.takeover_margin_seconds = (
+            self.TAKEOVER_MARGIN_SECONDS if takeover_margin_seconds is None else takeover_margin_seconds
+        )
         self.lock_id = str(uuid.uuid4())
         self.is_locked = False
         # Monotonic deadline of our own lease (polling provider; None = unset).
@@ -101,7 +113,17 @@ class S3LockProviderBase(LockProvider):
         self._state_lock = threading.Lock()
 
     def acquire(self) -> bool:
+        """Acquire the lock, breaking one whose holder is gone.
+
+        The deadline is at least `lease_seconds` plus a margin, WHATEVER timeout the
+        caller asked for. A lock is only takeable once it is older than the lease, so a
+        shorter deadline can never break a lock left behind by a killed process: the
+        call fails, and only a retry made after the lease has run down succeeds. That
+        is exactly what a 30 s timeout against a 60 s lease did - every first attempt
+        after a crash raised TimeoutError, with nothing to say it was transient (#96).
+        """
         start_time = time.time()
+        deadline = start_time + max(self.timeout, self.lease_seconds + self.takeover_margin_seconds)
         while True:
             # 1. Try to acquire lock (subclasses may also take over expired locks atomically)
             if self._try_acquire():
@@ -113,8 +135,16 @@ class S3LockProviderBase(LockProvider):
             self._check_and_break_expired_lock()
 
             # 3. Check timeout
-            if time.time() - start_time >= self.timeout:
-                raise TimeoutError(f"Failed to acquire S3 lock at {self.key} within {self.timeout}s")
+            if time.time() >= deadline:
+                waited = time.time() - start_time
+                raise TimeoutError(
+                    f"Failed to acquire the lock at {self.key} after {waited:.0f}s. "
+                    f"{self._holder_description()} A lock is broken automatically once it is "
+                    f"older than its {self.lease_seconds}s lease, so this means the holder is "
+                    f"alive and renewing it - another writer, a maintenance job, or a migration "
+                    f"still running. Wait for it rather than deleting the lock object: deleting "
+                    f"one that is still held lets two writers commit at once."
+                )
 
             # Wait with randomized jitter before retrying. random.uniform
             # de-correlates contending processes; the previous time-based
@@ -124,6 +154,17 @@ class S3LockProviderBase(LockProvider):
     def _try_acquire(self) -> bool:
         """Subclasses must implement the actual lock acquisition logic."""
         raise NotImplementedError
+
+    def _holder_description(self) -> str:
+        """One sentence about the lock that is in the way, for the timeout message."""
+        from datetime import datetime, timezone
+
+        try:
+            resp = self.s3.head_object(Bucket=self.bucket, Key=self.key)
+        except Exception:  # noqa: BLE001 - a diagnostic must never mask the timeout
+            return "The lock could not be inspected."
+        age = (datetime.now(timezone.utc) - resp["LastModified"]).total_seconds()
+        return f"It was last renewed {age:.0f}s ago (lease {self.lease_seconds}s)."
 
     def _check_and_break_expired_lock(self) -> bool:
         """Subclasses handle expired locks; CAS providers take over atomically in _try_acquire."""

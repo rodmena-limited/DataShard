@@ -5,6 +5,43 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2026-09-08
+
+### Fixed
+- **A lock left behind by a process that died could not be broken (#96).** The metadata lock's
+  acquire timeout was 30 s while its lease is 60 s, and a lock is only takeable once it is OLDER
+  than the lease — so the deadline always expired first. Every acquire after a crash raised
+
+      TimeoutError: Failed to acquire S3 lock at <table>/.locks/metadata.lock within 30.0s
+
+  and only a retry made more than 60 s later succeeded, with nothing in the message to say the
+  condition was transient. The acquire deadline is now always at least the lease plus a margin,
+  so an abandoned lock is taken over inside one call. A holder that is still renewing its lease is
+  refused exactly as before, and the timeout message now names how long ago the lock was renewed
+  and warns against deleting one that is still held.
+
+  Reported by crypto-trader, whose S3 **migration** failed with this error. Reproduced against
+  OVH before the fix (`FAILED after 32s`, then `second attempt acquired after 5s`) and verified
+  after it on the same bucket: a stale lock is acquired after 64 s, and a live holder is still
+  correctly refused.
+
+  This affects every S3 operation that takes the metadata lock, not just migration — a commit
+  following any hard-killed writer met the same wall.
+
+### Verified, having previously only been claimed
+- **Migration against a real S3 bucket.** `datashard migrate` shipped in 0.10.0 with "S3 migration
+  not exercised" in its closing statement rather than a test. S3 reads, CAS commits under
+  multi-process contention, garbage collection and DuckDB-over-S3 were all exercised, including
+  against real OVH; the migration path specifically was not. It has now been run end to end on OVH
+  — dry-run, migrate, verify, and an append afterwards; 4 snapshots in 31 s — and works. The
+  harness gained `probe_v0104_stale_lock_takeover.py`, which tests both directions of the lease
+  guard with a control that puts the deadline back inside the lease and shows the same stale lock
+  becoming unbreakable.
+- `probe_s3_cas_lock_lease_both_directions.py` previously asserted the bug as a feature: it
+  stopped the holder's heartbeat and then required the next acquirer to be REFUSED, which only
+  proved that the rival gave up before the lease expired. It now requires a *renewing* holder to
+  keep its lock, and a dead holder's lock to be taken over.
+
 ## [0.10.3] - 2026-09-08
 
 Five small defects found in a sweep of the 0.10.x releases themselves. No behaviour of an
