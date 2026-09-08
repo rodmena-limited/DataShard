@@ -64,4 +64,16 @@ an un-migrated table, the failure surfaces only *after* the one-way migration.
 - A structural test fails the build if any module regains a bare `pq.read_table` call.
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.10.1 (2026-09-08):** https://pypi.org/project/datashard/0.10.1/ · commit d5e074c · tag v0.10.1.
+
+Exercised: 260 unit tests (8 new in `tests/test_hive_path_inference.py`, each paired with a raw-pyarrow
+control proving the fixture really triggers inference); 34/34 probes including the new
+`probe_v0101_path_is_not_a_partition_scheme.py`; the reporter's own script run against the built wheel
+and then against the wheel installed back from PyPI, covering the crash variant with one and two data
+files and the silent-injection variant. Affected versions determined by running the reproduction against
+the released 0.8.1 and 0.9.1 packages from PyPI - both fail, so the reporter's inferred 0.8.x guess was
+correct; 0.7.2 was retested clean.
+
+Not exercised: a real S3 provider (the S3 leg runs against moto; S3 never took this path because its
+reads pass a file object), and pyarrow versions other than 22.0.0.
