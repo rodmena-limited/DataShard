@@ -3,7 +3,7 @@
 # Single source of truth for the version is pyproject.toml. Installed wheels report
 # it through package metadata; a development checkout reads pyproject.toml directly,
 # because an editable install's dist-info can lag behind (it reported 0.5.1 at 0.7.2).
-_FALLBACK_VERSION = "0.10.0"
+_FALLBACK_VERSION = "0.10.1"
 
 
 def _resolve_version() -> str:

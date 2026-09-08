@@ -5,6 +5,35 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-09-08
+
+### Fixed
+- **A table's directory is a location, never a partition scheme (#93).** Reads inferred
+  Hive-style partitioning from the filesystem path, so the physical location of a table leaked
+  into its data. A table stored under a path containing a `key=value` segment was affected in
+  one of two ways:
+  - **the key matches a column** - every read failed with
+    `ArrowTypeError: Unable to merge: Field <col> has incompatible types: string vs
+    dictionary<values=string, indices=int32, ordered=0>`. Had the merge succeeded, the directory
+    name would have **overwritten** the value the rows actually carry, which for the reporting
+    user is a different instrument (the directory holds the exchange pair, the column holds the
+    venue's pair);
+  - **the key matches no column** - a column parsed from the directory name was **silently
+    added** to every row, so a scan returned a column that is not in the table's schema. This
+    variant produced no error and had not been noticed.
+
+  Every parquet read now goes through one helper that turns inference off, and a test fails the
+  build if a bare `pq.read_table` call is reintroduced. Affected releases: **0.8.0 through
+  0.10.0** (0.8.1, 0.9.1 and 0.10.0 verified directly against the released packages); 0.7.2 is
+  unaffected. Local backend only - S3 reads pass a file object, which never triggers dataset
+  discovery, now pinned by a test so the two backends cannot drift.
+
+  Reported by crypto-trader on 2026-09-08 with a self-contained reproduction, against tables
+  laid out as `<root>/symbol=<pair>/day=<date>/`. **No data was ever written incorrectly**: the
+  defect was entirely in the read path, and an affected table reads correctly as soon as it is
+  opened by 0.10.1. Note that `row_count()` reads metadata only, so it kept returning the right
+  answer throughout - a health check built on it would have reported green.
+
 ## [0.10.0] - 2026-09-06
 
 **datashard tables are now Apache Iceberg v2 tables on disk.** DuckDB's `iceberg` extension,

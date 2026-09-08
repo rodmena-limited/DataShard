@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datashard"
-version = "0.10.0"
+version = "0.10.1"
 description = "Safe concurrent data operations for ML/AI workloads, Python implementation of Apache Iceberg concepts with S3 support"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -128,6 +128,12 @@ force_grid_wrap = 0
 use_parentheses = true
 ensure_newline_before_comments = true
 line_length = 99
+
+[tool.ruff]
+# The Iceberg v2 spike (#83) is a FROZEN research artifact: hand-written Iceberg
+# files produced to interrogate DuckDB and pyiceberg, kept verbatim as the record
+# of what was measured. It is deliberately terse and is not maintained code.
+extend-exclude = ["audit/spike_iceberg_v2"]
 
 [tool.ruff.lint]
 select = [

@@ -11,12 +11,24 @@ import pyarrow.parquet as pq
 
 from .arrow_types import iceberg_type_to_arrow
 from .column_stats import compute_column_bounds
-from .data_io import PANDAS_AVAILABLE, DataFileReader, DataFileWriter, pd
+from .data_io import (
+    PANDAS_AVAILABLE,
+    DataFileReader,
+    DataFileWriter,
+    pd,
+    read_parquet_table,
+)
 from .data_structures import DataFile, FileFormat, Schema
 from .integrity import IntegrityChecker
 from .local_backend import LocalStorageBackend
 from .logging_config import get_logger
 from .s3_backend import S3StorageBackend
+from .schema_validation import (
+    check_cast_family,
+    type_family,
+    validate_arrow_table_strict,
+    validate_records_strict,
+)
 from .storage_backend import StorageBackend
 
 if TYPE_CHECKING:
@@ -215,44 +227,12 @@ class DataFileManager:
     def validate_records_strict(
         self, records: List[Dict[str, Any]], iceberg_schema: Schema
     ) -> None:
-        """Validate records against the schema, raising on silent-loss hazards.
-
-        - Unknown/misnamed fields raise instead of being silently dropped by
-          pyarrow's schema projection.
-        - Required (non-nullable) fields must be present and non-None; pyarrow's
-          from_pylist does not enforce nullability, so we must.
-        Type mismatches are left to pyarrow, which raises on incompatible values.
-        """
-        # Schema.__post_init__ guarantees every field has a "name".
-        allowed = {str(f["name"]) for f in iceberg_schema.fields}
-        required = {
-            str(f["name"]) for f in iceberg_schema.fields if f.get("required", False)
-        }
-
-        for i, record in enumerate(records):
-            unknown = {str(k) for k in record.keys()} - allowed
-            if unknown:
-                raise ValueError(
-                    f"Record {i} has fields not in the table schema: {sorted(unknown)}. "
-                    f"Schema fields: {sorted(allowed)}. Refusing to silently drop data."
-                )
-            for name in required:
-                if record.get(name) is None:
-                    raise ValueError(
-                        f"Record {i} is missing required field '{name}' (or it is None)"
-                    )
+        """Records must not lose or coerce data silently (see schema_validation)."""
+        validate_records_strict(records, iceberg_schema)
 
     def validate_arrow_table_strict(self, table: pa.Table, iceberg_schema: Schema) -> None:
-        """Arrow-level twin of validate_records_strict: required columns present and
-        free of nulls. (Unknown columns cannot survive from_pandas/from_pylist with an
-        explicit schema, but callers check the DataFrame's columns before converting.)"""
-        required = [str(f["name"]) for f in iceberg_schema.fields if f.get("required", False)]
-        for name in required:
-            if name not in table.column_names:
-                raise ValueError(f"Required field '{name}' is missing")
-            nulls = table.column(name).null_count
-            if nulls:
-                raise ValueError(f"Required field '{name}' has {nulls} null value(s)")
+        """Arrow twin of validate_records_strict (see schema_validation)."""
+        validate_arrow_table_strict(table, iceberg_schema)
 
     def _write_arrow_table(self, file_path: str, table: pa.Table) -> Tuple[int, str]:
         """Serialise `table` to parquet once, in memory, and store it via the backend.
@@ -279,39 +259,8 @@ class DataFileManager:
             return os.path.relpath(validated, self.storage._real_base_path()).replace(os.sep, "/")
         return file_path.replace("\\", "/").lstrip("/")
 
-    @staticmethod
-    def _type_family(t: pa.DataType) -> str:
-        pt = pa.types
-        if pt.is_boolean(t):
-            return "bool"
-        if pt.is_integer(t) or pt.is_floating(t) or pt.is_decimal(t):
-            return "number"
-        if pt.is_timestamp(t):
-            return "timestamp"
-        if pt.is_date(t):
-            return "date"
-        if pt.is_time(t):
-            return "time"
-        if pt.is_string(t) or pt.is_large_string(t):
-            return "string"
-        if pt.is_binary(t) or pt.is_large_binary(t) or pt.is_fixed_size_binary(t):
-            return "binary"
-        if pt.is_null(t):
-            return "null"
-        return str(t)
-
-    @classmethod
-    def _check_cast_family(cls, name: str, source: pa.DataType, target: pa.DataType) -> None:
-        """Refuse cross-family coercions pyarrow would perform silently: the string "12"
-        must not become the integer 12, an int must not become text. Widening inside a
-        family (int32 -> long, float -> double, decimal precision) and null columns are fine.
-        """
-        src, dst = cls._type_family(source), cls._type_family(target)
-        if src != "null" and src != dst:
-            raise ValueError(
-                f"Column '{name}' is {source} but the table field is {target}; refusing to coerce "
-                f"across type families - convert it explicitly before appending"
-            )
+    _type_family = staticmethod(type_family)
+    _check_cast_family = staticmethod(check_cast_family)
 
     def write_data_file(
         self,
@@ -382,7 +331,7 @@ class DataFileManager:
             if field.name not in table.column_names:
                 table = table.append_column(field.name, pa.nulls(table.num_rows, type=field.type))
             else:
-                self._check_cast_family(field.name, table.schema.field(field.name).type, field.type)
+                check_cast_family(field.name, table.schema.field(field.name).type, field.type)
         try:
             table = table.select(arrow_schema.names).cast(arrow_schema)
         except _SCHEMA_MISMATCH_ERRORS as e:
@@ -443,7 +392,7 @@ class DataFileManager:
         if file_format != FileFormat.PARQUET:
             raise ValueError(f"Unsupported file format: {file_format}")
         with self.parquet_source(file_path) as (source, threads):
-            table = pq.read_table(source, columns=columns or None, use_threads=threads)
+            table = read_parquet_table(source, columns=columns or None, use_threads=threads)
         result: List[Dict[str, Any]] = table.to_pylist()
         return result
 
@@ -462,7 +411,7 @@ class DataFileManager:
         if file_format != FileFormat.PARQUET:
             raise ValueError(f"Unsupported file format: {file_format}")
         with self.parquet_source(file_path) as (source, threads):
-            table = pq.read_table(source, columns=columns or None, use_threads=threads)
+            table = read_parquet_table(source, columns=columns or None, use_threads=threads)
         return table.to_pandas()
 
     def validate_pandas_compatibility(self, df: "pd.DataFrame", iceberg_schema: Schema) -> bool:

@@ -6,6 +6,7 @@ modes (mixed into Table; split out of transaction.py for the 500-line file cap, 
 import os
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
+from .data_io import read_parquet_table
 from .data_structures import DataFile, Schema, TableMetadata
 from .file_manager import FileManager
 from .logging_config import get_logger
@@ -113,7 +114,7 @@ class _ScanMixin:
                     )
                 # Read all columns, filter, THEN project: the filter may reference
                 # a column not in `columns`.
-                table = pq.read_table(BytesIO(raw), use_threads=False)
+                table = read_parquet_table(BytesIO(raw), use_threads=False)
                 if compute_expr is not None:
                     table = table.filter(compute_expr)
                 if columns is not None:
@@ -130,7 +131,7 @@ class _ScanMixin:
                     # pyarrow applies `filters` against all needed columns during
                     # the scan and returns only `columns`, so pushdown is correct.
                     kwargs["filters"] = compute_expr
-                return pq.read_table(src, **kwargs)
+                return read_parquet_table(src, **kwargs)
         except (pa.ArrowException, OSError) as e:
             corrupt = self._as_corruption(data_file, e)
             if corrupt is not None:

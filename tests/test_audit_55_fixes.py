@@ -20,7 +20,6 @@ import pytest
 import datashard.disk_utils as disk_utils
 import datashard.metadata_manager as mm_module
 from datashard import (
-    AmbiguousMetadataError,
     ConcurrentModificationException,
     CorruptDataError,
     DataFile,

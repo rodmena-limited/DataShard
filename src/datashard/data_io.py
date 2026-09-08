@@ -25,7 +25,31 @@ from .logging_config import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["DataFileReader", "DataFileWriter", "PANDAS_AVAILABLE", "pd"]
+__all__ = ["DataFileReader", "DataFileWriter", "PANDAS_AVAILABLE", "pd", "read_parquet_table"]
+
+
+def read_parquet_table(source: Any, **kwargs: Any) -> pa.Table:
+    """pq.read_table with FILESYSTEM PARTITION INFERENCE OFF (#93).
+
+    pyarrow's default is partitioning="hive": it parses the directories above a
+    parquet file for `key=value` segments and folds them into the result. For a
+    datashard table that is never right - the partitioning is described by the
+    table's Iceberg metadata, and the directory is a location. Left on, a table
+    stored under `.../symbol=ZEN-USD/` either
+
+      * fails every scan with "Unable to merge: Field symbol has incompatible
+        types: string vs dictionary<...>" when the key matches a column, or
+      * silently gains a column parsed from the directory name when it does not
+
+    and in the first case the directory would otherwise OVERWRITE the column the
+    rows actually carry. Reads must depend on the table's data and metadata only,
+    so that the same table answers identically wherever it is stored.
+
+    ALWAYS read through this helper, never through pq.read_table directly;
+    tests/test_hive_path_inference.py fails the build if a bare call comes back.
+    """
+    kwargs.setdefault("partitioning", None)
+    return pq.read_table(source, **kwargs)
 
 
 class DataFileReader:
