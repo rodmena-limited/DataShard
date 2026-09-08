@@ -15,10 +15,14 @@ __author__ = "RODMENA LIMITED"
 # Import the main classes to make them available at package level
 from .data_structures import (
     DeleteFile,
+    HistoryEntry,
+    ManifestContent,
     ManifestFile,
+    PartitionField,
     PartitionSpec,
     Schema,
     Snapshot,
+    SortField,
     SortOrder,
     TableMetadata,
 )
@@ -31,12 +35,15 @@ from .metadata_manager import (
     AmbiguousMetadataError,
     ConcurrentModificationException,
     LegacyLayoutError,
+    MetadataManager,
     SchemaMismatchError,
     TableExistsError,
 )
 from .migrate import migrate_table
+from .snapshot_manager import SnapshotManager
 from .table import Table
 from .transaction import Transaction
+from .transaction_manager import TransactionManager
 
 __all__ = [
     "create_table",
@@ -54,6 +61,14 @@ __all__ = [
     "TableMetadata",
     "Table",
     "Transaction",
+    # documented in the API reference, so they must be importable from the package
+    "HistoryEntry",
+    "ManifestContent",
+    "PartitionField",
+    "SortField",
+    "MetadataManager",
+    "SnapshotManager",
+    "TransactionManager",
     "FilterOp",
     "FilterExpression",
     "parse_filter_dict",

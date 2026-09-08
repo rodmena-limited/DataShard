@@ -666,7 +666,13 @@ DataShard implements:
   (automatic at 64 manifests), `verify()`, `set_properties()`
 
 Data types: `boolean, int, long, float, double, decimal(P,S), date, time, timestamp,
-timestamptz, string, uuid, fixed, binary`; data files are always parquet.
+timestamptz, string, binary`; data files are always parquet.
+
+`uuid` and `fixed` are **refused for new tables** since 0.10.0: DataShard writes a parquet
+string for `uuid`, which pyiceberg will not read as a UUID, and a bare `fixed` is not a valid
+Iceberg type (it needs a length). Use `string` and `binary` — the parquet bytes are identical,
+so the change is a no-op on disk. Tables created before 0.10.0 that already have such a column
+keep working, and `datashard migrate` lists them under `columns_foreign_readers_may_reject`.
 
 ---
 

@@ -48,14 +48,23 @@ class _VerifyMixin:
         """Read the table and report whether it is actually readable.
 
         Unlike :meth:`row_count`, which answers from metadata alone, this opens every
-        data file the snapshot references and reads through the same code path a scan
-        uses - so it catches a file that is missing, truncated, unreadable, or whose
-        schema no longer matches the table.
+        data file the snapshot references and reads it through the same code path a
+        scan uses.
+
+        The two modes answer different questions, and the difference matters:
+
+        * the default answers **"can this table be read, and do the rows match the
+          manifests"**. It catches a missing, truncated or unreadable file, a page
+          that fails its CRC, and a file whose row count or schema disagrees with the
+          metadata. It does NOT catch damage in bytes no read touches - a flipped byte
+          in the file's leading magic, say, leaves every row correct and is reported
+          as healthy, because the table genuinely is readable;
+        * ``deep=True`` answers **"is every byte as it was written"**, by re-hashing
+          each file against the sha256 recorded at write time. That catches the case
+          above, and costs a full download of every file.
 
         Args:
-            deep: also verify each file's whole-file sha256 recorded at write time.
-                Downloads every byte; without it only the parquet footer and the pages
-                the read touches are checked (fast, and still catches corruption).
+            deep: re-hash every file against the checksum recorded at write time.
             limit: check at most this many data files (a sampled check for a very
                 large table). The report says how many were checked.
             snapshot_id: verify a historical snapshot instead of the current one.

@@ -220,13 +220,18 @@ DataShard creates the following structure in S3:
        ├── data/
        │   ├── auto_1763162900677093.parquet
        │   └── auto_1763162915234567.parquet
-       ├── metadata/
-       │   ├── v0.metadata.json
-       │   ├── v1.metadata.json
-       │   └── manifests/
-       │       ├── manifest_1763162900796257.avro
-       │       └── manifest_list_*.avro
-       └── metadata/version-hint.text
+       └── metadata/
+           ├── v1.metadata.json                              <- created by create_table
+           ├── v2.metadata.json                              <- one per commit; creating it IS the commit
+           ├── version-hint.text                             <- "2": a pointer, not the truth
+           ├── snap-3410625483784311857-1-<uuid>.avro        <- manifest lists
+           └── <uuid>-m0.avro                                <- manifests
+
+Since 0.10.0 this is the Apache Iceberg v2 layout, so DuckDB's ``iceberg`` extension,
+pyiceberg, Spark and Trino read the table directly — see :doc:`interoperability`. Tables
+written by 0.9.x and earlier used ``metadata.version-hint.text`` at the table root,
+``v{N}-{hex}.metadata.json`` and a ``metadata/manifests/`` subdirectory; :doc:`migration`
+converts them.
 
 Architecture
 ============

@@ -5,6 +5,40 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] - 2026-09-08
+
+Five small defects found in a sweep of the 0.10.x releases themselves. No behaviour of an
+existing table changes.
+
+### Added
+- **`datashard verify <table>`** - the health check 0.10.2 added to the API, now as a command,
+  which is how an operator with hundreds of tables actually runs it. Prints the report as JSON
+  and **exits 1 when the table is not readable**, so it drops into cron or a readiness probe:
+  `datashard verify /lake/trades || alert`. `--deep` re-hashes every byte, `--limit N` samples,
+  `--snapshot-id` checks a historical snapshot. It answers for **every** table state rather than
+  raising - a missing table, and an un-migrated one, come back as a report with `ok: false`.
+- **`datashard --version`.** The bare command already printed it; the flag errored.
+
+### Fixed
+- **The README advertised `uuid` and `fixed` as supported types.** Both have been refused for new
+  tables since 0.10.0, so the README contradicted the error a caller got. It now says so and names
+  `string` / `binary` as the drop-in replacements.
+- **The S3 storage doc showed the pre-0.10 layout** - `v0.metadata.json`, a `metadata/manifests/`
+  subdirectory, the old manifest filenames, and a malformed duplicate `metadata/` entry. Anyone
+  matching a real bucket against it would conclude something was wrong. It now shows the Iceberg
+  v2 layout, and says what the pre-0.10 one looked like.
+- **Seven classes the API reference documents could not be imported from the package**, so those
+  sections rendered EMPTY while the page still promised they were documented: `HistoryEntry`,
+  `ManifestContent`, `MetadataManager`, `PartitionField`, `SnapshotManager`, `SortField`,
+  `TransactionManager`. All are exported now, the docs build is free of import failures, and a
+  test fails the build if a documented class stops being importable.
+- **`verify()`'s own description overstated what its default mode checks.** The default answers
+  "can this table be read, and do the rows match the manifests"; it does not see damage in bytes
+  no read touches - a flipped byte in a file's leading magic leaves every row correct, and is
+  honestly reported as healthy. `deep=True` answers "is every byte as written". Both modes are
+  now documented precisely, and a test pins the boundary so the default is not quietly turned
+  into a full-file hash.
+
 ## [0.10.2] - 2026-09-08
 
 Everything here comes from a production review by crypto-trader, who has run datashard since

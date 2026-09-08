@@ -187,3 +187,68 @@ def test_migration_dry_run_projects_the_headroom_it_will_need(tmp_path):
     # the dry run really wrote nothing
     assert dry["status"] == "dry-run" and real["status"] == "migrated"
     assert migrate_table(real_path)["status"] == "already-migrated"
+
+
+def test_verify_modes_answer_different_questions(tmp_path):
+    """Damage in bytes no read touches leaves the table READABLE. The default mode is
+    right to call that healthy; only `deep` claims every byte is as written. Pinned so
+    nobody 'fixes' the default into a slow whole-file hash."""
+    import glob
+
+    t = _table(tmp_path, commits=2)
+    victim = sorted(glob.glob(os.path.join(t.table_path, "data", "*.parquet")))[0]
+    assert open(victim, "rb").read(4) == b"PAR1"
+    with open(victim, "r+b") as fh:          # break the leading magic, which no read reads
+        fh.seek(0)
+        fh.write(b"x")
+
+    reopened = load_table(t.table_path)
+    assert sorted(r["id"] for r in reopened.scan()) == [0, 1]  # the rows are still correct
+    assert reopened.verify()["ok"] is True                     # so "readable" is the honest answer
+    deep = reopened.verify(deep=True)
+    assert deep["ok"] is False and "hecksum" in deep["errors"][0]
+
+
+def test_the_cli_answers_for_every_table_state(tmp_path):
+    """`datashard verify` is a health check: it must exit 1 with a report, never traceback."""
+    from datashard.__main__ import main
+
+    healthy = _table(tmp_path, "good", commits=2)
+    assert main(["verify", healthy.table_path]) == 0
+    assert main(["verify", healthy.table_path, "--deep"]) == 0
+    assert main(["verify", healthy.table_path, "--limit", "1"]) == 0
+    assert main(["verify", str(tmp_path / "does_not_exist")]) == 1
+
+    victim = os.path.join(healthy.table_path, healthy._get_all_data_files()[0].file_path.lstrip("/"))
+    with open(victim, "r+b") as fh:
+        fh.seek(0)
+        fh.write(b"not parquet at all")
+    assert main(["verify", healthy.table_path]) == 1
+
+    with pytest.raises(SystemExit) as exc:   # --version is a flag, not a subcommand
+        main(["--version"])
+    assert exc.value.code == 0
+
+
+@pytest.mark.skipif(not os.path.exists(FIXTURE), reason="legacy fixture missing")
+def test_the_cli_verify_reports_a_legacy_table_instead_of_crashing(tmp_path):
+    from datashard.__main__ import main
+
+    d = tmp_path / "legacy"
+    d.mkdir()
+    with tarfile.open(FIXTURE) as tar:
+        tar.extractall(d, filter="data")
+    assert main(["verify", str(d / "legacy_091")]) == 1  # LegacyLayoutError becomes a report
+
+
+def test_every_class_the_api_reference_documents_is_importable():
+    """A sphinx autoclass that cannot import renders an EMPTY section - worse than an
+    absent one, because the page still promises the class is documented."""
+    import datashard
+
+    for name in ("Table", "Transaction", "TransactionManager", "MetadataManager",
+                 "SnapshotManager", "Schema", "Snapshot", "SortOrder", "SortField",
+                 "PartitionSpec", "PartitionField", "ManifestFile", "ManifestContent",
+                 "HistoryEntry", "TableMetadata", "DataFile", "FileFormat", "DeleteFile"):
+        assert hasattr(datashard, name), f"datashard.{name} is documented but not importable"
+        assert name in datashard.__all__, f"datashard.{name} imports but is missing from __all__"

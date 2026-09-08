@@ -113,14 +113,28 @@ monitor built on it reports green while the table is unusable.
    #  "deep": False, "errors": []}
 
 It opens every data file the current snapshot references, through the same code path a
-scan uses, so it catches a file that is missing, truncated, corrupt, or whose schema no
-longer matches. It **never raises** for a broken table — the report is the answer, and
-``errors`` names each bad file — so it drops straight into a health endpoint.
+scan uses. It **never raises** for a broken table — the report is the answer, and
+``errors`` names each bad file — so it drops straight into a health endpoint, and the
+``datashard verify <table>`` command exits 1 when ``ok`` is false:
 
-* ``verify(deep=True)`` also re-hashes every file against the checksum recorded at
-  write time. Correct but expensive: it downloads every byte.
-* ``verify(limit=n)`` checks a sample of ``n`` files, for a table too large to read
-  whole on every probe.
+.. code-block:: console
+
+   $ datashard verify /lake/trades || alert "trades unreadable"
+
+The two modes answer different questions:
+
+* the **default** answers *can this table be read, and do the rows match the
+  manifests*. It catches a missing, truncated or unreadable file, a page that fails
+  its CRC, and a file whose row count or schema disagrees with the metadata. It does
+  not catch damage in bytes that no read touches — a flipped byte in a file's leading
+  magic leaves every row correct, and is reported as healthy, because the table
+  genuinely is readable;
+* ``verify(deep=True)`` (``--deep``) answers *is every byte as it was written*, by
+  re-hashing each file against the checksum recorded at write time. It catches the
+  case above, and downloads every byte to do it.
+
+``verify(limit=n)`` (``--limit n``) checks a sample of ``n`` files, for a table too
+large to read whole on every probe.
 
 Filters, and what pruning does and does not do
 ----------------------------------------------
