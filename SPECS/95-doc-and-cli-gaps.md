@@ -48,4 +48,14 @@ rows still correct, and unhealthy by `deep`; every class the API reference docum
 and present in `__all__`. The docs build emits zero autodoc import failures (was seven).
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.10.3 (2026-09-08):** https://pypi.org/project/datashard/0.10.3/ · tag v0.10.3.
+
+Exercised: 273 unit tests (4 new); 35/35 probes; a docs build with **zero** autodoc import failures
+(was seven); and all five fixes re-checked against the wheel installed back from PyPI - the served
+long_description no longer lists `uuid`/`fixed` and explains the refusal, all seven classes import,
+`datashard --version` prints, and `datashard verify` exits 0 on a healthy table, 1 on a missing one
+and 1 on a corrupted one.
+
+Not exercised: the rendered readthedocs pages (the docs build was local; publication follows the
+push), and the CLI against an S3-backed table.
