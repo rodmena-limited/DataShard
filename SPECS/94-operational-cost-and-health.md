@@ -68,4 +68,18 @@ projection is within 5 % of, and never below, what the real run writes, and ever
 key is present.
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.10.2 (2026-09-08):** https://pypi.org/project/datashard/0.10.2/ · commit 73a9f95 · tag v0.10.2.
+
+Exercised: 269 unit tests (9 new); 35/35 probes; the docs build; the wheel installed back from PyPI and
+every code item of the review checked against the served artifact - the warning threshold and property,
+expire folding compaction in (20 manifests to 1 in one commit), `row_count()` reporting 20 on a table
+`verify()` calls broken, the three docstrings, and the dry-run headroom projection.
+
+Measured on 1,000 rows written three ways (local disk): one commit per row 428:1 metadata-to-data,
+batched 100-per-commit 6:1, and 9:1 after `expire_snapshots(retain_last=10)` + `garbage_collect()` on
+the un-batched table - i.e. batching is worth ~3,000x the metadata and the maintenance pair reclaims
+98 % of what an already-grown table carries, with every row intact and `verify()` green.
+
+Not exercised: the S3 backend for the maintenance path (the measurements are local-disk), and the
+reporter's own lake - they will re-measure on their 299 tables.
