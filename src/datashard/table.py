@@ -20,6 +20,10 @@ from .transaction_manager import TransactionManager
 
 logger = get_logger(__name__)
 
+# Records partition fields a caller asked for that this version cannot apply, so the
+# intent survives for 0.11 rather than being silently lost (#97).
+REQUESTED_PARTITION_FIELDS_PROPERTY = "datashard.requested-partition-fields"
+
 # Default snapshot age for Table.expire_snapshots() when no policy is given.
 DEFAULT_SNAPSHOT_MAX_AGE_MS = 5 * 24 * 3600 * 1000
 
@@ -69,27 +73,26 @@ class Table(_ScanMixin, _DuckDBMixin, _VerifyMixin):
             name_mapping_json,
         )
 
-        if partition_spec is not None and getattr(partition_spec, "fields", None):
-            raise NotImplementedError(
-                "Partition specs with fields are not supported by this version "
-                "(partitioning by value ships in 0.11)"
-            )
+        spec, dropped = self._accepted_partition_spec(partition_spec)
+        properties = {REQUESTED_PARTITION_FIELDS_PROPERTY: ",".join(dropped)} if dropped else {}
         if schema is not None:
             check_iceberg_representable(schema)
+            properties[NAME_MAPPING_PROPERTY] = name_mapping_json(schema)
             initial_metadata = TableMetadata(
                 location=self.table_path,
                 schemas=[schema],
                 current_schema_id=schema.schema_id,
-                partition_specs=[partition_spec] if partition_spec is not None else [],
+                partition_specs=[spec] if spec is not None else [],
                 last_column_id=max((int(f["id"]) for f in schema.fields), default=0),
                 # Parquet files without field ids (append_files from another writer)
                 # still resolve in DuckDB / pyiceberg through the name mapping (#88).
-                properties={NAME_MAPPING_PROPERTY: name_mapping_json(schema)},
+                properties=properties,
             )
         else:
             initial_metadata = TableMetadata(
                 location=self.table_path,
-                partition_specs=[partition_spec] if partition_spec is not None else [],
+                partition_specs=[spec] if spec is not None else [],
+                properties=properties,
             )
 
         try:
@@ -98,6 +101,37 @@ class Table(_ScanMixin, _DuckDBMixin, _VerifyMixin):
         except TableExistsError:
             # A concurrent creator won the race - their metadata is authoritative.
             logger.info(f"Table {self.table_path} was concurrently initialized; using existing metadata")
+
+    def _accepted_partition_spec(self, partition_spec: Optional[Any]) -> Any:
+        """(spec to persist, names of the fields dropped from it).
+
+        datashard does not split data files by partition before 0.11, so a spec whose
+        fields were recorded in the metadata would promise every reader - DuckDB,
+        pyiceberg, Spark - a layout the files do not have, and they prune on it. The
+        fields are therefore dropped and the caller told, exactly as `datashard migrate`
+        does for the same specs on pre-0.10 tables.
+
+        0.10.0 to 0.10.4 RAISED here instead, which removed a capability 0.7.2 had, and
+        it only fired on create: a recorder that makes one table per day upgraded
+        cleanly, appended all day, and failed at the day boundary (#97). Filters are
+        unaffected either way - `filter={"hour": ...}` returns the same rows through
+        column statistics, only reading more files than a partitioned layout would.
+        """
+        from .data_structures import PartitionSpec
+
+        fields = list(getattr(partition_spec, "fields", None) or [])
+        if not fields:
+            return partition_spec, []
+        names = [str(getattr(f, "name", f)) for f in fields]
+        logger.warning(
+            f"{self.table_path}: partition spec fields {names} are recorded as a table property "
+            f"but NOT applied - this version writes unpartitioned data files, and a spec in the "
+            f"metadata would promise DuckDB, pyiceberg and Spark a layout the files do not have. "
+            f"The table is created and every column, including {names[0]!r}, is queryable: "
+            f"filter={{{names[0]!r}: ...}} returns the same rows through column statistics, just "
+            f"reading more files than partition pruning would. Partitioning by value ships in 0.11."
+        )
+        return PartitionSpec(spec_id=getattr(partition_spec, "spec_id", 0), fields=[]), names
 
     def new_transaction(self) -> Transaction:
         """Create a new transaction"""

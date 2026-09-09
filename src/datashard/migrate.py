@@ -40,6 +40,50 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+# Left in the table ROOT by a migration. A pre-0.10 client reading a migrated table dies
+# with a bare KeyError deep in metadata parsing, which reads as "my lake is corrupt"
+# rather than "my library is too old" - and that client is already released, so the only
+# place left to say so is the directory the operator will look at next (#97).
+MIGRATION_NOTICE_PATH = "DATASHARD-MIGRATED-TO-ICEBERG-V2.txt"
+
+_MIGRATION_NOTICE = """This table was migrated to the Apache Iceberg v2 layout by datashard {version}
+on {when}.
+
+IF A CLIENT FAILS ON THIS TABLE WITH A BARE KeyError (for example KeyError: 'schema_id'),
+THE DATA IS FINE AND THE CLIENT IS TOO OLD. datashard 0.9.x and earlier cannot parse
+Iceberg metadata; they read the snake_case format this table no longer uses.
+
+    pip install --upgrade 'datashard>={version}'
+
+There is no downgrade. The pre-0.10 metadata is preserved beside the new metadata until
+garbage_collect() reclaims it, and the previous version hint was renamed to
+metadata.version-hint.text.migrated.
+
+This table is now readable by any Iceberg engine - DuckDB's iceberg extension, pyiceberg,
+Spark, Trino - directly from this directory. datashard must remain its only WRITER until
+the REST catalog client in 1.0.
+
+This file is a note for humans. Nothing reads it, and deleting it changes nothing.
+"""
+
+
+def write_migration_notice(storage: Any) -> None:
+    """Leave the human-readable breadcrumb described above. Never fails a migration."""
+    from datetime import datetime, timezone
+
+    from . import __version__
+
+    try:
+        storage.write_file(
+            MIGRATION_NOTICE_PATH,
+            _MIGRATION_NOTICE.format(
+                version=__version__, when=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            ).encode("utf-8"),
+        )
+    except Exception as e:  # noqa: BLE001 - a note must never fail the operation it describes
+        logger.warning(f"Could not write {MIGRATION_NOTICE_PATH}: {e}")
+
+
 def _metadata_bytes(storage: Any) -> int:
     """Bytes currently under metadata/ - what migration adds to, before GC reclaims it."""
     try:
@@ -244,6 +288,10 @@ def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optiona
             versions, _legacy_names = mm._metadata_versions_on_disk()
             for v in sorted(versions, reverse=True):
                 if not is_legacy_document(storage.read_json(f"metadata/{versions[v]}")):
+                    # Idempotent, and it also back-fills the notice on a table migrated
+                    # by an earlier version that did not leave one.
+                    if not dry_run and not storage.exists(MIGRATION_NOTICE_PATH):
+                        write_migration_notice(storage)
                     return {"status": "already-migrated", "version": v, "table": table_path}
             legacy_version, legacy_file = _legacy_current(mm, metadata_file)
             legacy_doc = storage.read_json(f"metadata/{legacy_file}")
@@ -315,6 +363,7 @@ def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optiona
                 storage.delete_file(LEGACY_HINT_PATH)
             except FileNotFoundError:
                 pass
+            write_migration_notice(storage)
             mm.current_version = new_version
             logger.warning(f"Migrated {table_path} to Iceberg v2 (v{new_version}); there is no downgrade")
             return report

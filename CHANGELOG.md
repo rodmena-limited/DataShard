@@ -5,6 +5,39 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] - 2026-09-09
+
+### Fixed
+- **`create_table(partition_spec=...)` works again (#97).** 0.7.2 accepted a spec with fields;
+  0.10.0 turned that into `NotImplementedError: Partition specs with fields are not supported by
+  this version`. That was a **removal**, not a feature that had not landed, and its message framed
+  it as forward-looking. The call is accepted again: the fields are recorded in the
+  `datashard.requested-partition-fields` table property, and a WARNING says they are not applied,
+  why, and that filters still return the same rows meanwhile.
+
+  **The shape is why this mattered more than the message suggests.** The raise fired only on
+  CREATE. A recorder that makes one table per (symbol, day) upgraded cleanly, appended
+  successfully all day, and would have failed at 00:00Z building the next day's tables — green
+  smoke tests, then a timed outage with nobody watching. Reported by the crypto-trader platform,
+  who found it 40 minutes before it would have fired across a 429-table lake.
+
+  The fields are still not *applied*, and deliberately so: this version writes unpartitioned data
+  files, so a spec recorded in the metadata would promise DuckDB, pyiceberg and Spark a layout the
+  files do not have, and those engines prune on it. Dropping the spec is exactly what
+  `datashard migrate` already does for the same specs on pre-0.10 tables. Partitioning by value,
+  with real pruning, is 0.11.
+- **A migrated table now carries a note for whoever meets an old client.** datashard 0.9.x and
+  earlier die on a migrated table with a bare `KeyError` deep in metadata parsing, which reads as
+  "my lake is corrupt" rather than "my library is too old". That client is already released and
+  cannot be changed, so `migrate_table` leaves `DATASHARD-MIGRATED-TO-ICEBERG-V2.txt` in the table
+  root saying exactly that, with the upgrade command. It is back-filled for tables migrated by an
+  earlier version the next time `migrate_table` runs, and nothing reads it.
+
+### Verified on real S3, not moto
+The whole S3 integration suite (15 tests) and the reporter's own shape — a recorder creating one
+table per (symbol, day) with their partition spec, across a day boundary — were run against a real
+OVH bucket for this release: 4 tables created, filters correct on each, `verify()` green.
+
 ## [0.10.4] - 2026-09-08
 
 ### Fixed
@@ -226,8 +259,12 @@ written when it does.
   datashard's manifest-list integrity moved under `datashard.*` keys, and their absence now means
   "unverified", never "corrupt", so a foreign writer's snapshot is readable.
 - Free-form `partition_values` passed to `append_*` are recorded as a datashard-only manifest
-  field. Real Iceberg partitioning (spec-driven, with pruning) ships in 0.11; a `partition_spec`
-  with fields is refused rather than silently ignored.
+  field. Real Iceberg partitioning (spec-driven, with pruning) ships in 0.11.
+- **REMOVED (and restored in 0.10.5): `create_table(partition_spec=...)` with a non-empty spec.**
+  0.7.2 accepted it; 0.10.0 through 0.10.4 raise `NotImplementedError`. This is a capability
+  removal, and because it fires only on CREATE an upgraded service can run green for hours and
+  fail when it next makes a table. 0.10.5 accepts the call again and records the fields as a
+  property instead. If you are upgrading from 0.8.x or 0.9.x, go to **0.10.5 or later**.
 - A table created without a schema now adopts the first append's schema into its metadata, so
   foreign readers see the columns instead of an empty struct. If another writer persists a
   different schema first, the commit fails before the commit point instead of committing a data
