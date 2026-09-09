@@ -172,6 +172,12 @@ A transform datashard cannot compute the way Iceberg does is **refused at create
 never accepted and ignored — an ignored spec would leave the metadata promising a layout
 the files do not have, and foreign readers prune on that metadata.
 
+**A decimal column cannot be partitioned by value.** ``identity`` and ``truncate[W]`` on a
+decimal produce a decimal partition value, and DuckDB's Avro reader does not merely fail on
+one — it aborts the process. Those two are refused at create; ``bucket[N]`` on the same
+column works, because its value is an int, and the decimal stays queryable through its
+column statistics either way.
+
 Two things to know before you partition:
 
 * **partitioning multiplies files.** Each commit writes one file per partition it

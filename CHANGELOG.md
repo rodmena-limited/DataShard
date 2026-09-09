@@ -45,11 +45,35 @@ that they consume our partition values, so a transform that disagrees would be c
 Partitioning, pruning and compaction were also exercised on a **real OVH S3 bucket**, with DuckDB
 reading the partitioned table over httpfs.
 
+### Found by the pre-release review, and fixed before publishing
+Asked for one more adversarial pass before this shipped to a live trading desk. It found six
+things in the new code, two of which would have crashed a customer's process:
+
+- **DuckDB aborts - SIGABRT, not an exception - on a decimal partition value.** `identity` or
+  `truncate[W]` on a decimal column produced a manifest whose Avro partition struct DuckDB cannot
+  decode, and it takes the process down with it. Both are now refused at create, naming `bucket[N]`
+  on the same column as the alternative (its value is an int, and it reads fine). Verified against
+  DuckDB 1.5.5 across every partition value type datashard can emit.
+- **DuckDB also aborts on `local-timestamp-micros`**, which was briefly used for zoneless
+  timestamps. Both timestamp kinds use `timestamp-micros`, so a zoneless partition value comes back
+  UTC-annotated - the same instant, invisible to pruning, and readable everywhere.
+- **Partition pruning silently did nothing for `day` and timestamp partitions.** The value stored
+  in a manifest comes back through Avro's logical types (an Iceberg `date` as a `date` object)
+  while a transform computes ints; comparing those raised, the pruner read that as "cannot decide"
+  and kept every file. Both sides are now canonicalised first. A `day`-partitioned table went from
+  opening 4 files of 4 to 1 of 4 on an equality filter.
+- **A compaction group key could collide across types** (`date(2026, 9, 1)` and the string
+  `"2026-09-01"` produced the same key), and a group that mixed two partitions would have been
+  written out under one of their values - rows silently relabelled. The key now carries the type,
+  and a rewrite refuses to merge files whose partition values differ.
+
 ### Two things to know before partitioning
 - **It multiplies files**: one per partition per commit. Pair it with `rewrite_data_files()` and
   with batching (see the operating guide).
 - **Row order changes**: a partitioned scan returns rows partition by partition, so `scan()` no
   longer echoes insertion order.
+- **You cannot partition on a decimal by value** (`identity`, `truncate`) - see above. `bucket[N]`
+  works, and the column stays queryable through its statistics either way.
 
 ### Changed
 - `datashard.requested-partition-fields`, the 0.10.5 property that recorded a spec datashard could
