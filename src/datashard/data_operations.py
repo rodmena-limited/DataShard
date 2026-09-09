@@ -302,6 +302,52 @@ class DataFileManager:
         """Min/max per column for file pruning (see column_stats)."""
         return compute_column_bounds(table, iceberg_schema)
 
+    def conform_arrow_table(self, table: pa.Table, iceberg_schema: Schema) -> pa.Table:
+        """The table as the schema describes it, or a refusal.
+
+        Columns not in the schema are an error (never silently dropped), absent optional
+        columns are filled with nulls, columns are reordered to the table's order and cast
+        to the table's Arrow types, and a cast across type families is refused. Required
+        columns must be null-free. Split out so a partitioned append can conform ONCE and
+        then group the rows (#98).
+        """
+        arrow_schema = self.create_arrow_schema(iceberg_schema)
+        unknown = set(table.column_names) - set(arrow_schema.names)
+        if unknown:
+            raise ValueError(
+                f"Table has columns not in the table schema: {sorted(unknown)}. "
+                f"Schema fields: {sorted(arrow_schema.names)}. Refusing to silently drop data."
+            )
+        for field in arrow_schema:
+            if field.name not in table.column_names:
+                table = table.append_column(field.name, pa.nulls(table.num_rows, type=field.type))
+            else:
+                check_cast_family(field.name, table.schema.field(field.name).type, field.type)
+        try:
+            table = table.select(arrow_schema.names).cast(arrow_schema)
+        except _SCHEMA_MISMATCH_ERRORS as e:
+            raise ValueError(f"Table is not compatible with the table schema: {e}") from e
+        self.validate_arrow_table_strict(table, iceberg_schema)
+        return table
+
+    def arrow_from_pandas(self, df: "pd.DataFrame", iceberg_schema: Schema) -> pa.Table:
+        """A DataFrame as a conformed Arrow table (the front half of write_pandas_file)."""
+        if not PANDAS_AVAILABLE:
+            raise ImportError("pandas is not available. Install with: pip install datashard[pandas]")
+        allowed = {str(f["name"]) for f in iceberg_schema.fields}
+        unknown = {str(c) for c in df.columns} - allowed
+        if unknown:
+            raise ValueError(
+                f"DataFrame has columns not in the table schema: {sorted(unknown)}. "
+                f"Schema fields: {sorted(allowed)}. Refusing to silently drop data."
+            )
+        try:
+            table = pa.Table.from_pandas(df, schema=self.create_arrow_schema(iceberg_schema),
+                                         preserve_index=False)
+        except _SCHEMA_MISMATCH_ERRORS as e:
+            raise ValueError(f"DataFrame is not compatible with the table schema: {e}") from e
+        return self.conform_arrow_table(table, iceberg_schema)
+
     def write_arrow_file(
         self,
         file_path: str,
@@ -320,23 +366,7 @@ class DataFileManager:
         """
         if file_format != FileFormat.PARQUET:
             raise ValueError(f"Unsupported file format: {file_format}")
-        arrow_schema = self.create_arrow_schema(iceberg_schema)
-        unknown = set(table.column_names) - set(arrow_schema.names)
-        if unknown:
-            raise ValueError(
-                f"Table has columns not in the table schema: {sorted(unknown)}. "
-                f"Schema fields: {sorted(arrow_schema.names)}. Refusing to silently drop data."
-            )
-        for field in arrow_schema:
-            if field.name not in table.column_names:
-                table = table.append_column(field.name, pa.nulls(table.num_rows, type=field.type))
-            else:
-                check_cast_family(field.name, table.schema.field(field.name).type, field.type)
-        try:
-            table = table.select(arrow_schema.names).cast(arrow_schema)
-        except _SCHEMA_MISMATCH_ERRORS as e:
-            raise ValueError(f"Table is not compatible with the table schema: {e}") from e
-        self.validate_arrow_table_strict(table, iceberg_schema)
+        table = self.conform_arrow_table(table, iceberg_schema)
         lower_bounds, upper_bounds = self._compute_column_bounds(table, iceberg_schema)
         file_size, checksum = self._write_arrow_table(file_path, table)
         return DataFile(

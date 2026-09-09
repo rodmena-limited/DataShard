@@ -65,13 +65,18 @@ def _bounds_map(values: Optional[Dict[int, Any]], types: Dict[int, Any]) -> Opti
     return out or None
 
 
-def _data_file_record(df: DataFile, location: str, types: Dict[int, Any]) -> Dict[str, Any]:
+def _data_file_record(
+    df: DataFile, location: str, types: Dict[int, Any], partition_names: Sequence[str] = ()
+) -> Dict[str, Any]:
     fmt = df.file_format.value if hasattr(df.file_format, "value") else str(df.file_format)
+    # Every partition field of the spec must appear, null when the row group had no value:
+    # a reader resolves the struct positionally by field-id and a missing key is not "null".
+    partition = {name: df.partition_values.get(name) for name in partition_names}
     return {
         "content": 0,
         "file_path": join_uri(location, df.file_path),
         "file_format": fmt.upper(),
-        "partition": {},
+        "partition": partition,
         "record_count": int(df.record_count),
         "file_size_in_bytes": int(df.file_size_in_bytes),
         "column_sizes": _int_map(df.column_sizes),
@@ -85,9 +90,13 @@ def _data_file_record(df: DataFile, location: str, types: Dict[int, Any]) -> Dic
         "equality_ids": None,
         "sort_order_id": df.sort_order_id,
         "datashard_sha256": df.checksum,
-        # Free-form labels from the pre-0.10 API: not Iceberg partitioning (that is
-        # 0.11's spec-driven partition struct), so invisible to foreign readers.
-        "datashard_partition_labels": json.dumps(df.partition_values, default=str) if df.partition_values else None,
+        # Free-form labels from the pre-0.11 API, kept only for a table with NO spec:
+        # with a spec the values live in the Iceberg partition struct above, which is
+        # what foreign readers prune on.
+        "datashard_partition_labels": (
+            json.dumps(df.partition_values, default=str)
+            if df.partition_values and not partition_names else None
+        ),
     }
 
 
@@ -97,9 +106,17 @@ def encode_manifest(
     spec: PartitionSpec,
     location: str,
 ) -> bytes:
-    """Avro bytes of a data manifest holding `entries`."""
-    if spec.fields:
-        raise NotImplementedError("Partition specs with fields ship in 0.11; this version writes unpartitioned manifests")
+    """Avro bytes of a data manifest holding `entries`.
+
+    When the table has a partition spec, each entry carries the Iceberg partition struct -
+    a field per spec field, with the spec's field-ids - which is what DuckDB, pyiceberg,
+    Spark and Trino prune on (#98).
+    """
+    from .partitioning import partition_avro_fields, spec_field_types
+
+    spec_fields = spec_field_types(spec, schema) if spec.fields else []
+    partition_fields = partition_avro_fields(spec_fields)
+    partition_names = [pf.name for pf, _ in spec_fields]
     types = _field_types(schema)
     records = [
         {
@@ -107,7 +124,7 @@ def encode_manifest(
             "snapshot_id": snapshot_id,
             "sequence_number": sequence_number,
             "file_sequence_number": sequence_number,
-            "data_file": _data_file_record(df, location, types),
+            "data_file": _data_file_record(df, location, types, partition_names),
         }
         for status, snapshot_id, sequence_number, df in entries
     ]
@@ -120,8 +137,44 @@ def encode_manifest(
         "content": "data",
     }
     bio = BytesIO()
-    fastavro.writer(bio, fastavro.parse_schema(manifest_entry_schema([])), records, metadata=header)
+    fastavro.writer(
+        bio, fastavro.parse_schema(manifest_entry_schema(partition_fields)), records, metadata=header
+    )
     return bio.getvalue()
+
+
+def partition_summaries(
+    entries: Sequence[ManifestEntry], spec: PartitionSpec, schema: Schema
+) -> List[Dict[str, Any]]:
+    """One Iceberg `field_summary` per partition field, in SPEC ORDER.
+
+    A manifest list for a partitioned table must carry these: DuckDB refuses a manifest
+    whose summary count does not match the spec ("Manifest has 0 'field_summary'"), and
+    every engine uses them to skip a whole manifest before opening it.
+    """
+    from .partitioning import result_type, spec_field_types
+
+    if not spec.fields:
+        return []
+    summaries = []
+    for pf, source_type in spec_field_types(spec, schema):
+        value_type = result_type(pf.transform, source_type)
+        values = [df.partition_values.get(pf.name) for _s, _sid, _seq, df in entries]
+        present = [v for v in values if v is not None]
+        lower = upper = None
+        if present:
+            try:
+                lower = encode_bound(min(present), value_type)
+                upper = encode_bound(max(present), value_type)
+            except TypeError:      # values that do not order together: no bound, no pruning
+                lower = upper = None
+        summaries.append({
+            "contains_null": len(present) != len(values),
+            "contains_nan": None,
+            "lower_bound": lower,
+            "upper_bound": upper,
+        })
+    return summaries
 
 
 def encode_manifest_list(
@@ -150,7 +203,7 @@ def encode_manifest_list(
             "added_rows_count": int(mf.added_rows_count or 0),
             "existing_rows_count": int(mf.existing_rows_count or 0),
             "deleted_rows_count": 0,
-            "partitions": [],
+            "partitions": list(mf.partitions) or None,
             "key_metadata": None,
             "datashard_sha256": mf.checksum,
         })

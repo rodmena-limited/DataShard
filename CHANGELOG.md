@@ -5,6 +5,59 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-09
+
+**Partitioning by value.** A partition spec is now applied, not just accepted: rows are grouped
+by their partition tuple, each commit writes one data file per partition, and the partition values
+go into the Iceberg partition struct — so DuckDB, pyiceberg, Spark and Trino prune on exactly the
+values datashard does. Requested by the crypto-trader platform, whose lake is partitioned by hour.
+
+### Added
+- **`create_table(partition_spec=...)` lays the table out by the spec.** Data lands under
+  `data/<name>=<value>/...`, the manifest carries the partition struct with the spec's field-ids,
+  and the manifest list carries the per-field summaries foreign readers need. Supported
+  transforms: `identity`, `year`, `month`, `day`, `hour`, `bucket[N]`, `truncate[W]`.
+  A transform datashard cannot compute the way Iceberg does is **refused at create** — accepted
+  and ignored would leave the metadata promising a layout the files do not have.
+- **Partition pruning on read.** A filter on a partition column skips whole partitions before any
+  file is opened. Equality and `in` prune every transform; ordering predicates prune the monotonic
+  ones (`identity`, the temporal transforms, `truncate`), and never `bucket`, which says nothing
+  about order. A file is only ever skipped when the predicate is provably unsatisfiable for its
+  whole partition, so a filtered scan returns exactly what the unpartitioned table returns.
+- **`Table.rewrite_data_files()`** merges small files into larger ones — necessary company for
+  partitioning, which writes one file per partition per commit. Files are merged **within a
+  partition only**, the result is one `replace` snapshot, and the inputs stay readable to older
+  snapshots until `garbage_collect()` reclaims them. `partition=`, `min_input_files=` and
+  `dry_run=` control it. Measured: 24 files → 3, 40,816 → 5,205 bytes, rows unchanged.
+
+### Verified against the real counterparties
+Every transform is compared against **pyiceberg's own implementation** rather than this
+repository's reading of the spec — 289 value comparisons across bucket, temporal and truncate.
+That comparison caught a real defect on its first run: decimal `truncate[W]` used the column's
+declared scale where Iceberg uses the value's own, which silently returned the value unchanged
+whenever the trailing zeros made it divisible by W.
+
+`audit/evaluations/probe_v0110_partitioned_foreign_readers.py` compares full rows against DuckDB
+and pyiceberg for all 8 layouts, before and after compaction, and carries a **negative control**
+that falsifies every partition value and requires both readers to return the wrong answer — proof
+that they consume our partition values, so a transform that disagrees would be caught.
+
+Partitioning, pruning and compaction were also exercised on a **real OVH S3 bucket**, with DuckDB
+reading the partitioned table over httpfs.
+
+### Two things to know before partitioning
+- **It multiplies files**: one per partition per commit. Pair it with `rewrite_data_files()` and
+  with batching (see the operating guide).
+- **Row order changes**: a partitioned scan returns rows partition by partition, so `scan()` no
+  longer echoes insertion order.
+
+### Changed
+- `datashard.requested-partition-fields`, the 0.10.5 property that recorded a spec datashard could
+  not apply, is no longer written for a spec it can apply. Tables created by 0.10.5 keep the
+  property; it is inert.
+- Schema evolution moves to 0.12, so partitioning and compaction could ship together as the plan
+  requires.
+
 ## [0.10.5] - 2026-09-09
 
 ### Fixed

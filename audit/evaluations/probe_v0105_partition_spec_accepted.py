@@ -1,13 +1,14 @@
-"""Claim (#97): a partition spec datashard cannot APPLY is still ACCEPTED at create,
-and the metadata never claims a partitioning the data files do not have.
+"""Claim (#97, #98): create_table accepts a partition spec, and since 0.11 the metadata
+and the data files AGREE about it.
 
 0.7.2 accepted such a spec; 0.10.0-0.10.4 raised NotImplementedError, which removed a
-capability - and only on CREATE, so an upgraded recorder that makes one table per day
-ran green all day and would have failed at the day boundary.
+capability - and only on CREATE, so an upgraded recorder that makes one table per day ran
+green all day and would have failed at the day boundary. 0.10.5 accepted the call without
+applying the spec; 0.11 applies it.
 
-Both halves are probed: the call must succeed, AND the persisted spec must stay empty,
-because DuckDB and pyiceberg prune on a partition spec and these files carry empty
-partition structs.
+The invariant that outlives both releases is the second claim here: whatever the metadata
+says about partitioning, the files must match it, because DuckDB and pyiceberg prune on
+what the metadata says.
 """
 import glob
 import json
@@ -23,7 +24,6 @@ from datashard import (  # noqa: E402
     PartitionSpec,
     Schema,
     create_table,
-    load_table,
 )
 
 SCHEMA = Schema(schema_id=1, fields=[
@@ -58,17 +58,22 @@ H.report(
 if t is not None:
     doc = json.load(open(sorted(glob.glob(os.path.join(t.table_path, "metadata", "v*.metadata.json")))[-1]))
     specs = doc["partition-specs"]
+    declared = [f["name"] for spec in specs for f in spec["fields"]]
+    on_disk = {tuple(sorted((df.partition_values or {}).keys())) for df in t._get_all_data_files()}
+    expected = {tuple(sorted(declared))} if declared else {()}
     H.report(
-        "the-metadata-never-claims-a-partitioning-the-files-do-not-have",
-        specs == [{"spec-id": 0, "fields": []}],
-        f"persisted partition-specs={specs} - foreign readers PRUNE on this, and these data "
-        f"files carry empty partition structs, so a recorded field would make them skip real rows",
+        "the-metadata-and-the-files-agree-about-partitioning",
+        on_disk == expected,
+        f"metadata declares {declared or 'no partitioning'} and every data file carries "
+        f"{sorted(on_disk)} - foreign readers PRUNE on the metadata, so a file whose partition "
+        f"struct does not match it would make them skip real rows",
     )
+    layout = sorted({os.path.basename(os.path.dirname(f))
+                     for f in glob.glob(os.path.join(t.table_path, "data", "*", "*.parquet"))})
     H.report(
-        "the-requested-fields-are-recorded-not-lost",
-        load_table(t.table_path).properties().get("datashard.requested-partition-fields") == "hour",
-        f"datashard.requested-partition-fields={load_table(t.table_path).properties().get('datashard.requested-partition-fields')!r} "
-        f"so 0.11 can offer to apply it",
+        "a-partitioned-table-is-laid-out-by-its-spec",
+        layout == ["hour=19", "hour=23", "hour=9"],
+        f"data/ contains {layout or 'no partition directories'}",
     )
     plain = build("no_spec", None)
     same = all(t.scan(filter=f) == plain.scan(filter=f) != []

@@ -39,6 +39,7 @@ class _Plan:
     retain_last: Optional[int] = None
     properties: Dict[str, Optional[str]] = field(default_factory=dict)
     compact: bool = False
+    replace: bool = False
 
 
 class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
@@ -177,6 +178,16 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
         self._operations.append({"type": "set_properties", "properties": dict(properties)})
         return self
 
+    def mark_replace(self) -> "Transaction":
+        """Label this commit's snapshot `replace` rather than `append`.
+
+        A data-file rewrite adds and removes files without changing the table's rows, and
+        Iceberg readers treat that differently from an append - a consumer following the
+        snapshot log must be able to tell "these rows are new" from "these rows moved".
+        """
+        self._operations.append({"type": "mark_replace"})
+        return self
+
     def compact_manifests(self) -> "Transaction":
         """Queue a rewrite of the active manifests into one (no-op below 2 manifests)."""
         if not self.is_active():
@@ -204,6 +215,8 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
                 plan.properties.update(operation["properties"])
             elif kind == "compact_manifests":
                 plan.compact = True
+            elif kind == "mark_replace":
+                plan.replace = True
             else:
                 raise RuntimeError(f"Unknown queued operation type {kind!r}")
         return plan
@@ -265,7 +278,7 @@ class Transaction(_InflightMixin, _AppendMixin, _CommitOpsMixin):
                     if plan.append_files or plan.deleted_paths or plan.compact:
                         committed = self._commit_file_ops(
                             base_metadata, plan.append_files, plan.deleted_paths, mutator,
-                            compact=plan.compact,
+                            compact=plan.compact, replace=plan.replace,
                         )
                     if not committed and mutator is not None:
                         # Metadata-only transaction (expire / properties): commit the

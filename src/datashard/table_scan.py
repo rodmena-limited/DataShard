@@ -4,7 +4,7 @@ modes (mixed into Table; split out of transaction.py for the 500-line file cap, 
 """
 
 import os
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .data_io import read_parquet_table
 from .data_structures import DataFile, Schema, TableMetadata
@@ -172,10 +172,12 @@ class _ScanMixin:
         expressions = parse_filter_dict(filter_dict) if filter_dict else []
         compute_expr = to_pyarrow_compute_expression(expressions) if expressions else None
 
-        # File-level pruning via column bounds
+        # File-level pruning: whole partitions first (a partitioned table can skip a
+        # directory without opening anything), then column bounds within what is left.
         if expressions:
             schema = self._get_current_schema(metadata)
             if schema:
+                data_files = self._prune_by_partition(data_files, expressions, metadata, schema)
                 data_files = prune_files_by_bounds(data_files, expressions, schema)
         if not data_files:
             return None
@@ -193,6 +195,24 @@ class _ScanMixin:
             tables = [read_one(df) for df in data_files]
 
         return self._concat_aligned(tables, pa)
+
+    @staticmethod
+    def _prune_by_partition(
+        data_files: List[DataFile], expressions: List[Any], metadata: Any, schema: Schema
+    ) -> List[DataFile]:
+        """Skip whole partitions a filter cannot match (#98). No-op for an unpartitioned
+        table, and never removes a file it cannot prove unmatched."""
+        from .partition_pruning import prune_files_by_partition
+        from .partitioning import spec_field_types
+
+        spec = next(
+            (p for p in (metadata.partition_specs if metadata else []) if p.spec_id == metadata.default_spec_id),
+            None,
+        )
+        if spec is None or not spec.fields:
+            return data_files
+        column_of = {int(f["id"]): str(f["name"]) for f in schema.fields}
+        return prune_files_by_partition(data_files, expressions, spec_field_types(spec, schema), column_of)
 
     @staticmethod
     def _concat_aligned(tables: List[Any], pa: Any) -> Any:
@@ -320,177 +340,3 @@ class _ScanMixin:
         if combined is None:
             return pd.DataFrame()
         return combined.to_pandas()
-
-    def scan_batches(
-        self,
-        batch_size: int = 10000,
-        columns: Optional[List[str]] = None,
-        filter: Optional[Dict[str, Any]] = None,
-        verify_checksums: Optional[Union[bool, str]] = None,
-        snapshot_id: Optional[int] = None,
-    ) -> Iterator[List[Dict[str, Any]]]:
-        """Scan data in batches for memory-efficient processing.
-
-        Yields batches of records, processing one parquet file at a time
-        using PyArrow's iter_batches for memory efficiency. Uses the same
-        filter engine (and error semantics) as scan().
-
-        Args:
-            batch_size: Approximate number of records per batch
-            columns: Optional column projection
-            filter: Optional predicate pushdown filter
-            verify_checksums: As in scan().
-
-        Yields:
-            List of records (dicts) per batch
-        """
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        from .filters import (
-            parse_filter_dict,
-            prune_files_by_bounds,
-            to_pyarrow_compute_expression,
-        )
-
-        metadata = self.metadata_manager.refresh()
-        data_files = self._get_all_data_files(metadata, snapshot_id)
-
-        expressions = parse_filter_dict(filter) if filter else []
-        if expressions and data_files:
-            schema = self._get_current_schema(metadata)
-            if schema:
-                data_files = prune_files_by_bounds(data_files, expressions, schema)
-
-        if not data_files:
-            return
-
-        compute_expr = to_pyarrow_compute_expression(expressions) if expressions else None
-        mode = self._resolve_verify_mode(verify_checksums)
-
-        yield from self._iter_file_batches(
-            data_files, batch_size, columns, compute_expr, mode, pa, pq
-        )
-
-    def _iter_file_batches(
-        self,
-        data_files: List[DataFile],
-        batch_size: int,
-        columns: Optional[List[str]],
-        compute_expr: Any,
-        verify: Any,
-        pa: Any,
-        pq: Any,
-    ) -> Iterator[List[Dict[str, Any]]]:
-        """Iterate over batches from data files. Read errors propagate.
-
-        In the default "page" mode a file is streamed and each page's CRC is
-        checked as it is read - nothing is materialised whole (#66). Only "full"
-        mode has to download a file completely to hash it.
-        """
-        from io import BytesIO
-
-        from .integrity import CorruptDataError, IntegrityChecker
-
-        mode = verify if isinstance(verify, str) else self._resolve_verify_mode(verify)
-        data_file_manager = self.file_manager.data_file_manager
-
-        # When filtering, read every column (the predicate may reference one not
-        # in `columns`); project down to `columns` only after filtering.
-        read_columns = None if compute_expr is not None else columns
-
-        def batches(pf: Any, threads: bool) -> Iterator[List[Dict[str, Any]]]:
-            for batch in pf.iter_batches(batch_size=batch_size, columns=read_columns, use_threads=threads):
-                table = pa.Table.from_batches([batch])
-                if compute_expr is not None:
-                    table = table.filter(compute_expr)
-                    if columns is not None:
-                        table = table.select(columns)
-                if table.num_rows > 0:
-                    yield table.to_pylist()
-
-        for data_file in data_files:
-            try:
-                if mode == "full" and data_file.checksum:
-                    rel_path = data_file.file_path.lstrip("/")
-                    raw = self.storage.read_file(rel_path)
-                    if not IntegrityChecker.verify_checksum(raw, data_file.checksum):
-                        raise CorruptDataError(
-                            f"Checksum mismatch for data file {data_file.file_path}"
-                        )
-                    yield from batches(pq.ParquetFile(BytesIO(raw)), False)
-                    continue
-                with data_file_manager.parquet_source(data_file.file_path) as (src, threads):
-                    pf = pq.ParquetFile(src, page_checksum_verification=mode != "off")
-                    yield from batches(pf, threads)
-            except (pa.ArrowException, OSError) as e:
-                corrupt = self._as_corruption(data_file, e)
-                if corrupt is not None:
-                    raise corrupt from e
-                raise
-
-    def iter_records(
-        self,
-        columns: Optional[List[str]] = None,
-        filter: Optional[Dict[str, Any]] = None,
-        verify_checksums: Optional[Union[bool, str]] = None,
-        snapshot_id: Optional[int] = None,
-    ) -> Iterator[Dict[str, Any]]:
-        """Iterate over records one at a time.
-
-        Memory efficient - only one batch in memory at a time.
-        Ideal for row-by-row processing of large tables.
-
-        Args:
-            columns: Optional column projection
-            filter: Optional predicate pushdown filter
-            verify_checksums: As in scan().
-
-        Yields:
-            Individual records as dicts
-        """
-        for batch in self.scan_batches(
-            batch_size=1000, columns=columns, filter=filter, verify_checksums=verify_checksums,
-            snapshot_id=snapshot_id,
-        ):
-            for record in batch:
-                yield record
-
-    def iter_pandas(
-        self,
-        chunksize: int = 50000,
-        columns: Optional[List[str]] = None,
-        filter: Optional[Dict[str, Any]] = None,
-        verify_checksums: Optional[Union[bool, str]] = None,
-        snapshot_id: Optional[int] = None,
-    ) -> Iterator[Any]:
-        """Iterate over data as pandas DataFrame chunks.
-
-        Memory efficient - only one chunk in memory at a time.
-        Ideal for processing large tables with pandas operations.
-
-        Args:
-            chunksize: Approximate rows per chunk
-            columns: Optional column projection
-            filter: Optional predicate pushdown filter
-            verify_checksums: As in scan().
-
-        Yields:
-            pandas DataFrame chunks
-
-        Raises:
-            ImportError: If pandas is not installed.
-        """
-        try:
-            import pandas as pd
-        except ImportError as e:
-            raise ImportError(
-                "pandas is required for iter_pandas(). Install with: pip install pandas"
-            ) from e
-
-        for batch in self.scan_batches(
-            batch_size=chunksize, columns=columns, filter=filter, verify_checksums=verify_checksums,
-            snapshot_id=snapshot_id,
-        ):
-            yield pd.DataFrame(batch)
-

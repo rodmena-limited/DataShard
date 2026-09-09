@@ -148,6 +148,12 @@ class _AppendMixin:
             return cast("Transaction", self)
 
         schema = self._schema_for_append(schema)
+        spec_fields = self._partition_fields(schema)
+        if spec_fields:
+            dfm = self.file_manager.data_file_manager
+            return self._append_arrow_partitioned(
+                dfm.arrow_from_pandas(df, schema), schema, spec_fields
+            )
         file_path = self._new_data_file_path()
         self._register_inflight(file_path)
         data_file = self.file_manager.data_file_manager.write_pandas_file(
@@ -182,6 +188,15 @@ class _AppendMixin:
             return cast("Transaction", self)
 
         schema = self._schema_for_append(schema)
+        spec_fields = self._partition_fields(schema)
+        if spec_fields:
+            if partition_values:
+                raise ValueError(
+                    "This table is partitioned by its spec, so partition_values cannot be passed "
+                    "as well - the values are computed from the rows. Drop the argument."
+                )
+            conformed = self.file_manager.data_file_manager.conform_arrow_table(table, schema)
+            return self._append_arrow_partitioned(conformed, schema, spec_fields)
         file_path = self._new_data_file_path()
         self._register_inflight(file_path)
         data_file = self.file_manager.data_file_manager.write_arrow_file(
@@ -269,6 +284,19 @@ class _AppendMixin:
             return cast("Transaction", self)
 
         schema = self._schema_for_append(schema)
+        spec_fields = self._partition_fields(schema)
+        if spec_fields:
+            import pyarrow as pa
+
+            dfm = self.file_manager.data_file_manager
+            if partition_values:
+                raise ValueError(
+                    "This table is partitioned by its spec, so partition_values cannot be passed "
+                    "as well - the values are computed from the rows. Drop the argument."
+                )
+            dfm.validate_records_strict(records, schema)
+            arrow = pa.Table.from_pylist(records, schema=dfm.create_arrow_schema(schema))
+            return self._append_arrow_partitioned(arrow, schema, spec_fields)
         file_path = self._new_data_file_path()
 
         # Register a GC-protection marker BEFORE writing the data file: the file
@@ -311,9 +339,56 @@ class _AppendMixin:
         return persisted
 
     @staticmethod
-    def _new_data_file_path() -> str:
-        """Table-relative path for a new data file (UUID-unique)."""
-        return f"data/auto_{uuid.uuid4().hex[:16]}.parquet"
+    def _new_data_file_path(partition_values: Optional[Dict[str, Any]] = None) -> str:
+        """Table-relative path for a new data file (UUID-unique).
+
+        A partitioned file lands under data/<name>=<value>/..., which is what makes a
+        partitioned lake browsable. Readers use the manifests, never the path (#93).
+        """
+        from .partitioning import partition_path
+
+        directory = partition_path("data", partition_values or {})
+        return f"{directory}/auto_{uuid.uuid4().hex[:16]}.parquet"
+
+    def _partition_fields(self, schema: Schema) -> Any:
+        """[(partition field, source type)] for the table's spec, or [] if unpartitioned."""
+        from .partitioning import spec_field_types
+
+        metadata = self._base_metadata_cache or self.metadata_manager.refresh(probe=False)
+        if metadata is None:
+            return []
+        spec = next(
+            (p for p in metadata.partition_specs if p.spec_id == metadata.default_spec_id), None
+        )
+        if spec is None or not spec.fields:
+            return []
+        from .partitioning import validate_spec
+
+        validate_spec(spec, schema)   # a spec stored before a schema existed is checked here
+        return spec_field_types(spec, schema)
+
+    def _append_arrow_partitioned(
+        self, table: Any, schema: Schema, spec_fields: Any
+    ) -> "Transaction":
+        """One data file per partition, in this one transaction and one snapshot."""
+        from .partitioning import partition_groups
+
+        column_of = {int(f["id"]): str(f["name"]) for f in schema.fields}
+        groups = partition_groups(table, spec_fields, column_of)
+        if len(groups) > 1:
+            logger.debug(f"append: {table.num_rows} rows span {len(groups)} partitions")
+        for values, rows in groups:
+            file_path = self._new_data_file_path(values)
+            self._register_inflight(file_path)
+            data_file = self.file_manager.data_file_manager.write_arrow_file(
+                file_path=file_path,
+                table=rows,
+                iceberg_schema=schema,
+                file_format=FileFormat.PARQUET,
+                partition_values=values,
+            )
+            self._queue_written_file(file_path, data_file)
+        return cast("Transaction", self)
 
     def _queue_written_file(self, file_path: str, data_file: DataFile) -> "Transaction":
         """Track a file this transaction wrote and queue it (Iceberg-style '/data/...' path)."""

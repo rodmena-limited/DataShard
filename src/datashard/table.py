@@ -7,6 +7,7 @@ in table_scan.py.
 import time
 from typing import Any, Dict, List, Optional
 
+from .compaction import _CompactionMixin
 from .data_structures import DataFile, Schema, Snapshot, TableMetadata
 from .duckdb_bridge import _DuckDBMixin
 from .file_manager import FileManager
@@ -14,6 +15,7 @@ from .logging_config import get_logger
 from .metadata_manager import MetadataManager
 from .snapshot_manager import SnapshotManager
 from .table_scan import _ScanMixin
+from .table_stream import _StreamMixin
 from .table_verify import _VerifyMixin
 from .transaction import Transaction
 from .transaction_manager import TransactionManager
@@ -30,7 +32,7 @@ DEFAULT_SNAPSHOT_MAX_AGE_MS = 5 * 24 * 3600 * 1000
 
 
 
-class Table(_ScanMixin, _DuckDBMixin, _VerifyMixin):
+class Table(_ScanMixin, _StreamMixin, _DuckDBMixin, _VerifyMixin, _CompactionMixin):
     """Main table interface with transaction support"""
 
     def __init__(
@@ -73,6 +75,7 @@ class Table(_ScanMixin, _DuckDBMixin, _VerifyMixin):
             name_mapping_json,
         )
 
+        self._pending_schema = schema
         spec, dropped = self._accepted_partition_spec(partition_spec)
         properties = {REQUESTED_PARTITION_FIELDS_PROPERTY: ",".join(dropped)} if dropped else {}
         if schema is not None:
@@ -103,35 +106,29 @@ class Table(_ScanMixin, _DuckDBMixin, _VerifyMixin):
             logger.info(f"Table {self.table_path} was concurrently initialized; using existing metadata")
 
     def _accepted_partition_spec(self, partition_spec: Optional[Any]) -> Any:
-        """(spec to persist, names of the fields dropped from it).
+        """(spec to persist, names of fields that could not be applied).
 
-        datashard does not split data files by partition before 0.11, so a spec whose
-        fields were recorded in the metadata would promise every reader - DuckDB,
-        pyiceberg, Spark - a layout the files do not have, and they prune on it. The
-        fields are therefore dropped and the caller told, exactly as `datashard migrate`
-        does for the same specs on pre-0.10 tables.
-
-        0.10.0 to 0.10.4 RAISED here instead, which removed a capability 0.7.2 had, and
-        it only fired on create: a recorder that makes one table per day upgraded
-        cleanly, appended all day, and failed at the day boundary (#97). Filters are
-        unaffected either way - `filter={"hour": ...}` returns the same rows through
-        column statistics, only reading more files than a partitioned layout would.
+        Since 0.11 a spec is APPLIED: rows are grouped by their partition tuple and each
+        commit writes one data file per partition, with the partition struct in the
+        manifest so DuckDB, pyiceberg, Spark and Trino prune on it exactly as datashard
+        does. A spec whose transform datashard cannot compute the way Iceberg defines it
+        is refused here, at create - never accepted and ignored, which would leave the
+        metadata promising a layout the files do not have.
         """
-        from .data_structures import PartitionSpec
+        from .partitioning import validate_spec
 
         fields = list(getattr(partition_spec, "fields", None) or [])
         if not fields:
             return partition_spec, []
-        names = [str(getattr(f, "name", f)) for f in fields]
-        logger.warning(
-            f"{self.table_path}: partition spec fields {names} are recorded as a table property "
-            f"but NOT applied - this version writes unpartitioned data files, and a spec in the "
-            f"metadata would promise DuckDB, pyiceberg and Spark a layout the files do not have. "
-            f"The table is created and every column, including {names[0]!r}, is queryable: "
-            f"filter={{{names[0]!r}: ...}} returns the same rows through column statistics, just "
-            f"reading more files than partition pruning would. Partitioning by value ships in 0.11."
+        schema = None
+        if self._pending_schema is not None:
+            schema = self._pending_schema
+        validate_spec(partition_spec, schema)  # raises UnsupportedTransform, before the table exists
+        logger.info(
+            f"{self.table_path}: partitioned by "
+            f"{', '.join(f'{pf.name} ({pf.transform})' for pf in fields)}"
         )
-        return PartitionSpec(spec_id=getattr(partition_spec, "spec_id", 0), fields=[]), names
+        return partition_spec, []
 
     def new_transaction(self) -> Transaction:
         """Create a new transaction"""

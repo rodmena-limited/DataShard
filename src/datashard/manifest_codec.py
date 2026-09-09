@@ -110,7 +110,10 @@ def data_file_from_iceberg(record: Dict[str, Any], types: Dict[int, Any], to_rel
     return DataFile(
         file_path="/" + to_rel(df["file_path"]),
         file_format=FileFormat(str(df["file_format"]).lower()),
-        partition_values=_labels(df.get("datashard_partition_labels")),
+        partition_values=(
+            dict(df.get("partition") or {})
+            or _labels(df.get("datashard_partition_labels"))
+        ),
         record_count=int(df["record_count"]),
         file_size_in_bytes=int(df["file_size_in_bytes"]),
         column_sizes=_pairs(df.get("column_sizes")) or None,
@@ -210,7 +213,7 @@ def manifest_from_iceberg(record: Dict[str, Any], to_rel: ToRelative) -> Manifes
         added_data_files_count=counts["added_files_count"],
         existing_data_files_count=counts["existing_files_count"],
         deleted_data_files_count=counts["deleted_files_count"],
-        partitions=[],
+        partitions=list(record.get("partitions") or []),
         content=content,
         sequence_number=record.get("sequence_number"),
         min_sequence_number=record.get("min_sequence_number"),

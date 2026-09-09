@@ -136,6 +136,68 @@ The two modes answer different questions:
 ``verify(limit=n)`` (``--limit n``) checks a sample of ``n`` files, for a table too
 large to read whole on every probe.
 
+Partitioning by value
+---------------------
+
+Since 0.11 a table can be laid out by a partition spec, and the layout is the real
+Iceberg one: DuckDB, pyiceberg, Spark and Trino prune on the same partition values
+datashard does.
+
+.. code-block:: python
+
+   from datashard import create_table, PartitionSpec, PartitionField
+
+   spec = PartitionSpec(spec_id=0, fields=[
+       PartitionField(source_id=2, field_id=1000, name="sym", transform="identity"),
+       PartitionField(source_id=1, field_id=1001, name="d",   transform="day"),
+   ])
+   table = create_table("/lake/trades", schema=schema, partition_spec=spec)
+   table.append_records(rows, schema)     # one file per (sym, day) present in `rows`
+
+Data then lands under ``data/sym=BTC-USD/d=2026-09-09/``, and a filter on a partition
+column skips the other partitions without opening them.
+
+Supported transforms, computed exactly as Iceberg defines them (each is checked against
+pyiceberg's own implementation in the test suite):
+
+============================  ===============================================
+``identity``                  the value itself
+``year`` ``month`` ``day``    from a ``date``, ``timestamp`` or ``timestamptz``
+``hour``                      from a ``timestamp`` or ``timestamptz``
+``bucket[N]``                 Iceberg's murmur3 hash, modulo N
+``truncate[W]``               strings, ints, longs, decimals and binary
+============================  ===============================================
+
+A transform datashard cannot compute the way Iceberg does is **refused at create**,
+never accepted and ignored — an ignored spec would leave the metadata promising a layout
+the files do not have, and foreign readers prune on that metadata.
+
+Two things to know before you partition:
+
+* **partitioning multiplies files.** Each commit writes one file per partition it
+  touches, so a table partitioned by hour and appended to every minute produces 24 files
+  an hour. Pair it with ``rewrite_data_files()`` (below) and with batching
+  (see :ref:`what a commit costs <commit-cost>`);
+* **row order changes.** A partitioned scan returns rows partition by partition, so
+  ``scan()`` no longer echoes insertion order. Sort if you depend on order.
+
+Merging small files
+-------------------
+
+.. code-block:: python
+
+   report = table.rewrite_data_files(target_file_size_bytes=128 * 1024**2,
+                                     min_input_files=5)
+   # {"rewritten_files": 24, "added_files": 3, "partitions": 3, "rows": 24,
+   #  "bytes_before": 40816, "bytes_after": 5205, "committed": True}
+
+Files are merged **within a partition only** — an output file always carries exactly one
+partition value — and the result is a single ``replace`` snapshot: the inputs become
+unreachable and ``garbage_collect()`` reclaims them later, so a reader holding an older
+snapshot keeps working. ``partition={"sym": "BTC-USD"}`` rewrites one partition,
+``min_input_files`` leaves a partition alone until it has that many small files, and
+``dry_run=True`` reports the plan without committing.
+
 Filters, and what pruning does and does not do
 ----------------------------------------------
 
@@ -146,13 +208,12 @@ changes how much is read:
 
    rows = table.scan(filter={"hour": ("between", (19, 19))})
 
-Today a filter is applied at two levels: files whose recorded column bounds cannot
-match are skipped entirely, and inside each remaining file parquet's own row-group
-statistics skip most of the rest. Partitioning by value — which prunes at the directory
-level, before a file is opened at all — ships in 0.11. Until then a filtered scan reads
-more files than it strictly must, and returns exactly the same rows: one production
-table measured 0.09 s slower on a filtered scan without partition pruning. There is no
-reason to rewrite a query layer while waiting for it.
+A filter is applied at three levels now: whole partitions whose value cannot match are
+skipped without opening a file, then files whose recorded column bounds cannot match,
+then parquet's own row-group statistics inside each remaining file. An **unpartitioned**
+table still uses the last two and returns exactly the same rows — one production table
+measured 0.09 s slower on a filtered scan without partition pruning — so there is no
+need to partition a table just to make filters work.
 
 Local and S3 are two implementations, not one
 ---------------------------------------------

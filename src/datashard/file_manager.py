@@ -27,6 +27,7 @@ from .manifest_writer import (
     ManifestEntry,
     encode_manifest,
     encode_manifest_list,
+    partition_summaries,
 )
 from .metadata_manager import MetadataManager
 from .metadata_serde import (
@@ -155,6 +156,7 @@ class FileManager:
         schema, spec = self._current_schema_and_spec(table_metadata)
         loc = location or (table_metadata.location if table_metadata else None) or self.metadata_manager.location_uri
         content = encode_manifest(entries, schema, spec, loc)
+        summaries = partition_summaries(entries, spec, schema)
         if pre_write_hook is not None:
             pre_write_hook(manifest_path)
         self.storage.write_file(manifest_path, content)
@@ -169,7 +171,7 @@ class FileManager:
             added_data_files_count=len(added),
             existing_data_files_count=len(existing),
             deleted_data_files_count=0,
-            partitions=[],
+            partitions=summaries,
             content=ManifestContent.DATA,
             sequence_number=sequence_number,
             min_sequence_number=min(seqs) if seqs else sequence_number,

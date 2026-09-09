@@ -40,6 +40,7 @@ class _CommitOpsMixin:
         deleted_paths: Set[str],
         mutator: Optional[Callable[[TableMetadata], None]],
         compact: bool = False,
+        replace: bool = False,
     ) -> bool:
         """Build manifests for file-level operations and commit the snapshot.
 
@@ -208,7 +209,13 @@ class _CommitOpsMixin:
 
         # 5. Commit the snapshot - with the SAME id stamped into the manifests. The
         # summary carries Iceberg's standard counters plus datashard's list integrity.
-        operation = "append" if append_files else ("delete" if deleted_paths else "replace")
+        # A rewrite adds AND removes files without changing the rows, which Iceberg calls
+        # `replace`; a consumer following the snapshot log must be able to tell that from
+        # an append (#98).
+        if replace:
+            operation = "replace"
+        else:
+            operation = "append" if append_files else ("delete" if deleted_paths else "replace")
         summary = list_info.summary()
         summary["added-data-files"] = str(len(append_files))
         summary["added-records"] = str(sum(df.record_count for df in append_files))
