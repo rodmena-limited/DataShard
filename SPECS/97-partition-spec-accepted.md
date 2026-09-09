@@ -54,4 +54,12 @@ one table per (symbol, day) with their spec, across a day boundary — 4 tables,
 each, `verify()` green.
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.10.5 (2026-09-09):** https://pypi.org/project/datashard/0.10.5/ · tag v0.10.5.
+
+Exercised: 284 unit tests (7 new); 37/37 probes; the full S3 integration suite (15 tests) against a
+REAL OVH bucket; the reporter's own recorder shape on that bucket - one table per (symbol, day)
+with their spec, across a day boundary, 4 tables, filters correct on each, verify() green; and the
+reporter's exact call against the wheel installed back from PyPI, again on the real bucket.
+
+Not exercised: applying the partition fields, which is 0.11 by design.
