@@ -51,4 +51,19 @@ read them happily, so a single-reader check would have shipped that.
   approved plan requires — partitioning alone multiplies small files.
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.11.0 (2026-09-10):** https://pypi.org/project/datashard/0.11.0/ · tag v0.11.0.
+
+Exercised: 362 unit tests (79 in the partitioning suite, including 289 transform comparisons
+against pyiceberg's own implementations); 38/38 probes; the built wheel; and the served wheel from
+PyPI against a real OVH bucket - a two-field spec, pruning, compaction 4 to 2 files, and DuckDB
+reading the partitioned table over httpfs.
+
+A pre-release adversarial review, asked for before this went to a live trading desk, found six
+further defects - two of which abort a reader's process (DuckDB SIGABRTs on a decimal partition
+value and on `local-timestamp-micros`), one that made pruning silently ineffective for `day` and
+timestamp partitions, and one that could have merged two partitions into one file. All fixed, each
+with a regression test, and recorded in the CHANGELOG.
+
+Not exercised: Spark and Trino (only DuckDB and pyiceberg were run); spec evolution, which is
+deliberately not implemented; a partitioned table larger than a few thousand rows.
