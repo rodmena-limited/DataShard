@@ -123,7 +123,17 @@ class _CompactionMixin:
                 tx._queue_written_file(path, data_file)
             tx.delete_files(removed)
             tx.mark_replace()
-            report["committed"] = bool(tx.commit())
+            try:
+                report["committed"] = bool(tx.commit())
+            except FileNotFoundError as e:
+                # Another rewrite (or a delete) removed these inputs while this one was
+                # reading them. Nothing is lost and nothing was committed, but the bare
+                # "not part of the current snapshot" reads like corruption.
+                raise RuntimeError(
+                    f"rewrite_data_files: the files this rewrite was merging are no longer in "
+                    f"the table - another rewrite or delete committed first. Nothing was changed "
+                    f"and no rows were lost; re-run it to merge what is there now. ({e})"
+                ) from e
         report["added_files"] = len(added)
         report["bytes_after"] = sum(df.file_size_in_bytes for _p, df in added)
         logger.info(

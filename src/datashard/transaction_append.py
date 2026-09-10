@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# One commit spreading over this many partitions is worth a word: it means a file and a
+# manifest entry per partition, and usually a higher-cardinality spec than intended.
+MANY_PARTITIONS_WARNING = 100
+
 
 class _AppendMixin:
     """append_files / append_data / append_pandas and their schema plumbing."""
@@ -35,6 +39,8 @@ class _AppendMixin:
         def is_active(self) -> bool: ...
 
         def _register_inflight(self, file_path: str) -> None: ...
+
+        def _register_inflight_many(self, file_paths: List[str]) -> None: ...
 
     def append_files(self, files: List[DataFile]) -> "Transaction":
         """Queue pre-built data files to append to the table.
@@ -375,11 +381,13 @@ class _AppendMixin:
 
         column_of = {int(f["id"]): str(f["name"]) for f in schema.fields}
         groups = partition_groups(table, spec_fields, column_of)
-        if len(groups) > 1:
-            logger.debug(f"append: {table.num_rows} rows span {len(groups)} partitions")
-        for values, rows in groups:
-            file_path = self._new_data_file_path(values)
-            self._register_inflight(file_path)
+        planned = [(values, rows, self._new_data_file_path(values)) for values, rows in groups]
+        self._warn_if_many_partitions(len(planned), table.num_rows, spec_fields)
+        # ONE batched marker write for every file this commit will write. Registering
+        # them one at a time cost a round trip per partition, so a 200-partition commit
+        # spent 200 sequential PUTs on markers before writing any data (#99).
+        self._register_inflight_many([path for _v, _r, path in planned])
+        for values, rows, file_path in planned:
             data_file = self.file_manager.data_file_manager.write_arrow_file(
                 file_path=file_path,
                 table=rows,
@@ -389,6 +397,25 @@ class _AppendMixin:
             )
             self._queue_written_file(file_path, data_file)
         return cast("Transaction", self)
+
+    @staticmethod
+    def _warn_if_many_partitions(n_partitions: int, n_rows: int, spec_fields: Any) -> None:
+        """Say so when one commit spreads across a great many partitions.
+
+        That is the classic partitioning mistake - a high-cardinality column in the spec -
+        and it is expensive in exactly the way this library has bitten people before: one
+        data file per partition per commit, each with its own manifest entry.
+        """
+        if n_partitions < MANY_PARTITIONS_WARNING:
+            return
+        names = ", ".join(f"{pf.name} ({pf.transform})" for pf, _t in spec_fields)
+        logger.warning(
+            f"this commit writes {n_partitions} data files for {n_rows} rows, one per partition "
+            f"of [{names}]. A partition column with many distinct values costs a file and a "
+            f"manifest entry per value per commit - if that was not intended, partition on a "
+            f"coarser transform (day instead of hour, bucket[N] instead of identity) and use "
+            f"rewrite_data_files() to merge what is already there."
+        )
 
     def _queue_written_file(self, file_path: str, data_file: DataFile) -> "Transaction":
         """Track a file this transaction wrote and queue it (Iceberg-style '/data/...' path)."""

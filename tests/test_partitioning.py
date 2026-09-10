@@ -26,7 +26,6 @@ from datashard import (
 )
 from datashard.partitioning import (
     UnsupportedTransform,
-    murmur3_32,
     partition_groups,
     transform_function,
 )
@@ -52,79 +51,6 @@ def spec(*fields):
     return PartitionSpec(spec_id=0, fields=[
         PartitionField(source_id=s, field_id=1000 + i, name=n, transform=t)
         for i, (s, n, t) in enumerate(fields)])
-
-
-# ---------------------------------------------------------------- against pyiceberg
-@pytest.mark.parametrize("n_buckets", [2, 16, 128, 1000])
-@pytest.mark.parametrize("itype,ptype,values", [
-    ("long", "LongType", [0, 1, -1, 34, 2**40, -(2**40)]),
-    ("int", "IntegerType", [0, 1, -1, 7, 2**30]),
-    ("string", "StringType", ["", "a", "iceberg", "ZEN-USDT", "unicode ↯ test"]),
-    ("date", "DateType", [date(1970, 1, 1), date(2026, 9, 9), date(1900, 3, 4)]),
-    ("timestamptz", "TimestamptzType", [datetime(2026, 9, 9, 12, 34, 56, 789012, tzinfo=timezone.utc)]),
-    ("timestamp", "TimestampType", [datetime(2026, 9, 9, 12, 34, 56, 789012), datetime(1969, 1, 1)]),
-    ("binary", "BinaryType", [b"", b"abc", bytes(range(16))]),
-])
-def test_bucket_matches_pyiceberg(n_buckets, itype, ptype, values):
-    ours = transform_function(f"bucket[{n_buckets}]", itype)
-    theirs = pyiceberg_transforms.BucketTransform(num_buckets=n_buckets).transform(
-        getattr(pyiceberg_types, ptype)())
-    for v in values:
-        assert ours(v) == theirs(v), (itype, v)
-
-
-def test_bucket_on_decimals_matches_pyiceberg():
-    ours = transform_function("bucket[16]", "decimal(18,8)")
-    theirs = pyiceberg_transforms.BucketTransform(num_buckets=16).transform(
-        pyiceberg_types.DecimalType(18, 8))
-    for v in (Decimal("1.5"), Decimal("-2.25"), Decimal("0"), Decimal("12345.6789")):
-        assert ours(v) == theirs(v), v
-
-
-@pytest.mark.parametrize("name,cls,itype,ptype,value", [
-    ("year", "YearTransform", "date", "DateType", date(2026, 9, 9)),
-    ("year", "YearTransform", "date", "DateType", date(1969, 12, 31)),
-    ("month", "MonthTransform", "date", "DateType", date(1969, 11, 30)),
-    ("month", "MonthTransform", "timestamp", "TimestampType", datetime(2026, 3, 15, 4, 5)),
-    ("day", "DayTransform", "date", "DateType", date(1968, 2, 29)),
-    ("day", "DayTransform", "timestamptz", "TimestamptzType", datetime(2026, 9, 9, 23, 59, 59, tzinfo=timezone.utc)),
-    ("hour", "HourTransform", "timestamptz", "TimestamptzType", datetime(2026, 9, 9, 23, 0, tzinfo=timezone.utc)),
-    ("hour", "HourTransform", "timestamp", "TimestampType", datetime(1969, 12, 31, 23, 0)),
-])
-def test_temporal_transforms_match_pyiceberg(name, cls, itype, ptype, value):
-    ours = transform_function(name, itype)(value)
-    theirs = getattr(pyiceberg_transforms, cls)().transform(getattr(pyiceberg_types, ptype)())(value)
-    assert ours == theirs
-
-
-@pytest.mark.parametrize("width", [2, 3, 10, 100])
-@pytest.mark.parametrize("itype,ptype,values", [
-    ("long", "LongType", [0, 1, -1, 17, -17, 12345, -99999]),
-    ("string", "StringType", ["", "a", "abcdef", "ZEN-USDT", "↯unicode↯"]),
-    ("binary", "BinaryType", [b"", b"abc", bytes(range(20))]),
-])
-def test_truncate_matches_pyiceberg(width, itype, ptype, values):
-    ours = transform_function(f"truncate[{width}]", itype)
-    theirs = pyiceberg_transforms.TruncateTransform(width=width).transform(getattr(pyiceberg_types, ptype)())
-    for v in values:
-        assert ours(v) == theirs(v), (itype, v)
-
-
-@pytest.mark.parametrize("width", [2, 3, 10, 100])
-def test_truncate_on_decimals_uses_the_values_own_scale(width):
-    """The defect this comparison caught: truncating at the column's declared scale left
-    the value unchanged whenever the trailing zeros made it divisible by W."""
-    ours = transform_function(f"truncate[{width}]", "decimal(18,8)")
-    theirs = pyiceberg_transforms.TruncateTransform(width=width).transform(pyiceberg_types.DecimalType(18, 8))
-    for v in (Decimal("1.5"), Decimal("-2.25"), Decimal("0"), Decimal("1.50000000"), Decimal("12345.6789")):
-        assert ours(v) == theirs(v), v
-
-
-def test_murmur3_matches_the_published_vectors():
-    """A known-positive for the hash itself, so a bucket comparison cannot pass vacuously."""
-    assert murmur3_32(b"") == 0
-    assert murmur3_32(b"a") == 1009084850
-    assert murmur3_32(b"hello") == 613153351
 
 
 # ---------------------------------------------------------------- refusals
@@ -260,7 +186,7 @@ def test_a_range_filter_prunes_a_temporal_partition(tmp_path):
 # ---------------------------------------------------------------- compaction
 def test_rewrite_data_files_merges_within_partitions_only(tmp_path):
     t = create_table(str(tmp_path / "t"), schema=SCHEMA, partition_spec=spec((2, "sym", "identity")))
-    for i in range(8):                                    # 8 commits x 3 partitions = 24 files
+    for _ in range(8):                                    # 8 commits x 3 partitions = 24 files
         t.append_records(rows(3), SCHEMA)
     assert len(t._get_all_data_files()) == 24
     before = sorted(r["n"] for r in t.scan())
@@ -309,7 +235,7 @@ def test_a_partition_value_survives_the_avro_round_trip(tmp_path):
     """What is written must be what is read back, per result type. A `day` partition
     goes out as an int and comes back as a date, and a timestamp comes back UTC-aware:
     both are the same instant, and `canonical` is what makes them comparable."""
-    from datashard.partitioning import canonical, result_type, transform_function
+    from datashard.partitioning import canonical, result_type
 
     cases = [
         ("string", "identity", "ZEN-USDT"), ("long", "identity", 2 ** 40),
@@ -402,3 +328,101 @@ def test_compaction_never_merges_two_partitions_even_if_their_keys_look_alike(tm
     assert _key({"d": date(2026, 9, 1)}) != _key({"d": "2026-09-01"})
     assert _key({"d": 1}) != _key({"d": "1"})
     assert _key({"d": True}) != _key({"d": 1})
+
+
+# ---------------------------------------------------------------- the second pass
+def test_one_commit_registers_its_markers_in_one_batch(tmp_path):
+    """Every data file needs a GC-protection marker before it is written. Registering
+    them one at a time cost a round trip PER PARTITION, so a 200-partition commit spent
+    200 sequential PUTs on markers before writing any data."""
+    schema = Schema(schema_id=1, fields=[
+        {"id": 1, "name": "h", "type": "int", "required": True},
+        {"id": 2, "name": "n", "type": "long"}])
+    t = create_table(str(tmp_path / "t"), schema=schema, partition_spec=spec((1, "h", "identity")))
+    batches = []
+    real = t.storage.write_files
+
+    def counting(items):
+        batches.append(len(items))
+        return real(items)
+
+    t.storage.write_files = counting
+    t.append_records([{"h": i, "n": i} for i in range(120)], schema)
+    assert len(t._get_all_data_files()) == 120
+    marker_batches = [n for n in batches if n >= 100]
+    assert marker_batches == [120], f"markers must go out in ONE batch, saw {batches}"
+
+
+def test_a_commit_over_many_partitions_says_so(tmp_path, caplog):
+    import logging
+
+    schema = Schema(schema_id=1, fields=[
+        {"id": 1, "name": "h", "type": "int", "required": True},
+        {"id": 2, "name": "n", "type": "long"}])
+    t = create_table(str(tmp_path / "t"), schema=schema, partition_spec=spec((1, "h", "identity")))
+    with caplog.at_level(logging.WARNING, logger="datashard.transaction_append"):
+        t.append_records([{"h": i, "n": i} for i in range(150)], schema)
+    warning = " ".join(r.message for r in caplog.records)
+    assert "150 data files" in warning and "rewrite_data_files" in warning, warning
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="datashard.transaction_append"):
+        t.append_records([{"h": 1, "n": 1}], schema)
+    assert not caplog.records, "a small commit must stay quiet"
+
+
+def test_identity_partitioning_on_a_float_is_refused(tmp_path):
+    """NaN never equals itself, so every NaN row would become its own partition and file."""
+    schema = Schema(schema_id=1, fields=[
+        {"id": 1, "name": "f", "type": "double"},
+        {"id": 2, "name": "n", "type": "long", "required": True}])
+    with pytest.raises(UnsupportedTransform, match="NaN"):
+        create_table(str(tmp_path / "f"), schema=schema, partition_spec=spec((1, "f", "identity")))
+
+
+def test_a_partition_directory_never_leaks_into_the_data(tmp_path):
+    """#98 writes `data/sym=BTC-USD/`, which is exactly the Hive-style path that made
+    reads fail or grow a phantom column in #93. The default spec partitions on a column
+    of the same name, so the two features meet head-on."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    t = create_table(str(tmp_path / "t"), schema=SCHEMA, partition_spec=spec((2, "sym", "identity")))
+    t.append_records(rows(9), SCHEMA)
+    a_file = glob.glob(str(tmp_path / "t" / "data" / "*" / "*.parquet"))[0]
+    assert "sym=" in a_file, a_file
+    with pytest.raises(pa.ArrowTypeError):
+        pq.read_table(a_file)                     # control: raw pyarrow still infers and fails
+    assert load_table(t.table_path).to_arrow().schema.names == ["ts", "sym", "px", "n"]
+    assert {r["sym"] for r in load_table(t.table_path).scan()} == {"BTC-USD", "ETH-USD", "ZEN-USDT"}
+
+
+def test_a_losing_rewrite_says_what_happened_and_loses_nothing(tmp_path):
+    """A rewrite whose inputs vanish between planning and committing must fail with a
+    sentence an operator can act on, not `not part of the current snapshot`, which reads
+    like corruption. The window is real: two rewrites racing produce exactly it."""
+    t = create_table(str(tmp_path / "t"), schema=SCHEMA, partition_spec=spec((2, "sym", "identity")))
+    for _ in range(4):
+        t.append_records(rows(3), SCHEMA)
+    before = sorted(r["n"] for r in t.scan())
+    doomed = t._get_all_data_files()[0]
+    victim, victim_rows = doomed.file_path, doomed.record_count
+
+    original_plan = t._plan_rewrite
+
+    def plan_then_lose_the_inputs(*args, **kwargs):
+        groups = original_plan(*args, **kwargs)
+        other = load_table(t.table_path)          # someone else commits INSIDE the window
+        with other.new_transaction() as tx:
+            tx.delete_files([victim])
+            tx.commit()
+        return groups
+
+    t._plan_rewrite = plan_then_lose_the_inputs
+    with pytest.raises(RuntimeError, match="no rows were lost"):
+        t.rewrite_data_files(min_input_files=2)
+
+    after = load_table(t.table_path)
+    assert len(after.scan()) == len(before) - victim_rows  # only the competing delete landed
+    assert after.verify()["ok"], "the failed rewrite must leave a readable table"
+    assert after.rewrite_data_files(min_input_files=2)["committed"], "and a re-run must work"

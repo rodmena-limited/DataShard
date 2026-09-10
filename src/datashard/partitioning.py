@@ -165,6 +165,22 @@ def truncate_value(value: Any, width: int, iceberg_type: str) -> Any:
     raise UnsupportedTransform(f"truncate[] is not defined for type {iceberg_type!r}")
 
 
+def _reject_float_identity(transform: str, iceberg_type: str) -> None:
+    """identity on a float or double is refused.
+
+    NaN never equals itself, so every NaN row lands in its own partition - a file per row.
+    Iceberg deprecates float and double as identity partition sources for the same reason.
+    """
+    if transform == "identity" and iceberg_type in ("float", "double"):
+        raise UnsupportedTransform(
+            f"identity partitioning on a {iceberg_type} column is refused: NaN never equals "
+            f"itself, so every NaN row would become its own partition and its own file. Iceberg "
+            f"deprecates float and double as identity partition sources, and defines no other "
+            f"transform for them either - partition on a different column. The {iceberg_type} "
+            f"stays queryable through its column statistics, which is what filters use."
+        )
+
+
 def transform_function(transform: str, iceberg_type: str) -> Callable[[Any], Any]:
     """The callable for `transform` applied to a column of `iceberg_type`.
 
@@ -172,6 +188,7 @@ def transform_function(transform: str, iceberg_type: str) -> Callable[[Any], Any
     does - refusing beats writing a partition value a foreign reader disagrees with.
     """
     if transform == "identity":
+        _reject_float_identity(transform, iceberg_type)
         return lambda v: v
     if transform in TEMPORAL:
         if iceberg_type not in ("date", "timestamp", "timestamptz"):

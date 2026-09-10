@@ -5,6 +5,39 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-09-10
+
+A second adversarial pass over 0.11.0, asked for before the library settles. It went after what the
+first pass did not cover: many partitions in one commit, concurrency around compaction, and
+pathological partition values.
+
+### Fixed
+- **A commit registered one GC marker per partition, sequentially.** Every data file needs a marker
+  before it is written, and a 200-partition commit made 201 separate registrations — on OVH, at
+  ~190 ms a request, roughly 38 seconds of round trips before the first data file was written.
+  They now go out in one batch (2 batched writes for that commit).
+- **`identity` partitioning on a `float` or `double` is refused.** NaN never equals itself, so every
+  NaN row became its own partition and its own file — 5 NaN rows produced 5 files. Iceberg
+  deprecates float and double as identity partition sources for the same reason, and defines no
+  other transform for them, so the message says to partition on a different column.
+- **A rewrite that lost a race reported it as `FileNotFoundError: ... not part of the current
+  snapshot`**, which reads like corruption. It now says that nothing was changed, no rows were
+  lost, and a re-run will merge what is there — the same complaint made about the bare `KeyError`
+  an old client gives on a migrated table.
+
+### Added
+- **A warning when one commit spreads across many partitions** (100 by default), naming the count,
+  the spec and the remedy. A high-cardinality partition column costs a file and a manifest entry
+  per value per commit, which is the same shape as the metadata growth that prompted 0.10.2.
+
+### Checked and found sound, so unchanged
+- **A rewrite racing an append**: both commit, every row present, no duplicates, `verify()` green.
+- **Two rewrites racing**: one wins, the loser fails loudly with the table intact — only its
+  message needed work.
+- **A partitioned table's own `data/sym=X/` directories** do not leak into the data it returns.
+  0.11 creates by default exactly the Hive-style layout that broke reads in 0.10.0, so this now has
+  its own test, with a control showing raw pyarrow still failing on the same file.
+
 ## [0.11.0] - 2026-09-09
 
 **Partitioning by value.** A partition spec is now applied, not just accepted: rows are grouped
