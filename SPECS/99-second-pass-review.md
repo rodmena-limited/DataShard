@@ -36,4 +36,13 @@ first data file is written.
 - **Partition value round trip and path escaping**: already covered by the first pass's fixes.
 
 ## Outcome
-(filled at release)
+
+**Shipped in 0.11.1 (2026-09-10):** https://pypi.org/project/datashard/0.11.1/ · tag v0.11.1.
+
+Exercised: 367 unit tests; 38/38 probes; the built wheel (one marker batch for 120 partitions, the
+float refusal, the many-partition warning, DuckDB agreeing); and the served wheel from PyPI against
+a real OVH bucket - a two-field spec, 48 rows, pruning, compaction 12 to 6 files, and DuckDB
+reading it over httpfs.
+
+Not exercised: Spark and Trino; a partitioned table beyond a few thousand rows; the many-partition
+warning threshold against a real high-cardinality production spec.
