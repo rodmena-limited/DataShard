@@ -178,6 +178,12 @@ one — it aborts the process. Those two are refused at create; ``bucket[N]`` on
 column works, because its value is an int, and the decimal stays queryable through its
 column statistics either way.
 
+**A uuid or fixed column cannot be partitioned by value** either, for a related reason:
+Iceberg readers disagree about how such a partition value is spelled in the manifest's Avro
+struct and in the path, and a partition value a reader misreads is worse than none.
+``bucket[N]`` is the way to partition on a uuid, and it is exact — Iceberg hashes the same
+16 bytes datashard stores.
+
 Two things to know before you partition:
 
 * **partitioning multiplies files.** Each commit writes one file per partition it

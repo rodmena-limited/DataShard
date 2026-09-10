@@ -30,6 +30,11 @@ from .schema_validation import (
     validate_records_strict,
 )
 from .storage_backend import StorageBackend
+from .uuid_columns import (
+    encode_columns as encode_uuid_columns,
+    normalise_dataframe as normalise_uuid_dataframe,
+    normalise_records as normalise_uuid_records,
+)
 
 if TYPE_CHECKING:
     from .file_manager import FileManager
@@ -276,6 +281,7 @@ class DataFileManager:
 
         if records:
             self.validate_records_strict(records, iceberg_schema)
+        records = normalise_uuid_records(records, iceberg_schema)
 
         arrow_schema = self.create_arrow_schema(iceberg_schema)
         # ONE conversion: the same table yields the statistics and the bytes (#69).
@@ -312,6 +318,7 @@ class DataFileManager:
         then group the rows (#98).
         """
         arrow_schema = self.create_arrow_schema(iceberg_schema)
+        table = encode_uuid_columns(table, iceberg_schema)   # str / UUID -> 16 bytes (#92)
         unknown = set(table.column_names) - set(arrow_schema.names)
         if unknown:
             raise ValueError(
@@ -341,6 +348,7 @@ class DataFileManager:
                 f"DataFrame has columns not in the table schema: {sorted(unknown)}. "
                 f"Schema fields: {sorted(allowed)}. Refusing to silently drop data."
             )
+        df = normalise_uuid_dataframe(df, iceberg_schema)   # str -> 16 bytes (#92)
         try:
             table = pa.Table.from_pandas(df, schema=self.create_arrow_schema(iceberg_schema),
                                          preserve_index=False)
@@ -405,6 +413,7 @@ class DataFileManager:
                 f"Schema fields: {sorted(allowed)}. Refusing to silently drop data."
             )
         arrow_schema = self.create_arrow_schema(iceberg_schema)
+        df = normalise_uuid_dataframe(df, iceberg_schema)   # str -> 16 bytes (#92)
         try:
             table = pa.Table.from_pandas(df, schema=arrow_schema, preserve_index=False)
         except _SCHEMA_MISMATCH_ERRORS as e:
@@ -454,7 +463,7 @@ class DataFileManager:
         try:
             # Convert the DataFrame to Arrow Table using the schema
             arrow_schema = self.create_arrow_schema(iceberg_schema)
-            pa.Table.from_pandas(df, schema=arrow_schema)
+            pa.Table.from_pandas(normalise_uuid_dataframe(df, iceberg_schema), schema=arrow_schema)
             return True
         except _SCHEMA_MISMATCH_ERRORS as e:
             logger.debug(f"DataFrame is not compatible with the schema: {e}")
@@ -468,7 +477,7 @@ class DataFileManager:
             arrow_schema = self.create_arrow_schema(iceberg_schema)
 
             # Try to create a table with the records and schema
-            pa.Table.from_pylist(records, schema=arrow_schema)
+            pa.Table.from_pylist(normalise_uuid_records(records, iceberg_schema), schema=arrow_schema)
             return True
         except _SCHEMA_MISMATCH_ERRORS as e:
             logger.debug(f"Records are not compatible with the schema: {e}")

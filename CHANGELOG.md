@@ -5,6 +5,42 @@ All notable changes to DataShard will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-09-10
+
+`uuid` and `fixed[L]` columns, written the way Iceberg specifies them (#92). Both were **refused at
+create** since 0.10, because what datashard wrote for them was not what the Iceberg type promised.
+
+### Added
+- **A `uuid` column is 16 bytes of fixed-width binary on disk** — what Iceberg specifies, and what
+  DuckDB and pyiceberg read natively (pyiceberg sees `extension<arrow.uuid>`). In Python it stays a
+  canonical **string**, so results remain JSON serialisable and the API is unchanged; a write also
+  accepts a `uuid.UUID` or the raw 16 bytes, and so does a filter value. A value that is not a uuid
+  is refused rather than stored.
+- **A `fixed[L]` column** is `fixed_size_binary(L)` on disk and `bytes` in Python. A bare `fixed`
+  stays refused: Iceberg's type carries its width, and pyiceberg's parser rejects it without one.
+- **`bucket[N]` partitioning on a uuid column**, which hashes exactly the 16 bytes datashard stores,
+  as Iceberg defines it.
+
+### Changed
+- **A table written before 0.11.2 keeps reading.** Its uuid column really is a parquet string; old
+  string files and new binary files are decoded per file, so they land in one scan, one filter and
+  one `rewrite_data_files()` — which converts the old files to the Iceberg encoding. A migration
+  report still lists such columns under `columns_foreign_readers_may_reject`, now with the rewrite
+  as the fix: migration does not touch data files, so pyiceberg still refuses those older files.
+- **A uuid or fixed partition VALUE is refused at create** (`identity`, `truncate[W]`), with
+  `bucket[N]` named as the alternative: Iceberg readers disagree about how such a value is spelled
+  in the manifest's Avro struct and in the path, and a partition value a reader misreads is worse
+  than no partitioning. The same rule already applies to decimals.
+
+### Verified
+- `probe_v0112_uuid_and_fixed_foreign_readers.py`: DuckDB **and** pyiceberg return the same rows as
+  datashard, on values, for a table with a uuid and a `fixed[4]` column. Its **negative control**
+  builds the pre-0.11.2 representation on purpose and requires pyiceberg to still refuse it
+  (`Cannot promote an string to uuid`), so the passing comparison is the new encoding being read.
+- 12 regression tests in `tests/test_uuid_and_fixed.py` cover every read API, every write API
+  (records, Arrow in either encoding, pandas, partitioned), bounds and pruning, and a rewrite of a
+  table holding both encodings at once.
+
 ## [0.11.1] - 2026-09-10
 
 A second adversarial pass over 0.11.0, asked for before the library settles. It went after what the

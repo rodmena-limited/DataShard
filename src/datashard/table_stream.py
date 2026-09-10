@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 from .data_structures import DataFile, Schema, TableMetadata
 from .logging_config import get_logger
+from .uuid_columns import (
+    decode_columns as decode_uuid_columns,
+    split_expressions as split_uuid_expressions,
+)
 
 logger = get_logger(__name__)
 
@@ -76,19 +80,21 @@ class _StreamMixin:
         data_files = self._get_all_data_files(metadata, snapshot_id)
 
         expressions = parse_filter_dict(filter) if filter else []
-        if expressions and data_files:
-            schema = self._get_current_schema(metadata)
-            if schema:
-                data_files = prune_files_by_bounds(data_files, expressions, schema)
+        schema = self._get_current_schema(metadata)
+        # A uuid predicate runs after the column is decoded, as in scan() (#92).
+        pushdown, after_decode = split_uuid_expressions(expressions, schema)
+        if expressions and data_files and schema:
+            data_files = prune_files_by_bounds(data_files, pushdown + after_decode, schema)
 
         if not data_files:
             return
 
-        compute_expr = to_pyarrow_compute_expression(expressions) if expressions else None
+        compute_expr = to_pyarrow_compute_expression(pushdown) if pushdown else None
+        post_expr = to_pyarrow_compute_expression(after_decode) if after_decode else None
         mode = self._resolve_verify_mode(verify_checksums)
 
         yield from self._iter_file_batches(
-            data_files, batch_size, columns, compute_expr, mode, pa, pq
+            data_files, batch_size, columns, compute_expr, mode, pa, pq, post_expr, schema
         )
 
     def _iter_file_batches(
@@ -100,6 +106,8 @@ class _StreamMixin:
         verify: Any,
         pa: Any,
         pq: Any,
+        post_expr: Any = None,
+        uuid_schema: Optional[Schema] = None,
     ) -> Iterator[List[Dict[str, Any]]]:
         """Iterate over batches from data files. Read errors propagate.
 
@@ -113,18 +121,25 @@ class _StreamMixin:
 
         mode = verify if isinstance(verify, str) else self._resolve_verify_mode(verify)
         data_file_manager = self.file_manager.data_file_manager
+        # The caller already read the metadata; only re-read it when it did not.
+        if uuid_schema is None:
+            uuid_schema = self._get_current_schema()   # uuid columns become strings (#92)
 
         # When filtering, read every column (the predicate may reference one not
         # in `columns`); project down to `columns` only after filtering.
-        read_columns = None if compute_expr is not None else columns
+        filtering = compute_expr is not None or post_expr is not None
+        read_columns = None if filtering else columns
 
         def batches(pf: Any, threads: bool) -> Iterator[List[Dict[str, Any]]]:
             for batch in pf.iter_batches(batch_size=batch_size, columns=read_columns, use_threads=threads):
                 table = pa.Table.from_batches([batch])
                 if compute_expr is not None:
                     table = table.filter(compute_expr)
-                    if columns is not None:
-                        table = table.select(columns)
+                table = decode_uuid_columns(table, uuid_schema)
+                if post_expr is not None:
+                    table = table.filter(post_expr)
+                if filtering and columns is not None:
+                    table = table.select(columns)
                 if table.num_rows > 0:
                     yield table.to_pylist()
 

@@ -12,6 +12,10 @@ from .file_manager import FileManager
 from .logging_config import get_logger
 from .metadata_manager import MetadataManager
 from .storage_backend import StorageBackend
+from .uuid_columns import (
+    decode_columns as decode_uuid_columns,
+    split_expressions as split_uuid_expressions,
+)
 
 logger = get_logger(__name__)
 
@@ -169,23 +173,43 @@ class _ScanMixin:
         if not data_files:
             return None
 
+        schema = self._get_current_schema(metadata)
         expressions = parse_filter_dict(filter_dict) if filter_dict else []
-        compute_expr = to_pyarrow_compute_expression(expressions) if expressions else None
+        # A predicate on a uuid column is applied after that column is decoded (#92); the
+        # rest is pushed into the parquet reader as before.
+        pushdown, after_decode = split_uuid_expressions(expressions, schema)
+        compute_expr = to_pyarrow_compute_expression(pushdown) if pushdown else None
+        post_expr = to_pyarrow_compute_expression(after_decode) if after_decode else None
 
         # File-level pruning: whole partitions first (a partitioned table can skip a
         # directory without opening anything), then column bounds within what is left.
-        if expressions:
-            schema = self._get_current_schema(metadata)
-            if schema:
-                data_files = self._prune_by_partition(data_files, expressions, metadata, schema)
-                data_files = prune_files_by_bounds(data_files, expressions, schema)
+        if expressions and schema:
+            expressions = pushdown + after_decode
+            data_files = self._prune_by_partition(data_files, expressions, metadata, schema)
+            data_files = prune_files_by_bounds(data_files, expressions, schema)
         if not data_files:
             return None
 
         mode = self._resolve_verify_mode(verify_checksums)
 
+        # A column the post-decode predicate needs must be read even when it is not
+        # projected, and dropped again afterwards.
+        read_columns = columns
+        if columns is not None and after_decode:
+            read_columns = list(columns) + [
+                e.column for e in after_decode if e.column not in columns
+            ]
+
         def read_one(df: DataFile) -> Any:
-            return self._read_datafile_table(df, columns, compute_expr, mode, pa, pq)
+            table = self._read_datafile_table(df, read_columns, compute_expr, mode, pa, pq)
+            # A uuid column is 16 bytes on disk since 0.11.2 and a string before it; both
+            # become strings here, per file, so one scan can span both (#92).
+            table = decode_uuid_columns(table, schema)
+            if post_expr is not None:
+                table = table.filter(post_expr)
+                if columns is not None:
+                    table = table.select(columns)
+            return table
 
         if parallel:
             n_workers = parallel if isinstance(parallel, int) else (os.cpu_count() or 4)

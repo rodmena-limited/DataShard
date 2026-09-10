@@ -96,6 +96,11 @@ def encode_bound(value: Any, iceberg_type: Any) -> Optional[bytes]:
         if t == "string":
             return value.encode("utf-8") if isinstance(value, str) else None
         if t == "uuid":
+            # A uuid column is 16 raw bytes since 0.11.2, and a string in tables written
+            # before it; a bound must encode from either (#92).
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                raw = bytes(value)
+                return raw if len(raw) == 16 else None
             return uuid.UUID(str(value)).bytes if isinstance(value, (str, uuid.UUID)) else None
         if t == "binary" or t.startswith("fixed"):
             return bytes(value) if isinstance(value, (bytes, bytearray, memoryview)) else None

@@ -423,28 +423,30 @@ def test_migrating_a_table_that_has_no_snapshots(tmp_path):
     assert load_table(path).row_count() == 1
 
 
-@pytest.mark.parametrize("bad_type,suggested", [("uuid", "string"), ("fixed", "binary")])
-def test_column_types_no_iceberg_engine_can_read_are_refused_at_create(tmp_path, bad_type, suggested):
-    """pyiceberg refuses a 'uuid' column backed by a parquet string, and a bare 'fixed' is
-    not a valid Iceberg type at all. The bytes are the same, so the fix costs nothing."""
+def test_a_column_type_no_iceberg_engine_can_read_is_refused_at_create(tmp_path):
+    """A bare 'fixed' is not an Iceberg type - the width is part of it - and pyiceberg's
+    parser rejects it outright. Since 0.11.2 it is the only refusal left: uuid and
+    fixed[L] are written as the fixed-width binary Iceberg specifies (#92)."""
     schema = Schema(schema_id=1, fields=[
         {"id": 1, "name": "k", "type": "long", "required": True},
-        {"id": 2, "name": "v", "type": bad_type},
+        {"id": 2, "name": "v", "type": "fixed"},
     ])
-    with pytest.raises(ValueError, match=f"use '{suggested}'"):
-        create_table(str(tmp_path / bad_type), schema)
-    assert not os.path.exists(tmp_path / bad_type / "metadata")  # refusing wrote nothing
-    # the same table with the suggested type is accepted
-    ok = Schema(schema_id=1, fields=[
-        {"id": 1, "name": "k", "type": "long", "required": True},
-        {"id": 2, "name": "v", "type": suggested},
-    ])
-    assert create_table(str(tmp_path / (bad_type + "_ok")), ok).created
+    with pytest.raises(ValueError, match=r"use fixed\[L\]"):
+        create_table(str(tmp_path / "fixed"), schema)
+    assert not os.path.exists(tmp_path / "fixed" / "metadata")  # refusing wrote nothing
+    for good in ("fixed[16]", "binary", "uuid"):
+        ok = Schema(schema_id=1, fields=[
+            {"id": 1, "name": "k", "type": "long", "required": True},
+            {"id": 2, "name": "v", "type": good},
+        ])
+        assert create_table(str(tmp_path / good.replace("[", "").replace("]", "")), ok).created
 
 
-def test_an_existing_table_with_such_a_column_keeps_working(tmp_path):
-    """The guard is only for NEW schemas: a table that already has one must still read."""
-    from datashard.metadata_serde import unrepresentable_fields
+def test_a_migrated_table_reports_the_columns_foreign_readers_will_still_refuse(tmp_path):
+    """A table old enough to migrate stores its uuid column as a parquet STRING, and
+    migration does not rewrite data files - so the report must name that column even
+    though the type itself is fine to write today."""
+    from datashard.metadata_serde import legacy_unreadable_fields, unrepresentable_fields
 
     schema = Schema(schema_id=1, fields=[
         {"id": 1, "name": "k", "type": "long", "required": True},
@@ -455,10 +457,12 @@ def test_an_existing_table_with_such_a_column_keeps_working(tmp_path):
     patched = t.metadata_manager._dict_to_metadata(t.metadata_manager._metadata_to_dict(base))
     patched.schemas = [schema]
     patched.current_schema_id = 1
-    t.metadata_manager.commit(base, patched)  # simulate a table created before the guard
+    t.metadata_manager.commit(base, patched)  # simulate a table written before 0.11.2
     reopened = load_table(str(tmp_path / "legacy_uuid"))
-    assert unrepresentable_fields(reopened._get_current_schema()) == {"v": "string"}
-    reopened.append_records([{"k": 1, "v": "abc"}], reopened._get_current_schema())
+    current = reopened._get_current_schema()
+    assert unrepresentable_fields(current) == {}, "the type is writable now"
+    assert "v" in legacy_unreadable_fields(current), "its OLD files are still not readable"
+    reopened.append_records([{"k": 1, "v": str(uuid.uuid4())}], current)
     assert reopened.row_count() == 1
 
 

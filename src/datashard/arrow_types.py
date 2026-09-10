@@ -6,7 +6,7 @@ from typing import Any, Dict, Union
 
 import pyarrow as pa
 
-from .data_structures import parse_decimal_type
+from .data_structures import UUID_BYTES, parse_decimal_type, parse_fixed_type
 
 
 def iceberg_type_to_arrow(iceberg_type: Union[str, Dict[str, Any]]) -> pa.DataType:
@@ -27,8 +27,13 @@ def iceberg_type_to_arrow(iceberg_type: Union[str, Dict[str, Any]]) -> pa.DataTy
         "timestamp": pa.timestamp("us"),
         "timestamptz": pa.timestamp("us", tz="UTC"),
         "string": pa.string(),
-        "uuid": pa.string(),  # For UUID handling
+        # Iceberg's uuid is 16 raw bytes. datashard wrote a parquet STRING here until
+        # 0.11.2, which pyiceberg refused to read as a uuid ("Cannot promote an string to
+        # uuid"); scans convert it back to a str so callers see what they wrote (#92).
+        "uuid": pa.binary(UUID_BYTES),
         "binary": pa.binary(),
+        # A bare "fixed" has no width and is not a valid Iceberg type; it stays mapped
+        # for tables written before 0.10, and is refused for new schemas.
         "fixed": pa.binary(),
     }
 
@@ -37,6 +42,9 @@ def iceberg_type_to_arrow(iceberg_type: Union[str, Dict[str, Any]]) -> pa.DataTy
         decimal_spec = parse_decimal_type(iceberg_type)
         if decimal_spec is not None:
             return pa.decimal128(*decimal_spec)
+        fixed_width = parse_fixed_type(iceberg_type)
+        if fixed_width is not None:
+            return pa.binary(fixed_width)
         if iceberg_type.startswith("list<"):
             # Extract element type and map it
             element_type = iceberg_type[5:-1]  # Remove 'list<>' wrapper

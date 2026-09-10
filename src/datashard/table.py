@@ -115,7 +115,7 @@ class Table(_ScanMixin, _StreamMixin, _DuckDBMixin, _VerifyMixin, _CompactionMix
         is refused here, at create - never accepted and ignored, which would leave the
         metadata promising a layout the files do not have.
         """
-        from .partitioning import validate_spec
+        from .partition_validation import validate_spec
 
         fields = list(getattr(partition_spec, "fields", None) or [])
         if not fields:

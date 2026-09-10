@@ -11,6 +11,7 @@ from .data_structures import DataFile, FileFormat, Schema, TableMetadata
 from .file_manager import FileManager
 from .logging_config import get_logger
 from .metadata_manager import MetadataManager
+from .uuid_columns import normalise_records as normalise_uuid_records
 
 if TYPE_CHECKING:
     from .transaction import Transaction
@@ -300,6 +301,9 @@ class _AppendMixin:
                     "This table is partitioned by its spec, so partition_values cannot be passed "
                     "as well - the values are computed from the rows. Drop the argument."
                 )
+            # A uuid arrives as a string and is stored as 16 bytes (#92); this path builds
+            # the Arrow table itself, so it converts before validating against the schema.
+            records = normalise_uuid_records(records, schema)
             dfm.validate_records_strict(records, schema)
             arrow = pa.Table.from_pylist(records, schema=dfm.create_arrow_schema(schema))
             return self._append_arrow_partitioned(arrow, schema, spec_fields)
@@ -368,7 +372,7 @@ class _AppendMixin:
         )
         if spec is None or not spec.fields:
             return []
-        from .partitioning import validate_spec
+        from .partition_validation import validate_spec
 
         validate_spec(spec, schema)   # a spec stored before a schema existed is checked here
         return spec_field_types(spec, schema)

@@ -24,7 +24,7 @@ from .metadata_serde import (
     NAME_MAPPING_PROPERTY,
     is_legacy_document,
     name_mapping_json,
-    unrepresentable_fields,
+    legacy_unreadable_fields,
 )
 from .metadata_serde_legacy import legacy_dict_to_metadata
 from .version_hint import (
@@ -274,8 +274,11 @@ def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optiona
             partition-spec fields discarded because pre-0.10 data was never
             partitioned by them (empty for almost every table).
         ``columns_foreign_readers_may_reject``
-            columns whose type no Iceberg engine reads reliably (``uuid``, ``fixed``);
-            datashard still reads them. Empty for almost every table.
+            columns whose EXISTING data files a foreign reader will refuse: a bare
+            ``fixed``, and a ``uuid`` column, which this table stores as a parquet
+            string (pyiceberg: "Cannot promote an string to uuid"). Migration does not
+            rewrite data files, so the value says what will; datashard reads them either
+            way. Empty for almost every table.
     """
     from .storage_backend import CASConflictError, create_storage_backend
 
@@ -332,7 +335,7 @@ def migrate_table(table_path: str, dry_run: bool = False, metadata_file: Optiona
                 new_md.last_column_id = max(new_md.last_column_id, max(int(f["id"]) for f in current.fields))
                 # Columns Iceberg engines cannot read are migrated as they are - datashard
                 # keeps reading them - but the operator must know which ones (#84).
-                unreadable = unrepresentable_fields(current)
+                unreadable = legacy_unreadable_fields(current)
                 if unreadable:
                     logger.warning(
                         f"{table_path}: columns {sorted(unreadable)} use types no Iceberg engine reads "

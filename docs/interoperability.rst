@@ -81,20 +81,25 @@ is always written.
 Column types
 ------------
 
-Every type datashard writes maps to an Iceberg primitive that both readers accept, with two
-exceptions that are **refused for new tables** since 0.10:
+Every type datashard writes maps to an Iceberg primitive that both readers accept. Two
+need a word of explanation, and one is refused:
 
-============  ================================================================
-``uuid``      datashard writes a parquet *string*; pyiceberg refuses to promote
-              it to ``uuid``. Use ``string`` - identical bytes on disk.
-``fixed``     Iceberg requires a length (``fixed[16]``); a bare ``fixed`` fails
-              pyiceberg's type parser. Use ``binary``.
-============  ================================================================
+==============  ==============================================================
+``uuid``        16 bytes of fixed-width binary on disk since 0.11.2, which is
+                what Iceberg specifies - a **string** in Python. Writes also
+                accept a ``uuid.UUID`` or the raw 16 bytes.
+``fixed[L]``    ``L`` bytes of fixed-width binary; ``bytes`` in Python. The
+                length is part of the type, as in Iceberg.
+``fixed``       Refused: Iceberg's ``fixed`` carries a length, and a bare
+                ``fixed`` fails pyiceberg's type parser. Use ``fixed[L]``.
+==============  ==============================================================
 
-A table created before 0.10 that already has such a column keeps working in datashard, and
-``datashard migrate`` lists the affected columns under
-``columns_foreign_readers_may_reject``. Change the declared type to the suggestion above
-when you can: the parquet files do not need rewriting.
+Before 0.11.2 datashard wrote a parquet *string* for a ``uuid`` column, which pyiceberg
+refuses to promote (``Cannot promote an string to uuid``), so 0.10 refused the type outright.
+Such a table keeps reading in datashard - old string files and new binary files land in the
+same scan, and a filter finds rows in either - but a foreign reader will not read the old
+files. ``datashard migrate`` lists those columns under
+``columns_foreign_readers_may_reject``; :meth:`Table.rewrite_data_files` converts them.
 
 Struct, list and map columns are not supported (datashard's schema validation refuses them).
 

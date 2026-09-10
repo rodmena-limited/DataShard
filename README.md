@@ -666,13 +666,19 @@ DataShard implements:
   (automatic at 64 manifests), `verify()`, `set_properties()`
 
 Data types: `boolean, int, long, float, double, decimal(P,S), date, time, timestamp,
-timestamptz, string, binary`; data files are always parquet.
+timestamptz, string, binary, uuid, fixed[L]`; data files are always parquet.
 
-`uuid` and `fixed` are **refused for new tables** since 0.10.0: DataShard writes a parquet
-string for `uuid`, which pyiceberg will not read as a UUID, and a bare `fixed` is not a valid
-Iceberg type (it needs a length). Use `string` and `binary` — the parquet bytes are identical,
-so the change is a no-op on disk. Tables created before 0.10.0 that already have such a column
-keep working, and `datashard migrate` lists them under `columns_foreign_readers_may_reject`.
+`uuid` and `fixed[L]` are written as Iceberg requires since 0.11.2 — 16 bytes and L bytes of
+fixed-width binary, which DuckDB and pyiceberg read natively. A `uuid` is a **string** in
+Python (`"6ba7b810-9dad-11d1-80b4-00c04fd430c8"`); writes also accept a `uuid.UUID` or the raw
+16 bytes, and filters accept any of the three. A `fixed[L]` is `bytes` both ways. A bare
+`fixed` is still refused: Iceberg's type needs a length, and pyiceberg's parser rejects it.
+
+A table created before 0.11.2 stores its uuid column as a parquet string; it keeps reading,
+in the same scan as files written since, and `datashard migrate` still lists such columns
+under `columns_foreign_readers_may_reject` — pyiceberg cannot read those older files
+(`Cannot promote an string to uuid`). Rewriting them with `rewrite_data_files()` converts
+them, or write the column as `string` if you would rather not have a uuid type at all.
 
 ---
 

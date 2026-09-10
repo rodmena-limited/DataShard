@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .data_structures import DataFile
 from .logging_config import get_logger
+from .uuid_columns import decode_columns as decode_uuid_columns
 
 if TYPE_CHECKING:
     from .data_structures import Schema, TableMetadata
@@ -99,8 +100,16 @@ class _CompactionMixin:
         removed: List[str] = []
         with self.new_transaction() as tx:
             for group in groups:
+                # Decode per FILE, as a scan does: a table written before 0.11.2 stores its
+                # uuid column as a string and one written after stores 16 bytes, and
+                # concatenating those two directly would cast the strings to 36-byte
+                # binary. Decoding first also makes a rewrite the way to convert an old
+                # file to the Iceberg encoding (#92).
                 tables = [
-                    self._read_datafile_table(df, None, None, mode, pa, pq) for df in group
+                    decode_uuid_columns(
+                        self._read_datafile_table(df, None, None, mode, pa, pq), schema
+                    )
+                    for df in group
                 ]
                 merged = self._concat_aligned(tables, pa)
                 values = dict(group[0].partition_values or {})

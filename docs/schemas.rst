@@ -43,6 +43,14 @@ Supported Types
 - **float**: 32-bit IEEE 754 floating point
 - **double**: 64-bit IEEE 754 floating point
 - **string**: UTF-8 encoded character sequences
+- **binary**: variable-length bytes; **fixed[L]**: exactly ``L`` bytes (``bytes`` in Python)
+- **uuid**: 16 bytes on disk, a canonical **string** in Python
+  (``"6ba7b810-9dad-11d1-80b4-00c04fd430c8"``); a write also accepts a ``uuid.UUID`` or the
+  raw 16 bytes, and so does a filter value
+- **date**, **time**, **timestamp**, **timestamptz**, **decimal(P,S)**
+
+A bare **fixed** is refused: Iceberg's ``fixed`` carries its width, and a reader's type
+parser rejects it. Use ``fixed[L]`` or ``binary``.
 
 Type Selection Guidelines
 ^^^^^^^^^^^^^^^^^^^^^^^^^^

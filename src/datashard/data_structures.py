@@ -12,6 +12,21 @@ from typing import Any, Dict, List, Optional
 
 # Iceberg decimal type: decimal(P,S) with precision 1..38 (fits pyarrow's decimal128).
 DECIMAL_TYPE_RE = re.compile(r"^decimal\(\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)$")
+# Iceberg's fixed type carries its width: fixed[16]. A bare "fixed" has no width, so it
+# cannot be expressed as an Iceberg column at all (#92).
+FIXED_TYPE_RE = re.compile(r"^fixed\[\s*(\d{1,6})\s*\]$")
+UUID_BYTES = 16
+
+
+def parse_fixed_type(type_str: str) -> Optional[int]:
+    """The width of a 'fixed[L]' type string, else None. A bare 'fixed' returns None."""
+    m = FIXED_TYPE_RE.match(type_str.strip()) if isinstance(type_str, str) else None
+    if not m:
+        return None
+    width = int(m.group(1))
+    if width < 1:
+        raise ValueError(f"Invalid fixed type '{type_str}': the width must be at least 1")
+    return width
 
 
 def parse_decimal_type(type_str: str) -> Optional[tuple[int, int]]:
@@ -87,8 +102,12 @@ class Schema:
 
             f_type = field_def["type"]
             if isinstance(f_type, str):
-                if f_type not in valid_primitive_types and parse_decimal_type(f_type) is None:
-                     raise ValueError(f"Invalid schema: Unknown field type '{f_type}' in field '{field_def['name']}'. Supported primitive types: {sorted(valid_primitive_types)} and decimal(P,S)")
+                if (
+                    f_type not in valid_primitive_types
+                    and parse_decimal_type(f_type) is None
+                    and parse_fixed_type(f_type) is None
+                ):
+                     raise ValueError(f"Invalid schema: Unknown field type '{f_type}' in field '{field_def['name']}'. Supported primitive types: {sorted(valid_primitive_types)}, decimal(P,S) and fixed[L]")
             # We permit dict/list for complex types (struct, list, map) without deep validation for now
 
 

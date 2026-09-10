@@ -38,14 +38,11 @@ def is_legacy_document(doc: Dict[str, Any]) -> bool:
     return "format-version" not in doc and "format_version" in doc
 
 
-# Types datashard accepts but cannot represent as an Iceberg column that BOTH major
-# readers accept, because the parquet datashard writes does not match what the Iceberg
-# type promises (verified against pyiceberg 0.12 and DuckDB 1.5.5, spike #83):
-#   uuid  -> we write a parquet STRING; pyiceberg refuses ("Cannot promote string to uuid")
-#   fixed -> Iceberg requires fixed[L]; a bare "fixed" fails pyiceberg's type parser
-# Both hold exactly the same bytes as `string` / `binary`, so switching the declared type
-# costs nothing on disk.
-NOT_ICEBERG_REPRESENTABLE = {"uuid": "string", "fixed": "binary"}
+# A bare "fixed" carries no width, and Iceberg has no such type - pyiceberg's parser
+# rejects it ("Could not match fixed, expected format fixed[22]"). Since 0.11.2 `uuid`
+# and `fixed[L]` ARE representable: they are written as fixed-width binary, which is
+# what Iceberg specifies (#92).
+NOT_ICEBERG_REPRESENTABLE = {"fixed": "fixed[L], giving the width, or binary"}
 
 
 def unrepresentable_fields(schema: Schema) -> Dict[str, str]:
@@ -57,6 +54,23 @@ def unrepresentable_fields(schema: Schema) -> Dict[str, str]:
     }
 
 
+def legacy_unreadable_fields(schema: Schema) -> Dict[str, str]:
+    """{field name: what to do} for columns of a table being MIGRATED whose existing data
+    files a foreign reader cannot read.
+
+    Wider than :func:`unrepresentable_fields`, which only refuses what cannot be written
+    today: a table old enough to need migrating stores its `uuid` column as a parquet
+    string, which pyiceberg refuses to promote ("Cannot promote an string to uuid"). Those
+    files are not rewritten by a migration - the data is untouched - so the operator is
+    told which columns foreign readers will still refuse, and how to fix them.
+    """
+    out = dict(unrepresentable_fields(schema))
+    for f in schema.fields:
+        if f.get("type") == "uuid" and str(f["name"]) not in out:
+            out[str(f["name"])] = "rewrite_data_files() to convert the old string files"
+    return out
+
+
 def check_iceberg_representable(schema: Schema) -> None:
     """Refuse to CREATE a table whose columns would not be readable by Iceberg engines.
 
@@ -64,13 +78,11 @@ def check_iceberg_representable(schema: Schema) -> None:
     """
     bad = unrepresentable_fields(schema)
     if bad:
-        detail = ", ".join(f"'{n}' ({''}use '{t}')" for n, t in bad.items())
+        detail = ", ".join(f"'{n}' (use {t})" for n, t in bad.items())
         raise ValueError(
-            f"datashard tables are Iceberg v2 tables since 0.10, and these columns cannot be "
-            f"expressed as Iceberg columns that every engine reads: {detail}. The parquet bytes "
-            f"are identical, so changing the declared type is a no-op on disk. (pyiceberg refuses "
-            f"'uuid' backed by a parquet string, and a bare 'fixed' is not a valid Iceberg type - "
-            f"it requires a length, fixed[L], which datashard does not write yet.)"
+            f"datashard tables are Iceberg v2 tables, and these columns cannot be expressed as "
+            f"Iceberg columns every engine reads: {detail}. A bare 'fixed' has no width, and "
+            f"Iceberg has no such type - pyiceberg's parser rejects it outright."
         )
 
 

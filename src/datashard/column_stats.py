@@ -9,6 +9,7 @@ import pyarrow as pa
 
 from .data_structures import Schema
 from .logging_config import get_logger
+from .uuid_columns import to_text as to_uuid_text
 
 logger = get_logger(__name__)
 
@@ -46,7 +47,7 @@ iceberg_schema: Schema,
             continue
 
         # Skip complex types and binary - can't compute meaningful bounds
-        if field_type in ("binary", "fixed", "list", "map", "struct"):
+        if field_type in ("binary", "list", "map", "struct") or field_type.startswith("fixed"):
             continue
 
         column = table.column(field_name)
@@ -59,6 +60,13 @@ iceberg_schema: Schema,
             min_val = min_scalar.as_py()
             max_val = max_scalar.as_py()
 
+            if field_type == "uuid":
+                # A uuid is 16 bytes in the file and a string everywhere else (#92); the
+                # bound is compared against what the CALLER filters on, so keep the text.
+                # Canonical uuid text and the 16 bytes sort the same way, so the bound
+                # still bounds.
+                min_val = to_uuid_text(min_val)
+                max_val = to_uuid_text(max_val)
             if min_val is not None:
                 lower_bounds[field_id] = min_val
             if max_val is not None:
